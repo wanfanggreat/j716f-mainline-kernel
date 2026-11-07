@@ -1,0 +1,292 @@
+--- a/drivers/gpu/drm/msm/adreno/adreno_gpu.c
++++ b/drivers/gpu/drm/msm/adreno/adreno_gpu.c
+@@ -660,19 +660,39 @@
+ 	return bo;
+ }
+ 
++static bool skip_scm_aperture;
++MODULE_PARM_DESC(skip_scm_aperture,
++		 "J716F diagnostic: skip the GPU SMMU aperture SCM call");
++module_param_named(skip_scm_aperture, skip_scm_aperture, bool, 0644);
++
+ int adreno_hw_init(struct msm_gpu *gpu)
+ {
+ 	struct adreno_gpu *adreno_gpu = to_adreno_gpu(gpu);
++	bool aperture_available;
+ 	int ret;
+ 
+ 	VERB("%s", gpu->name);
+ 
++	aperture_available = qcom_scm_set_gpu_smmu_aperture_is_available();
++	dev_info(gpu->dev->dev,
++		 "J716F GPU: hw_init enter (aperture_available=%d skip=%d)\n",
++		 aperture_available, skip_scm_aperture);
++
+ 	if (adreno_gpu->info->family >= ADRENO_6XX_GEN1 &&
+-	    qcom_scm_set_gpu_smmu_aperture_is_available()) {
+-		/* We currently always use context bank 0, so hard code this */
+-		ret = qcom_scm_set_gpu_smmu_aperture(0);
+-		if (ret)
+-			DRM_DEV_ERROR(gpu->dev->dev, "unable to set SMMU aperture: %d\n", ret);
++	    aperture_available) {
++		if (skip_scm_aperture) {
++			dev_info(gpu->dev->dev,
++				 "J716F GPU: aperture SCM skipped\n");
++		} else {
++			dev_info(gpu->dev->dev,
++				 "J716F GPU: aperture SCM enter\n");
++			/* We currently always use context bank 0, so hard code this */
++			ret = qcom_scm_set_gpu_smmu_aperture(0);
++			dev_info(gpu->dev->dev,
++				 "J716F GPU: aperture SCM done ret=%d\n", ret);
++			if (ret)
++				DRM_DEV_ERROR(gpu->dev->dev, "unable to set SMMU aperture: %d\n", ret);
++		}
+ 	}
+ 
+ 	for (int i = 0; i < gpu->nr_rings; i++) {
+@@ -695,6 +715,8 @@
+ 		}
+ 	}
+ 
++	dev_info(gpu->dev->dev, "J716F GPU: hw_init done\n");
++
+ 	return 0;
+ }
+ 
+--- a/drivers/gpu/drm/msm/adreno/adreno_device.c
++++ b/drivers/gpu/drm/msm/adreno/adreno_device.c
+@@ -16,6 +16,11 @@
+ MODULE_PARM_DESC(snapshot_debugbus, "Include debugbus sections in GPU devcoredump (if not fused off)");
+ module_param_named(snapshot_debugbus, snapshot_debugbus, bool, 0600);
+ 
++static bool no_gpu_rpm;
++MODULE_PARM_DESC(no_gpu_rpm,
++		 "J716F diagnostic: forbid GPU runtime suspend (keep the GPU powered)");
++module_param_named(no_gpu_rpm, no_gpu_rpm, bool, 0644);
++
+ int enable_preemption = -1;
+ MODULE_PARM_DESC(enable_preemption, "Enable preemption (A7xx+ only) (1=on , 0=disable, -1=auto (default))");
+ module_param(enable_preemption, int, 0600);
+@@ -105,6 +110,11 @@
+ 	 */
+ 	pm_runtime_enable(&pdev->dev);
+ 
++	if (no_gpu_rpm) {
++		pm_runtime_forbid(&pdev->dev);
++		dev_info(dev->dev, "J716F GPU: runtime PM forbidden (diagnostic)\n");
++	}
++
+ 	ret = pm_runtime_get_sync(&pdev->dev);
+ 	if (ret < 0) {
+ 		pm_runtime_put_noidle(&pdev->dev);
+--- a/drivers/gpu/drm/msm/adreno/a6xx_gmu.c
++++ b/drivers/gpu/drm/msm/adreno/a6xx_gmu.c
+@@ -1318,9 +1318,13 @@
+ 
+ 	gmu->hung = false;
+ 
++	dev_info(gmu->dev, "J716F GMU: resume enter\n");
++
+ 	/* Turn on the resources */
+ 	pm_runtime_get_sync(gmu->dev);
+ 
++	dev_info(gmu->dev, "J716F GMU: power on done\n");
++
+ 	a6xx_gmu_gxpd_get(gmu);
+ 
+ 	/* Use a known rate to bring up the GMU */
+@@ -1331,10 +1335,14 @@
+ 	if (ret)
+ 		goto rpm_put;
+ 
++	dev_info(gmu->dev, "J716F GMU: clocks on\n");
++
+ 	ret = a6xx_gmu_secure_init(a6xx_gpu);
+ 	if (ret)
+ 		goto disable_clk;
+ 
++	dev_info(gmu->dev, "J716F GMU: secure init done\n");
++
+ 	/* Read the slice info on A8x GPUs */
+ 	a8xx_gpu_get_slice_info(gpu);
+ 
+@@ -1361,11 +1369,15 @@
+ 		status = GMU_COLD_BOOT;
+ 	}
+ 
++	dev_info(gmu->dev, "J716F GMU: fw_start enter status=%d\n", status);
+ 	ret = a6xx_gmu_fw_start(gmu, status);
++	dev_info(gmu->dev, "J716F GMU: fw_start ret=%d\n", ret);
+ 	if (ret)
+ 		goto disable_irq;
+ 
++	dev_info(gmu->dev, "J716F GMU: hfi_start enter\n");
+ 	ret = a6xx_hfi_start(gmu, status);
++	dev_info(gmu->dev, "J716F GMU: hfi_start ret=%d\n", ret);
+ 	if (ret)
+ 		goto disable_irq;
+ 
+@@ -1380,6 +1392,8 @@
+ 	/* Set the GPU to the current freq */
+ 	a6xx_gmu_set_initial_freq(gpu, gmu);
+ 
++	dev_info(gmu->dev, "J716F GMU: resume done\n");
++
+ 	return 0;
+ 
+ disable_irq:
+--- a/drivers/gpu/drm/msm/adreno/a6xx_gpu.c
++++ b/drivers/gpu/drm/msm/adreno/a6xx_gpu.c
+@@ -1822,14 +1822,20 @@
+ {
+ 	struct msm_ringbuffer *ring = gpu->funcs->active_ring(gpu);
+ 
++	dev_info(&gpu->pdev->dev, "J716F GPU: fault irq enter\n");
++
+ 	/*
+ 	 * If stalled on SMMU fault, we could trip the GPU's hang detection,
+ 	 * but the fault handler will trigger the devcore dump, and we want
+ 	 * to otherwise resume normally rather than killing the submit, so
+ 	 * just bail.
+ 	 */
+-	if (gpu_read(gpu, REG_A6XX_RBBM_STATUS3) & A6XX_RBBM_STATUS3_SMMU_STALLED_ON_FAULT)
++	if (gpu_read(gpu, REG_A6XX_RBBM_STATUS3) & A6XX_RBBM_STATUS3_SMMU_STALLED_ON_FAULT) {
++		dev_info(&gpu->pdev->dev, "J716F GPU: fault irq SMMU stalled\n");
+ 		return;
++	}
++
++	dev_info(&gpu->pdev->dev, "J716F GPU: fault irq reading state\n");
+ 
+ 	DRM_DEV_ERROR(&gpu->pdev->dev,
+ 		"gpu fault ring %d fence %x status %8.8X rb %4.4x/%4.4x ib1 %16.16llX/%4.4x ib2 %16.16llX/%4.4x\n",
+--- a/drivers/gpu/drm/msm/msm_gpu.c
++++ b/drivers/gpu/drm/msm/msm_gpu.c
+@@ -166,8 +166,11 @@
+ 	if (!gpu->needs_hw_init)
+ 		return 0;
+ 
++	dev_info(gpu->dev->dev, "J716F GPU: hw_init needed\n");
++
+ 	disable_irq(gpu->irq);
+ 	ret = gpu->funcs->hw_init(gpu);
++	dev_info(gpu->dev->dev, "J716F GPU: hw_init ret=%d\n", ret);
+ 	if (!ret)
+ 		gpu->needs_hw_init = false;
+ 	enable_irq(gpu->irq);
+@@ -794,13 +797,23 @@
+ {
+ 	struct msm_ringbuffer *ring = submit->ring;
+ 	unsigned long flags;
++	bool cold = gpu->needs_hw_init;
+ 
+ 	WARN_ON(!mutex_is_locked(&gpu->lock));
+ 
++	if (cold)
++		dev_info(gpu->dev->dev, "J716F GPU: cold submit enter\n");
++
+ 	pm_runtime_get_sync(&gpu->pdev->dev);
+ 
++	if (cold)
++		dev_info(gpu->dev->dev, "J716F GPU: cold submit resume done\n");
++
+ 	msm_gpu_hw_init(gpu);
+ 
++	if (cold)
++		dev_info(gpu->dev->dev, "J716F GPU: cold submit hw_init done\n");
++
+ 	submit->seqno = submit->hw_fence->seqno;
+ 
+ 	/*
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_plane.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_plane.c
+@@ -9,6 +9,7 @@
+ 
+ #include <linux/debugfs.h>
+ #include <linux/dma-buf.h>
++#include <linux/module.h>
+ 
+ #include <drm/drm_atomic.h>
+ #include <drm/drm_atomic_uapi.h>
+@@ -94,6 +95,21 @@
+ 	DRM_FORMAT_MOD_INVALID
+ };
+ 
++/*
++ * J716F diagnostic: force linear scanout buffers.  If the freeze follows the
++ * first full-screen UBWC plane commit, advertising only LINEAR makes the
++ * compositor allocate uncompressed buffers and takes UBWC out of the path.
++ */
++static bool force_linear;
++MODULE_PARM_DESC(force_linear,
++		 "J716F diagnostic: advertise only linear DRM format modifiers");
++module_param_named(force_linear, force_linear, bool, 0644);
++
++static const uint64_t linear_format_modifiers[] = {
++	DRM_FORMAT_MOD_LINEAR,
++	DRM_FORMAT_MOD_INVALID
++};
++
+ #define to_dpu_plane(x) container_of(x, struct dpu_plane, base)
+ 
+ static struct dpu_kms *_dpu_plane_get_kms(struct drm_plane *plane)
+@@ -1836,7 +1852,9 @@
+ 	pdpu = drmm_universal_plane_alloc(dev, struct dpu_plane, base,
+ 				0xff, &dpu_plane_funcs,
+ 				format_list, num_formats,
+-				supported_format_modifiers, type, NULL);
++				force_linear ? linear_format_modifiers :
++					       supported_format_modifiers,
++				type, NULL);
+ 	if (IS_ERR(pdpu))
+ 		return ERR_CAST(pdpu);
+ 
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_interrupts.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_interrupts.c
+@@ -15,6 +15,9 @@
+ #include "dpu_hw_mdss.h"
+ #include "dpu_trace.h"
+ 
++/* J716F diagnostic: log the first DPU IRQ statuses seen after boot. */
++static unsigned int j716f_dpu_irq_logs;
++
+ /*
+  * Register offsets in MDSS register file for the interrupt registers
+  * w.r.t. the MDP base
+@@ -363,6 +366,12 @@
+ 		if (!irq_status)
+ 			continue;
+ 
++		if (j716f_dpu_irq_logs < 60) {
++			j716f_dpu_irq_logs++;
++			pr_info("J716F DPU irq reg=%d status=0x%08x en=0x%08x\n",
++				reg_idx, irq_status, enable_mask);
++		}
++
+ 		/*
+ 		 * Search through matching intr status.
+ 		 */
+--- a/drivers/gpu/drm/msm/dsi/dsi_host.c
++++ b/drivers/gpu/drm/msm/dsi/dsi_host.c
+@@ -1777,6 +1777,9 @@
+ 	queue_work(msm_host->workqueue, &msm_host->err_work);
+ }
+ 
++/* J716F diagnostic: log the first DSI IRQ statuses seen after boot. */
++static unsigned int j716f_dsi_irq_logs;
++
+ static irqreturn_t dsi_host_irq(int irq, void *ptr)
+ {
+ 	struct msm_dsi_host *msm_host = ptr;
+@@ -1791,6 +1794,11 @@
+ 	dsi_write(msm_host, REG_DSI_INTR_CTRL, isr);
+ 	spin_unlock_irqrestore(&msm_host->intr_lock, flags);
+ 
++	if (j716f_dsi_irq_logs < 60) {
++		j716f_dsi_irq_logs++;
++		pr_info("J716F DSI%d irq isr=0x%08x\n", msm_host->id, isr);
++	}
++
+ 	DBG("isr=0x%x, id=%d", isr, msm_host->id);
+ 
+ 	if (isr & DSI_IRQ_ERROR)

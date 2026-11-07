@@ -660,19 +660,39 @@ struct drm_gem_object *adreno_fw_create_bo(struct msm_gpu *gpu,
 	return bo;
 }
 
+static bool skip_scm_aperture;
+MODULE_PARM_DESC(skip_scm_aperture,
+		 "J716F diagnostic: skip the GPU SMMU aperture SCM call");
+module_param_named(skip_scm_aperture, skip_scm_aperture, bool, 0644);
+
 int adreno_hw_init(struct msm_gpu *gpu)
 {
 	struct adreno_gpu *adreno_gpu = to_adreno_gpu(gpu);
+	bool aperture_available;
 	int ret;
 
 	VERB("%s", gpu->name);
 
+	aperture_available = qcom_scm_set_gpu_smmu_aperture_is_available();
+	dev_info(gpu->dev->dev,
+		 "J716F GPU: hw_init enter (aperture_available=%d skip=%d)\n",
+		 aperture_available, skip_scm_aperture);
+
 	if (adreno_gpu->info->family >= ADRENO_6XX_GEN1 &&
-	    qcom_scm_set_gpu_smmu_aperture_is_available()) {
-		/* We currently always use context bank 0, so hard code this */
-		ret = qcom_scm_set_gpu_smmu_aperture(0);
-		if (ret)
-			DRM_DEV_ERROR(gpu->dev->dev, "unable to set SMMU aperture: %d\n", ret);
+	    aperture_available) {
+		if (skip_scm_aperture) {
+			dev_info(gpu->dev->dev,
+				 "J716F GPU: aperture SCM skipped\n");
+		} else {
+			dev_info(gpu->dev->dev,
+				 "J716F GPU: aperture SCM enter\n");
+			/* We currently always use context bank 0, so hard code this */
+			ret = qcom_scm_set_gpu_smmu_aperture(0);
+			dev_info(gpu->dev->dev,
+				 "J716F GPU: aperture SCM done ret=%d\n", ret);
+			if (ret)
+				DRM_DEV_ERROR(gpu->dev->dev, "unable to set SMMU aperture: %d\n", ret);
+		}
 	}
 
 	for (int i = 0; i < gpu->nr_rings; i++) {
@@ -694,6 +714,8 @@ int adreno_hw_init(struct msm_gpu *gpu)
 			ring->memptrs->fence = ring->fctx->last_fence;
 		}
 	}
+
+	dev_info(gpu->dev->dev, "J716F GPU: hw_init done\n");
 
 	return 0;
 }

@@ -15,6 +15,9 @@
 #include "dpu_hw_mdss.h"
 #include "dpu_trace.h"
 
+/* J716F diagnostic: log the first DPU IRQ statuses seen after boot. */
+static unsigned int j716f_dpu_irq_logs;
+
 /*
  * Register offsets in MDSS register file for the interrupt registers
  * w.r.t. the MDP base
@@ -362,6 +365,12 @@ irqreturn_t dpu_core_irq(struct msm_kms *kms)
 
 		if (!irq_status)
 			continue;
+
+		if (j716f_dpu_irq_logs < 60) {
+			j716f_dpu_irq_logs++;
+			pr_info("J716F DPU irq reg=%d status=0x%08x en=0x%08x\n",
+				reg_idx, irq_status, enable_mask);
+		}
 
 		/*
 		 * Search through matching intr status.

@@ -166,8 +166,11 @@ int msm_gpu_hw_init(struct msm_gpu *gpu)
 	if (!gpu->needs_hw_init)
 		return 0;
 
+	dev_info(gpu->dev->dev, "J716F GPU: hw_init needed\n");
+
 	disable_irq(gpu->irq);
 	ret = gpu->funcs->hw_init(gpu);
+	dev_info(gpu->dev->dev, "J716F GPU: hw_init ret=%d\n", ret);
 	if (!ret)
 		gpu->needs_hw_init = false;
 	enable_irq(gpu->irq);
@@ -794,12 +797,22 @@ void msm_gpu_submit(struct msm_gpu *gpu, struct msm_gem_submit *submit)
 {
 	struct msm_ringbuffer *ring = submit->ring;
 	unsigned long flags;
+	bool cold = gpu->needs_hw_init;
 
 	WARN_ON(!mutex_is_locked(&gpu->lock));
 
+	if (cold)
+		dev_info(gpu->dev->dev, "J716F GPU: cold submit enter\n");
+
 	pm_runtime_get_sync(&gpu->pdev->dev);
 
+	if (cold)
+		dev_info(gpu->dev->dev, "J716F GPU: cold submit resume done\n");
+
 	msm_gpu_hw_init(gpu);
+
+	if (cold)
+		dev_info(gpu->dev->dev, "J716F GPU: cold submit hw_init done\n");
 
 	submit->seqno = submit->hw_fence->seqno;
 

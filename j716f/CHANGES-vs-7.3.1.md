@@ -2,9 +2,10 @@
 
 基线：tag `upstream-7.3.1`（未修改的 kernel.org 7.3.1 树）。
 M10 构建源码：tag `j716f-m10`（`e562462a3`）。
+M11/v45-diag 构建源码：tag `j716f-m11`（本提交）。
 归档工作树：tag `j716f-worktree-20261108`（`15a8792c9`）。
-归档文档 HEAD：tag `j716f-archive-20261108`。
-下面的逐文件统计以工作树为准；构建产物对应 `j716f-m10`。
+归档文档 HEAD：tag `j716f-archive-20261108` 及其后续归档提交。
+下面的逐文件统计以 M11 构建源码为准；M10 产物对应 `j716f-m10`。
 
 ## 新增文件
 
@@ -23,10 +24,17 @@ M10 构建源码：tag `j716f-m10`（`e562462a3`）。
 | `arch/arm64/boot/dts/qcom/Makefile` | +2/-0 |
 | `drivers/base/dd.c` | +9/-0 |
 | `drivers/bluetooth/hci_qca.c` | +34/-0 |
+| `drivers/gpu/drm/msm/adreno/a6xx_gmu.c` | +14/-0 |
+| `drivers/gpu/drm/msm/adreno/a6xx_gpu.c` | +7/-1 |
+| `drivers/gpu/drm/msm/adreno/adreno_device.c` | +10/-0 |
+| `drivers/gpu/drm/msm/adreno/adreno_gpu.c` | +27/-5 |
 | `drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c` | +173/-5 |
-| `drivers/gpu/drm/msm/dsi/dsi_host.c` | +125/-23 |
+| `drivers/gpu/drm/msm/disp/dpu1/dpu_hw_interrupts.c` | +9/-0 |
+| `drivers/gpu/drm/msm/disp/dpu1/dpu_plane.c` | +19/-1 |
+| `drivers/gpu/drm/msm/dsi/dsi_host.c` | +133/-23 |
 | `drivers/gpu/drm/msm/dsi/phy/dsi_phy.c` | +15/-7 |
 | `drivers/gpu/drm/msm/dsi/phy/dsi_phy_7nm.c` | +49/-2 |
+| `drivers/gpu/drm/msm/msm_gpu.c` | +13/-0 |
 | `drivers/gpu/drm/panel/panel-raydium-rm69380.c` | +184/-30 |
 | `drivers/hid/i2c-hid/i2c-hid-core.c` | +16/-0 |
 | `drivers/i2c/busses/i2c-qcom-geni.c` | +9/-1 |
@@ -59,51 +67,58 @@ M10 构建源码：tag `j716f-m10`（`e562462a3`）。
 | `sound/soc/soc-dapm.c` | +24/-0 |
 | `sound/soc/soc-pcm.c` | +30/-1 |
 
-合计：38 个修改文件 + 2 个新增文件，4993 insertions(+)，176 deletions(-)
+合计：45 个修改文件 + 2 个新增文件，5100 insertions(+)，183 deletions(-)
 （`git diff --stat upstream-7.3.1..j716f-m10` 的原始输出）：
 
 ```text
- arch/arm64/boot/dts/qcom/Makefile                |    2 +
- arch/arm64/boot/dts/qcom/sm8250-lenovo-j716f.dts | 1462 ++++++++++++++++++++++
- drivers/base/dd.c                                |    9 +
- drivers/bluetooth/hci_qca.c                      |   34 +
- drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c         |  178 ++-
- drivers/gpu/drm/msm/dsi/dsi_host.c               |  148 ++-
- drivers/gpu/drm/msm/dsi/phy/dsi_phy.c            |   22 +-
- drivers/gpu/drm/msm/dsi/phy/dsi_phy_7nm.c        |   51 +-
- drivers/gpu/drm/panel/panel-raydium-rm69380.c    |  214 +++-
- drivers/hid/i2c-hid/i2c-hid-core.c               |   16 +
- drivers/i2c/busses/i2c-qcom-geni.c               |   10 +-
- drivers/input/touchscreen/goodix.c               |  345 ++++-
- drivers/input/touchscreen/goodix.h               |   13 +
- drivers/regulator/qcom-rpmh-regulator.c          |   45 +-
- drivers/soc/qcom/qcom_pd_mapper.c                |    7 +
- drivers/soc/qcom/ubwc_config.c                   |    2 +
- drivers/tty/serial/qcom_geni_serial.c            |   26 +-
- drivers/usb/gadget/function/f_ncm.c              |   29 +
- drivers/usb/gadget/function/u_serial.c           |  198 ++-
- drivers/watchdog/qcom-wdt.c                      |   12 +
- include/sound/cs35l41.h                          |    5 +
- kernel/async.c                                   |   82 +-
- sound/core/pcm_lib.c                             |    3 -
- sound/soc/codecs/Kconfig                         |    4 +
- sound/soc/codecs/Makefile                        |    2 +
- sound/soc/codecs/cs35l41-lib.c                   |   31 +-
- sound/soc/codecs/cs35l41.c                       |   27 +
- sound/soc/codecs/es7210.c                        |  704 +++++++++++
- sound/soc/codecs/lpass-tx-macro.c                |  141 ++-
- sound/soc/codecs/lpass-va-macro.c                |  379 +++++-
- sound/soc/qcom/common.c                          |   19 +-
- sound/soc/qcom/qdsp6/q6afe-dai.c                 |   46 +-
- sound/soc/qcom/qdsp6/q6afe.c                     |   19 +-
- sound/soc/qcom/qdsp6/q6asm-dai.c                 |  316 ++++-
- sound/soc/qcom/qdsp6/q6asm.c                     |   77 +-
- sound/soc/qcom/qdsp6/q6dsp-lpass-clocks.c        |   49 +-
- sound/soc/qcom/qdsp6/q6routing.c                 |    9 +-
- sound/soc/qcom/sm8250.c                          |  378 +++++-
- sound/soc/soc-dapm.c                             |   24 +
- sound/soc/soc-pcm.c                              |   31 +-
- 40 files changed, 4993 insertions(+), 176 deletions(-)
+ arch/arm64/boot/dts/qcom/Makefile                 |    2 +
+ arch/arm64/boot/dts/qcom/sm8250-lenovo-j716f.dts  | 1462 +++++++++++++++++++++
+ drivers/base/dd.c                                 |    9 +
+ drivers/bluetooth/hci_qca.c                       |   34 +
+ drivers/gpu/drm/msm/adreno/a6xx_gmu.c             |   14 +
+ drivers/gpu/drm/msm/adreno/a6xx_gpu.c             |    8 +-
+ drivers/gpu/drm/msm/adreno/adreno_device.c        |   10 +
+ drivers/gpu/drm/msm/adreno/adreno_gpu.c           |   32 +-
+ drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c          |  178 ++-
+ drivers/gpu/drm/msm/disp/dpu1/dpu_hw_interrupts.c |    9 +
+ drivers/gpu/drm/msm/disp/dpu1/dpu_plane.c         |   20 +-
+ drivers/gpu/drm/msm/dsi/dsi_host.c                |  156 ++-
+ drivers/gpu/drm/msm/dsi/phy/dsi_phy.c             |   22 +-
+ drivers/gpu/drm/msm/dsi/phy/dsi_phy_7nm.c         |   51 +-
+ drivers/gpu/drm/msm/msm_gpu.c                     |   13 +
+ drivers/gpu/drm/panel/panel-raydium-rm69380.c     |  214 ++-
+ drivers/hid/i2c-hid/i2c-hid-core.c                |   16 +
+ drivers/i2c/busses/i2c-qcom-geni.c                |   10 +-
+ drivers/input/touchscreen/goodix.c                |  345 ++++-
+ drivers/input/touchscreen/goodix.h                |   13 +
+ drivers/regulator/qcom-rpmh-regulator.c           |   45 +-
+ drivers/soc/qcom/qcom_pd_mapper.c                 |    7 +
+ drivers/soc/qcom/ubwc_config.c                    |    2 +
+ drivers/tty/serial/qcom_geni_serial.c             |   26 +-
+ drivers/usb/gadget/function/f_ncm.c               |   29 +
+ drivers/usb/gadget/function/u_serial.c            |  198 ++-
+ drivers/watchdog/qcom-wdt.c                       |   12 +
+ include/sound/cs35l41.h                           |    5 +
+ kernel/async.c                                    |   82 +-
+ sound/core/pcm_lib.c                              |    3 -
+ sound/soc/codecs/Kconfig                          |    4 +
+ sound/soc/codecs/Makefile                         |    2 +
+ sound/soc/codecs/cs35l41-lib.c                    |   31 +-
+ sound/soc/codecs/cs35l41.c                        |   27 +
+ sound/soc/codecs/es7210.c                         |  704 ++++++++++
+ sound/soc/codecs/lpass-tx-macro.c                 |  141 +-
+ sound/soc/codecs/lpass-va-macro.c                 |  379 +++++-
+ sound/soc/qcom/common.c                           |   19 +-
+ sound/soc/qcom/qdsp6/q6afe-dai.c                  |   46 +-
+ sound/soc/qcom/qdsp6/q6afe.c                      |   19 +-
+ sound/soc/qcom/qdsp6/q6asm-dai.c                  |  316 ++++-
+ sound/soc/qcom/qdsp6/q6asm.c                      |   77 +-
+ sound/soc/qcom/qdsp6/q6dsp-lpass-clocks.c         |   49 +-
+ sound/soc/qcom/qdsp6/q6routing.c                  |    9 +-
+ sound/soc/qcom/sm8250.c                           |  378 +++++-
+ sound/soc/soc-dapm.c                              |   24 +
+ sound/soc/soc-pcm.c                               |   31 +-
+ 47 files changed, 5100 insertions(+), 183 deletions(-)
 ```
 
 ## 未纳入本仓的工作树文件

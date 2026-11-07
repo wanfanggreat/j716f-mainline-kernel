@@ -16,6 +16,11 @@ bool snapshot_debugbus = false;
 MODULE_PARM_DESC(snapshot_debugbus, "Include debugbus sections in GPU devcoredump (if not fused off)");
 module_param_named(snapshot_debugbus, snapshot_debugbus, bool, 0600);
 
+static bool no_gpu_rpm;
+MODULE_PARM_DESC(no_gpu_rpm,
+		 "J716F diagnostic: forbid GPU runtime suspend (keep the GPU powered)");
+module_param_named(no_gpu_rpm, no_gpu_rpm, bool, 0644);
+
 int enable_preemption = -1;
 MODULE_PARM_DESC(enable_preemption, "Enable preemption (A7xx+ only) (1=on , 0=disable, -1=auto (default))");
 module_param(enable_preemption, int, 0600);
@@ -104,6 +109,11 @@ struct msm_gpu *adreno_load_gpu(struct drm_device *dev)
 	 * booting the gpu, go ahead and enable runpm:
 	 */
 	pm_runtime_enable(&pdev->dev);
+
+	if (no_gpu_rpm) {
+		pm_runtime_forbid(&pdev->dev);
+		dev_info(dev->dev, "J716F GPU: runtime PM forbidden (diagnostic)\n");
+	}
 
 	ret = pm_runtime_get_sync(&pdev->dev);
 	if (ret < 0) {

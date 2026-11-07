@@ -9,6 +9,7 @@
 
 #include <linux/debugfs.h>
 #include <linux/dma-buf.h>
+#include <linux/module.h>
 
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_uapi.h>
@@ -90,6 +91,21 @@ struct dpu_plane {
 
 static const uint64_t supported_format_modifiers[] = {
 	DRM_FORMAT_MOD_QCOM_COMPRESSED,
+	DRM_FORMAT_MOD_LINEAR,
+	DRM_FORMAT_MOD_INVALID
+};
+
+/*
+ * J716F diagnostic: force linear scanout buffers.  If the freeze follows the
+ * first full-screen UBWC plane commit, advertising only LINEAR makes the
+ * compositor allocate uncompressed buffers and takes UBWC out of the path.
+ */
+static bool force_linear;
+MODULE_PARM_DESC(force_linear,
+		 "J716F diagnostic: advertise only linear DRM format modifiers");
+module_param_named(force_linear, force_linear, bool, 0644);
+
+static const uint64_t linear_format_modifiers[] = {
 	DRM_FORMAT_MOD_LINEAR,
 	DRM_FORMAT_MOD_INVALID
 };
@@ -1836,7 +1852,9 @@ static struct drm_plane *dpu_plane_init_common(struct drm_device *dev,
 	pdpu = drmm_universal_plane_alloc(dev, struct dpu_plane, base,
 				0xff, &dpu_plane_funcs,
 				format_list, num_formats,
-				supported_format_modifiers, type, NULL);
+				force_linear ? linear_format_modifiers :
+					       supported_format_modifiers,
+				type, NULL);
 	if (IS_ERR(pdpu))
 		return ERR_CAST(pdpu);
 

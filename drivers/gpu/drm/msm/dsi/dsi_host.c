@@ -1777,6 +1777,9 @@ static void dsi_error(struct msm_dsi_host *msm_host)
 	queue_work(msm_host->workqueue, &msm_host->err_work);
 }
 
+/* J716F diagnostic: log the first DSI IRQ statuses seen after boot. */
+static unsigned int j716f_dsi_irq_logs;
+
 static irqreturn_t dsi_host_irq(int irq, void *ptr)
 {
 	struct msm_dsi_host *msm_host = ptr;
@@ -1790,6 +1793,11 @@ static irqreturn_t dsi_host_irq(int irq, void *ptr)
 	isr = dsi_read(msm_host, REG_DSI_INTR_CTRL);
 	dsi_write(msm_host, REG_DSI_INTR_CTRL, isr);
 	spin_unlock_irqrestore(&msm_host->intr_lock, flags);
+
+	if (j716f_dsi_irq_logs < 60) {
+		j716f_dsi_irq_logs++;
+		pr_info("J716F DSI%d irq isr=0x%08x\n", msm_host->id, isr);
+	}
 
 	DBG("isr=0x%x, id=%d", isr, msm_host->id);
 

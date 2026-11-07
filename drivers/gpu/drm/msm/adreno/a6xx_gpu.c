@@ -1822,14 +1822,20 @@ static void a6xx_fault_detect_irq(struct msm_gpu *gpu)
 {
 	struct msm_ringbuffer *ring = gpu->funcs->active_ring(gpu);
 
+	dev_info(&gpu->pdev->dev, "J716F GPU: fault irq enter\n");
+
 	/*
 	 * If stalled on SMMU fault, we could trip the GPU's hang detection,
 	 * but the fault handler will trigger the devcore dump, and we want
 	 * to otherwise resume normally rather than killing the submit, so
 	 * just bail.
 	 */
-	if (gpu_read(gpu, REG_A6XX_RBBM_STATUS3) & A6XX_RBBM_STATUS3_SMMU_STALLED_ON_FAULT)
+	if (gpu_read(gpu, REG_A6XX_RBBM_STATUS3) & A6XX_RBBM_STATUS3_SMMU_STALLED_ON_FAULT) {
+		dev_info(&gpu->pdev->dev, "J716F GPU: fault irq SMMU stalled\n");
 		return;
+	}
+
+	dev_info(&gpu->pdev->dev, "J716F GPU: fault irq reading state\n");
 
 	DRM_DEV_ERROR(&gpu->pdev->dev,
 		"gpu fault ring %d fence %x status %8.8X rb %4.4x/%4.4x ib1 %16.16llX/%4.4x ib2 %16.16llX/%4.4x\n",
