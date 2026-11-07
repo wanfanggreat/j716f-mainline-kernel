@@ -1,0 +1,18 @@
+--- a/drivers/gpu/drm/msm/dsi/phy/dsi_phy_7nm.c
++++ b/drivers/gpu/drm/msm/dsi/phy/dsi_phy_7nm.c
+@@ -884,6 +884,15 @@
+ 		return ret;
+ 	}
+ 
++	/*
++	 * The clock framework may prepare the PLL while reparenting the
++	 * dispcc clocks to this newly registered provider (7.x).  Program a
++	 * valid default VCO rate so that the prepare can lock; the DSI host
++	 * reprograms the rate for the panel mode later.
++	 */
++	if (pll_7nm->clk_hw.clk)
++		clk_set_rate(pll_7nm->clk_hw.clk, phy->cfg->min_pll_rate);
++
+ 	phy->vco_hw = &pll_7nm->clk_hw;
+ 
+ 	/* TODO: Remove this when we have proper display handover support */

@@ -1,0 +1,11 @@
+--- a/drivers/soc/qcom/ubwc_config.c
++++ b/drivers/soc/qcom/ubwc_config.c
+@@ -159,6 +159,8 @@
+ 	{ .compatible = "qcom,sm7325", .data = &ubwc_3_1_hbb14, },
+ 	{ .compatible = "qcom,sm8150", .data = &ubwc_3_0_hbb15, },
+ 	{ .compatible = "qcom,sm8250", .data = &ubwc_4_0_hbb16, },
++	/* J716F bootloader rewrites the root compatible to the board name only */
++	{ .compatible = "lenovo,j716f", .data = &ubwc_4_0_hbb16, },
+ 	{ .compatible = "qcom,sm8350", .data = &ubwc_4_0_hbb16, },
+ 	{ .compatible = "qcom,sm8450", .data = &ubwc_4_0_hbb16, },
+ 	{ .compatible = "qcom,sm8550", .data = &ubwc_4_0_hbb16, },

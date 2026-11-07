@@ -1,0 +1,51 @@
+# v40 config + cmdline deltas, applied on top of the v39 .config
+# (out/linux-7.3.1-phasei/.config before this round), then olddefconfig.
+#
+# Why each line:
+#   PSEUDO_NMI off / HARDLOCKUP PERF off
+#       v39 turned both on and 3/3 boots wedged udev in
+#       async_synchronize_cookie_domain, so no module loaded and Wi-Fi was
+#       gone.  Single-variable revert (TD-059).  PERF hardlockup on arm64
+#       depends on pseudo-NMI being real (arch/arm64/kernel/watchdog_hld.c),
+#       so it goes with it.
+#   HARDLOCKUP_DETECTOR_BUDDY + PREFER_BUDDY
+#       Keeps "Watchdog detected hard LOCKUP on cpu N" without touching
+#       interrupt delivery: the buddy detector counts hrtimer interrupts.
+#   WATCHDOG_SYSFS
+#       Without it watchdog_dev.c compiles wdt_groups out entirely, which is
+#       why v39 saw an empty /sys/class/watchdog/watchdog0.  Not a driver bug.
+#   WATCHDOG_NOWAYOUT
+#       systemd's final close() of /dev/watchdog used to disarm the hardware
+#       watchdog during shutdown; a hang there then had no recovery (M5: 6+
+#       minutes).  NOWAYOUT makes that close a no-op.
+#   WQ_WATCHDOG
+#       A stuck async worker parks in async_synchronize_*; the workqueue
+#       stall detector reports the pool before the whole system wedges.
+CONFIG_ARM64_PSEUDO_NMI=n
+CONFIG_HARDLOCKUP_DETECTOR_PERF=n
+CONFIG_HARDLOCKUP_DETECTOR=y
+CONFIG_HARDLOCKUP_DETECTOR_BUDDY=y
+CONFIG_HARDLOCKUP_DETECTOR_PREFER_BUDDY=y
+CONFIG_WATCHDOG_SYSFS=y
+CONFIG_WATCHDOG_NOWAYOUT=y
+CONFIG_WQ_WATCHDOG=y
+# kept from v39:
+CONFIG_WATCHDOG_PRETIMEOUT_GOV=y
+CONFIG_WATCHDOG_PRETIMEOUT_GOV_PANIC=y
+CONFIG_WATCHDOG_PRETIMEOUT_DEFAULT_GOV_PANIC=y
+CONFIG_SOFTLOCKUP_DETECTOR=y
+CONFIG_DETECT_HUNG_TASK=y
+CONFIG_PANIC_TIMEOUT=10
+
+# cmdline: v39 base minus two tokens, nothing else changes.
+#   -panic=-1                       "delay <0 = reboot immediately"; it
+#                                   overrode CONFIG_PANIC_TIMEOUT=10, so panic
+#                                   reset the board before panic_print flushed
+#                                   the all-CPU backtraces.
+#   -irqchip.gicv3_pseudo_nmi=1     matches CONFIG_ARM64_PSEUDO_NMI=n above.
+#
+# Final v40 cmdline (NCM):
+# console=ttyMSM0,115200n8 earlycon=qcom_geni,0xa90000 console=tty0 loglevel=7
+# clk_ignore_unused pd_ignore_unused fbcon=font=TER16x32 j716f.timeout=0
+# j716f.usbnet=ncm j716f.root=UUID=3f2a9c1e-... j716f.rootuuid=... root=UUID=...
+# rw rootwait systemd.show_status=1

@@ -1,0 +1,191 @@
+--- a/sound/soc/qcom/qdsp6/q6asm-dai.c
++++ b/sound/soc/qcom/qdsp6/q6asm-dai.c
+@@ -30,27 +30,34 @@
+ MODULE_PARM_DESC(capture_debug, "Inspect capture DMA buffers (disabled by default)");
+ 
+ /*
+- * Lenovo J716F (SM8250-AC / kona ADSP): the firmware answers
+- * ASM_CMD_SHARED_MEM_MAP_REGIONS with ADSP_EFAILED for the address the
+- * upstream driver computes, while the same ADSP accepts the buffer when the
+- * vendor kernel hands it an ION IOVA from the audio SMMU window with the SID
+- * in the upper 32 bits. Different ASM firmware generations interpret that
+- * 64-bit address field differently, so keep the upstream encoding as mode 0
+- * and fall back through the other plausible encodings until one is accepted:
++ * Lenovo J716F (SM8250-AC / kona ADSP): the ADSP answers
++ * ASM_CMD_SHARED_MEM_MAP_REGIONS with ADSP_EFAILED for any buffer address
++ * outside the LPASS audio SMMU window.  The vendor kernel maps its audio
++ * buffers from 0x1000_0000-0x1FFF_FFFF (qcom,iommu-dma-addr-pool on its
++ * msm-audio-ion node); with the upstream 32-bit DMA mask iommu-dma hands out
++ * an IOVA near the top of the 32-bit space and the DSP rejects it.
++ * q6asm_dai_pcm_new() therefore limits the audio DMA mask to 29 bits, which
++ * puts the IOVA at 0x1FFF_xxxx inside that window - that is the actual fix.
+  *
+- *  0: dma_addr | (sid << 32)   upstream / vendor ION layout
++ * The 64-bit address field encoding still differs between ASM firmware
++ * generations, so keep the upstream layout as mode 0 and fall back through
++ * the other plausible encodings if the DSP ever rejects it:
++ *
++ *  0: dma_addr | (sid << 32)   upstream / vendor ION layout (accepted here)
+  *  1: dma_addr                 no SID, low 32 bits of the IOVA
+  *  2: phys_addr | (sid << 32)  SID with the real physical address
+  *  3: phys_addr                no SID, physical address
+  *
+- * A mode that worked is remembered; map_mode >= 0 forces one from userspace
+- * through the module parameter node under /sys/module. Bring-up scaffolding:
+- * remove it once the encoding this ADSP accepts is known.
++ * The accepted mode is remembered per direction; map_mode >= 0 forces one
++ * from userspace through the module parameter node under /sys/module.
++ * Bring-up scaffolding: reduce to mode 0 once the window assumption has been
++ * re-verified on a second boot (TD-042).
+  */
+ static int map_mode = -1;
+ module_param(map_mode, int, 0644);
+ MODULE_PARM_DESC(map_mode, "J716F: force ASM shared-memory address mode (-1 = auto)");
+-static int map_mode_ok = -1;
++/* Accepted mode per direction (SNDRV_PCM_STREAM_PLAYBACK/CAPTURE). */
++static int map_mode_ok[2] = { -1, -1 };
+ 
+ #define PLAYBACK_MIN_NUM_PERIODS    2
+ #define PLAYBACK_MAX_NUM_PERIODS   8
+@@ -303,10 +310,12 @@
+ 	if (map_mode >= 0) {
+ 		order[n++] = map_mode;
+ 	} else {
+-		if (map_mode_ok >= 0)
+-			order[n++] = map_mode_ok;
++		int cached = map_mode_ok[substream->stream];
++
++		if (cached >= 0)
++			order[n++] = cached;
+ 		for (i = 0; i < 4; i++)
+-			if (i != map_mode_ok)
++			if (i != cached)
+ 				order[n++] = i;
+ 	}
+ 
+@@ -334,22 +343,34 @@
+ 			break;
+ 		}
+ 
++		/*
++		 * q6asm_map_memory_regions() returns a positive value on
++		 * success (see q6asm_apr_send_session_pkt()), so "not
++		 * negative" is the success test, not "== 0". It also returns
++		 * 0 early when the port already has a mapping, which is
++		 * success as well.
++		 */
+ 		ret = q6asm_map_memory_regions(substream->stream,
+ 					       prtd->audio_client, phys,
+ 					       period_sz, prtd->periods);
+-		dev_err(dev,
+-			"J716F-ASM: map dir=%d mode=%d phys=%#llx dma=%#llx pa=%#llx sid=%#llx period=%zu periods=%u -> %d\n",
+-			substream->stream, mode, (unsigned long long)phys,
+-			(unsigned long long)dma_addr,
+-			(unsigned long long)phys_addr,
+-			(unsigned long long)sid_bits, period_sz,
+-			prtd->periods, ret);
+-		if (!ret) {
++		if (ret >= 0) {
+ 			prtd->phys = phys;
+ 			prtd->mapped = true;
+-			map_mode_ok = mode;
++			map_mode_ok[substream->stream] = mode;
++			dev_info(dev,
++				 "J716F-ASM: map dir=%d mode=%d phys=%#llx dma=%#llx period=%zu periods=%u accepted\n",
++				 substream->stream, mode,
++				 (unsigned long long)phys,
++				 (unsigned long long)dma_addr,
++				 period_sz, prtd->periods);
+ 			return 0;
+ 		}
++
++		dev_err(dev,
++			"J716F-ASM: map dir=%d mode=%d phys=%#llx dma=%#llx period=%zu periods=%u rejected (%d)\n",
++			substream->stream, mode, (unsigned long long)phys,
++			(unsigned long long)dma_addr, period_sz,
++			prtd->periods, ret);
+ 	}
+ 
+ 	return -ENOMEM;
+@@ -391,24 +412,28 @@
+ 	prtd->capture_started = false;
+ 	/* rate and channels are sent to audio driver */
+ 	if (prtd->state) {
+-		/* clear the previous setup if any  */
+-		ret = q6asm_cmd(prtd->audio_client, prtd->stream_id, CMD_CLOSE);
+-		if (ret < 0) {
+-			dev_err(dev, "Failed to close q6asm stream %d\n", prtd->stream_id);
+-			return ret;
+-		}
+-
++		/*
++		 * Clear the previous setup if any.  Unmap before CMD_CLOSE:
++		 * CMD_CLOSE invalidates the ADSP-side memory map handle, and a
++		 * later UNMAP then fails with "invalid mem handle" and leaves
++		 * the session unusable.  The vendor driver frees the buffer
++		 * before releasing the client for the same reason.
++		 */
+ 		if (prtd->mapped) {
+ 			ret = q6asm_unmap_memory_regions(substream->stream,
+ 							 prtd->audio_client);
+-			if (ret < 0) {
+-				dev_err(dev, "Failed to unmap memory regions for q6asm stream %d\n",
+-					prtd->stream_id);
+-				return ret;
+-			}
++			if (ret < 0)
++				dev_warn(dev, "J716F: unmap before close failed %d\n",
++					 ret);
+ 			prtd->mapped = false;
+ 		}
+ 
++		ret = q6asm_cmd(prtd->audio_client, prtd->stream_id, CMD_CLOSE);
++		if (ret < 0) {
++			dev_err(dev, "Failed to close q6asm stream %d\n", prtd->stream_id);
++			return ret;
++		}
++
+ 		q6routing_stream_close(soc_prtd->dai_link->id,
+ 					 substream->stream);
+ 		prtd->state = Q6ASM_STREAM_STOPPED;
+@@ -724,17 +749,17 @@
+ 		 * after the stream had been opened: the ADSP only tolerates a
+ 		 * limited number of open sessions and answered the next
+ 		 * OPEN_WRITE/OPEN_READ with ADSP_EALREADY (0x9).
++		 *
++		 * Unmap first, then close: CMD_CLOSE invalidates the ADSP-side
++		 * memory map handle, so an UNMAP afterwards fails and leaves the
++		 * bookkeeping inconsistent.
+ 		 */
+ 		if (prtd->mapped) {
+-			q6asm_cmd(prtd->audio_client, prtd->stream_id,
+-				  CMD_CLOSE);
+ 			q6asm_unmap_memory_regions(substream->stream,
+ 						   prtd->audio_client);
+ 			prtd->mapped = false;
+-		} else {
+-			q6asm_cmd(prtd->audio_client, prtd->stream_id,
+-				  CMD_CLOSE);
+ 		}
++		q6asm_cmd(prtd->audio_client, prtd->stream_id, CMD_CLOSE);
+ 		q6asm_audio_client_free(prtd->audio_client);
+ 		prtd->audio_client = NULL;
+ 	}
+--- a/sound/soc/qcom/qdsp6/q6asm.c
++++ b/sound/soc/qcom/qdsp6/q6asm.c
+@@ -321,6 +321,15 @@
+ 		dev_err(a->dev, "DSP returned error[%x]\n",
+ 			ac->result.status);
+ 		rc = -EINVAL;
++	} else {
++		/*
++		 * wait_event_timeout() returns the remaining jiffies, i.e. a
++		 * positive value on success. Callers use this return value as
++		 * an errno (and some, like the ASM memory-map ladder, test for
++		 * "== 0"), so report success as 0 here instead of leaking the
++		 * timeout remainder.
++		 */
++		rc = 0;
+ 	}
+ 
+ err:

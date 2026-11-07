@@ -1,0 +1,21 @@
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c
+@@ -78,11 +78,15 @@
+ 	return pcc_white_r != 1024 || pcc_white_g != 1024 || pcc_white_b != 1024;
+ }
+ 
+-/* Q10 -> the S3.15 the PCC register wants; clamp to the 4.0 it can hold. */
++/*
++ * Q10 -> the S3.15 the PCC register wants.  1.0 is 0x8000 and the positive
++ * range stops at 0x1ffff (3.9999), so 4096 must clamp to 4095: 4096 << 5 is
++ * 0x20000, which the block reads as -4.0 and would blank the screen.
++ */
+ static inline u32 dpu_pcc_gain_s3_15(unsigned int q10)
+ {
+-	if (q10 > 4096)
+-		q10 = 4096;
++	if (q10 > 4095)
++		q10 = 4095;
+ 
+ 	return q10 << 5;
+ }

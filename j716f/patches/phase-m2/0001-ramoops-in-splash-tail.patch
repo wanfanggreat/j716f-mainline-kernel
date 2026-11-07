@@ -1,0 +1,35 @@
+--- a/arch/arm64/boot/dts/qcom/sm8250-lenovo-j716f.dts
++++ b/arch/arm64/boot/dts/qcom/sm8250-lenovo-j716f.dts
+@@ -61,10 +61,31 @@
+ 	};
+ 
+ 	reserved-memory {
++		/*
++		 * The bootloader loads the splash into the start of this
++		 * region; the panel itself needs 2560x1600x4 = 16 MiB, so
++		 * 33 MiB is plenty and the last 2 MiB is dead weight after
++		 * handoff.
++		 */
+ 		cont_splash_mem: memory@9c000000 {
+-			reg = <0x0 0x9c000000 0x0 0x2300000>;
++			reg = <0x0 0x9c000000 0x0 0x2100000>;
+ 			no-map;
+ 		};
++
++		/*
++		 * Phase M2: crash log that survives a reboot.  A watchdog or
++		 * panic reset keeps the DDR contents for the next boot, which
++		 * is exactly the case we need for the CPU-idle freeze seen on
++		 * 2026-11-07 (no pstore at all back then).  Sits in the tail
++		 * of the splash reservation so nothing else can hand it out.
++		 */
++		ramoops@9e100000 {
++			compatible = "ramoops";
++			reg = <0x0 0x9e100000 0x0 0x200000>;
++			record-size = <0x40000>;
++			console-size = <0x80000>;
++			pmsg-size = <0x40000>;
++		};
+ 	};
+ 
+ 	vph_pwr: regulator-vph-pwr {

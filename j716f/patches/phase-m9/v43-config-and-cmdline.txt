@@ -1,0 +1,32 @@
+v43 配置与 cmdline 记录
+=======================
+
+配置增量（在 v42 .config 上）：
+
+  CONFIG_U_SERIAL_CONSOLE=y
+
+其余不变（CONFIG_USB_CONFIGFS_ACM=y、CONFIG_USB_F_ACM=y、
+CONFIG_USB_U_SERIAL=y 在 v42 已开；v42 的 NETCONSOLE、PSEUDO_NMI、
+WATCHDOG_SYSFS/NOWAYOUT、WQ_WATCHDOG、PSTORE_RAM/CONSOLE/PMSG 保持）。
+
+配置哈希（v43 构建，out/linux-7.3.1-phasei/.config）：
+  见 build-identity.txt / 清单。
+
+cmdline（在 v42 基础上加一处）：
+
+  console=ttyMSM0,115200n8 earlycon=qcom_geni,0xa90000
+  console=tty0 console=ttyGS0
+  loglevel=7 clk_ignore_unused pd_ignore_unused fbcon=font=TER16x32
+  j716f.timeout=0 j716f.usbnet=ncm|rndis
+  j716f.root=UUID=3f2a9c1e-7b4d-4e2a-9c5f-1d8e6b3a4f70
+  j716f.rootuuid=3f2a9c1e-7b4d-4e2a-9c5f-1d8e6b3a4f70
+  root=UUID=3f2a9c1e-7b4d-4e2a-9c5f-1d8e6b3a4f70 rw rootwait
+  systemd.show_status=1
+  [默认镜像] irqchip.gicv3_pseudo_nmi=1
+  [-nopnmi 对照] 无 pseudo_nmi
+
+说明：
+- `console=ttyGS0` 在 ACM 函数创建（j716f-acm-console.sh on）后注册；
+  注册时 CON_PRINTBUFFER 会把日志缓冲打到串口。ACM 不在时该 console
+  条目只是未匹配，不影响 tty0/ttyMSM0。
+- panic=20 由 /etc/sysctl.d/60-j716f-panic.conf 设置（v42 起）。

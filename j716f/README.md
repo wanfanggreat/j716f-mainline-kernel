@@ -15,17 +15,30 @@ Snapdragon 870 / SM8250-AC）主线 Linux 移植的**完整内核源码**，
 | tarball SHA-256 | `fa595aad93734f829c963c2a90ef7c3673224fd7fdae7b49406e397cde2de231` |
 | 上游基线 tag | `upstream-7.3.1` |
 | 基线提交 | `788e48f`（chore(kernel): import Linux 7.3.1 from kernel.org tarball） |
-| 本仓最终 tag | `j716f-m10` |
+| M10 构建源码 tag | `j716f-m10` = `e562462a3c039afd27f3ab5e1cc584d8bc24b77a` |
+| 归档工作树 tag | `j716f-worktree-20261108` = `b6276810bda3402ea33d2a9f1cca22e998143b07`（分支 `main` HEAD） |
 | 许可 | GPL-2.0（见 `COPYING`） |
 
 上游 tarball 不携带 git 历史，因此本仓把**未修改的 7.3.1 树**作为单个
-基线提交导入；`git diff upstream-7.3.1..j716f-m10` 就是本项目的全部本地改动。
+基线提交导入；`git diff upstream-7.3.1..j716f-m10` 是产生 M10 镜像的
+源码改动，`git diff upstream-7.3.1..j716f-worktree-20261108` 是归档时
+工作树的全部改动。
+
+M10 镜像构建完成后（2026-11-08 00:59），工作树又增加了一处
+`u_serial.c` 修改：`oops_in_progress` 后正常完成路径不再从 fifo 取数，
+避免把 panic 数据排到共享请求里。该改动**没有重新编译**，因此：
+
+- `Image`/DTB/模块等构建产物对应 **`j716f-m10`**；
+- 当前分支 HEAD 对应 **`j716f-worktree-20261108`**，比构建源码多
+  7 insertions / 1 deletion（净 +6 行）。
 
 ## 本地改动范围
 
 相对 7.3.1 共 40 个文件：38 个修改、2 个新增
 （`sm8250-lenovo-j716f.dts`、`es7210.c`），合计
-2820 insertions / 175 deletions。逐文件统计见
+4993 insertions / 176 deletions（以 `j716f-worktree-20261108` 计）。
+M10 构建源码 `j716f-m10` 为 4986 insertions / 175 deletions。
+逐文件统计见
 [`CHANGES-vs-7.3.1.md`](CHANGES-vs-7.3.1.md)，按阶段拆分的补丁原文在
 [`patches/`](patches/)。
 

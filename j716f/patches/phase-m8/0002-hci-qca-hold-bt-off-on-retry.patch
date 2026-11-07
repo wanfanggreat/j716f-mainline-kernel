@@ -1,0 +1,20 @@
+--- a/drivers/bluetooth/hci_qca.c
++++ b/drivers/bluetooth/hci_qca.c
+@@ -2059,6 +2059,17 @@
+ 
+ 		if (retries < MAX_INIT_RETRIES) {
+ 			bt_dev_warn(hdev, "Retry BT power ON:%d", retries);
++			/*
++			 * Lenovo J716F: the pwrseq turns BT_EN off and then
++			 * qca_power_on turns it on again in the next
++			 * iteration.  Without a delay the pin is low for
++			 * only microseconds; the QCA6390 then never answers
++			 * the next 0xfc00 version command (seen when
++			 * bluetoothd is restarted, where the first power
++			 * cycle is not done by the bootloader).  Hold the
++			 * BT domain off long enough to actually reset it.
++			 */
++			msleep(200);
+ 			if (hu->serdev) {
+ 				serdev_device_close(hu->serdev);
+ 				ret = serdev_device_open(hu->serdev);

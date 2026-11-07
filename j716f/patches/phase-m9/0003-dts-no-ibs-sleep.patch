@@ -1,0 +1,16 @@
+--- a/arch/arm64/boot/dts/qcom/sm8250-lenovo-j716f.dts
++++ b/arch/arm64/boot/dts/qcom/sm8250-lenovo-j716f.dts
+@@ -1066,6 +1066,13 @@
+ 		vddrfa1p7-supply = <&vreg_pmu_rfa_1p7>;
+ 
+ 		/*
++		 * v42 真机：pm_test 的 UART suspend/resume 会让 QCA6390
++		 * 重新初始化失败（0xfc00/0x0c03 -110），挂起后蓝牙变 DOWN。
++		 * 保留 BT 供电、跳过 in-band sleep，等 v43 验证。
++		 */
++		qcom,no-ibs-sleep;
++
++		/*
+ 		 * Phase L4: 属性按 LSB-first 编码。内核把它解释为
+ 		 * 02:00:00:00:5A:AD（本地管理、单播），不是数组顺序。
+ 		 */

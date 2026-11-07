@@ -1,0 +1,21 @@
+--- a/sound/soc/qcom/qdsp6/q6dsp-lpass-clocks.c
++++ b/sound/soc/qcom/qdsp6/q6dsp-lpass-clocks.c
+@@ -130,7 +130,17 @@
+ 	struct q6dsp_clk *clk = to_q6dsp_clk(hw);
+ 	struct q6dsp_cc *cc = dev_get_drvdata(clk->dev);
+ 
+-	cc->desc->lpass_unvote_clk(clk->dev, clk->q6dsp_clk_id, clk->handle);
++	/*
++	 * Lenovo J716F: the ADSP rejects the LPASS core vote (see
++	 * clk_vote_q6dsp_block) and q6afe never fills in a client handle,
++	 * so clk->handle stays 0.  Sending the matching devote anyway only
++	 * produces "cmd = 0x100f6 returned error = 0x1" plus "Unknown cmd"
++	 * on every audio clock teardown.  There is nothing to unvote when
++	 * the vote was refused, so skip it.
++	 */
++	if (clk->handle)
++		cc->desc->lpass_unvote_clk(clk->dev, clk->q6dsp_clk_id,
++					   clk->handle);
+ }
+ 
+ static const struct clk_ops clk_vote_q6dsp_ops = {

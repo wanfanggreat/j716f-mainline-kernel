@@ -1,0 +1,21 @@
+--- a/sound/soc/codecs/lpass-va-macro.c
++++ b/sound/soc/codecs/lpass-va-macro.c
+@@ -854,9 +854,16 @@
+ 			ret = regulator_set_current_limit(va->micb_reg,
+ 							  va->micb_current,
+ 							  va->micb_current);
++			/*
++			 * Lenovo J716F: va-vdd-micb is vreg_s4a_1p8, a fixed
++			 * always-on SMPS that does not implement current
++			 * limiting, so -EINVAL is expected and harmless (the
++			 * microphones work).  Do not log it as an error on
++			 * every capture start.
++			 */
+ 			if (ret)
+-				dev_err(va->dev,
+-					"J716F-VA: micb set current %u failed %d\n",
++				dev_dbg(va->dev,
++					"J716F-VA: micb current %u not supported (%d)\n",
+ 					va->micb_current, ret);
+ 		}
+ 		ret = regulator_enable(va->micb_reg);

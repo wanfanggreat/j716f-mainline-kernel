@@ -1,0 +1,115 @@
+--- a/drivers/usb/gadget/function/u_serial.c
++++ b/drivers/usb/gadget/function/u_serial.c
+@@ -95,6 +95,7 @@
+ 	struct usb_request	*req;
+ 	struct kfifo		buf;
+ 	size_t			missed;
++	bool			panic_started;
+ };
+ 
+ /*
+@@ -951,7 +952,7 @@
+ 	}
+ }
+ 
+-static void __gs_console_push(struct gs_console *cons)
++static void __gs_console_push(struct gs_console *cons, bool atomic)
+ {
+ 	struct usb_request *req = cons->req;
+ 	struct usb_ep *ep;
+@@ -964,7 +965,7 @@
+ 		return;	/* busy */
+ 
+ 	ep = cons->console.data;
+-	size = kfifo_out(&cons->buf, req->buf, ep->maxpacket);
++	size = kfifo_out(&cons->buf, req->buf, GS_CONSOLE_BUF_SIZE);
+ 	if (!size)
+ 		return;
+ 
+@@ -979,10 +980,24 @@
+ 
+ 	req->length = size;
+ 
+-	spin_unlock_irq(&cons->lock);
+-	if (usb_ep_queue(ep, req, GFP_ATOMIC))
+-		req->length = 0;
+-	spin_lock_irq(&cons->lock);
++	/*
++	 * Lenovo J716F: in panic context there is no workqueue and no
++	 * completion IRQ; queue the request directly while keeping IRQs
++	 * disabled.  The UDC still transfers the data, which is what puts
++	 * the backtrace on the host's serial port.  In normal context keep
++	 * the original unlock_irq()/lock_irq() so a completion can run.
++	 */
++	if (atomic) {
++		spin_unlock(&cons->lock);
++		if (usb_ep_queue(ep, req, GFP_ATOMIC))
++			req->length = 0;
++		spin_lock(&cons->lock);
++	} else {
++		spin_unlock_irq(&cons->lock);
++		if (usb_ep_queue(ep, req, GFP_ATOMIC))
++			req->length = 0;
++		spin_lock_irq(&cons->lock);
++	}
+ }
+ 
+ static void gs_console_work(struct work_struct *work)
+@@ -991,7 +1006,7 @@
+ 
+ 	spin_lock_irq(&cons->lock);
+ 
+-	__gs_console_push(cons);
++	__gs_console_push(cons, false);
+ 
+ 	spin_unlock_irq(&cons->lock);
+ }
+@@ -1005,12 +1020,37 @@
+ 
+ 	spin_lock_irqsave(&cons->lock, flags);
+ 
++	/*
++	 * Lenovo J716F: the 8 KiB fifo normally holds recent normal logs.
++	 * If a panic starts, drop them once so the first 8 KiB request that
++	 * is queued directly carries the panic header and backtraces, not a
++	 * window of old messages.  Later panic chunks append normally.
++	 */
++	if (oops_in_progress && !cons->panic_started) {
++		kfifo_reset(&cons->buf);
++		cons->panic_started = true;
++	}
++
+ 	n = kfifo_in(&cons->buf, buf, count);
+ 	if (n < count)
+ 		cons->missed += count - n;
+ 
+-	if (cons->req && !cons->req->length)
+-		schedule_work(&cons->work);
++	if (!oops_in_progress && cons->panic_started &&
++	    cons->req && !cons->req->length && kfifo_is_empty(&cons->buf))
++		cons->panic_started = false;
++
++	if (cons->req && !cons->req->length) {
++		/*
++		 * Lenovo J716F: schedule_work() cannot run during a panic
++		 * (secondaries stopped, workqueues frozen), so the ttyGS
++		 * console would never reach the host exactly when it is
++		 * needed.  Push synchronously and keep IRQs off.
++		 */
++		if (oops_in_progress)
++			__gs_console_push(cons, true);
++		else
++			schedule_work(&cons->work);
++	}
+ 
+ 	spin_unlock_irqrestore(&cons->lock, flags);
+ }
+@@ -1031,7 +1071,7 @@
+ 		return 0;
+ 
+ 	ep = port->port_usb->in;
+-	req = gs_alloc_req(ep, ep->maxpacket, GFP_ATOMIC);
++	req = gs_alloc_req(ep, GS_CONSOLE_BUF_SIZE, GFP_ATOMIC);
+ 	if (!req)
+ 		return -ENOMEM;
+ 	req->complete = gs_console_complete_out;

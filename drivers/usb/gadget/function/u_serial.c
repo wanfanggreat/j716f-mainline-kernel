@@ -1006,7 +1006,13 @@ static void gs_console_work(struct work_struct *work)
 
 	spin_lock_irq(&cons->lock);
 
-	__gs_console_push(cons);
+	/*
+	 * Once a panic starts, the panic path owns the fifo and queues its
+	 * own requests; a late normal request completion must not drain the
+	 * panic data into the shared request and reorder the stream.
+	 */
+	if (!oops_in_progress)
+		__gs_console_push(cons);
 
 	spin_unlock_irq(&cons->lock);
 }

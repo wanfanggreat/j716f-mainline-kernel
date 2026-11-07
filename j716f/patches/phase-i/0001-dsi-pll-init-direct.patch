@@ -1,0 +1,48 @@
+--- a/drivers/gpu/drm/msm/dsi/phy/dsi_phy_7nm.c
++++ b/drivers/gpu/drm/msm/dsi/phy/dsi_phy_7nm.c
+@@ -905,23 +905,34 @@
+ 	pll_7nm->phy = phy;
+ 	phy->pll_data = pll_7nm;
+ 
++	phy->vco_hw = &pll_7nm->clk_hw;
++
++	/*
++	 * Program a valid default VCO configuration before the clock provider
++	 * is registered.
++	 *
++	 * The clock core reparents the dispcc DSI gate clocks to this provider
++	 * as soon as it appears, and their CLK_SET_RATE_UNGATE path prepares
++	 * the PLL.  If the PLL registers still hold their reset values the
++	 * prepare cannot lock (status 0) and the divider recalculation warns
++	 * about a zero divisor.
++	 *
++	 * Doing this through clk_set_rate() is wrong: that propagates the rate
++	 * change down into the dispcc children while their own divider
++	 * registers are still zero, which is exactly what produced the
++	 * zero-divisor warnings and the failed PLL lock in the first place.
++	 * Program the PLL registers directly instead; the DSI host still
++	 * reprograms the real panel rate later.
++	 */
++	dsi_pll_7nm_vco_set_rate(&pll_7nm->clk_hw, phy->cfg->min_pll_rate,
++				 VCO_REF_CLK_RATE);
++
+ 	ret = pll_7nm_register(pll_7nm, phy->provided_clocks->hws);
+ 	if (ret) {
+ 		DRM_DEV_ERROR(&pdev->dev, "failed to register PLL: %d\n", ret);
+ 		return ret;
+ 	}
+ 
+-	/*
+-	 * The clock framework may prepare the PLL while reparenting the
+-	 * dispcc clocks to this newly registered provider (7.x).  Program a
+-	 * valid default VCO rate so that the prepare can lock; the DSI host
+-	 * reprograms the rate for the panel mode later.
+-	 */
+-	if (pll_7nm->clk_hw.clk)
+-		clk_set_rate(pll_7nm->clk_hw.clk, phy->cfg->min_pll_rate);
+-
+-	phy->vco_hw = &pll_7nm->clk_hw;
+-
+ 	/* TODO: Remove this when we have proper display handover support */
+ 	msm_dsi_phy_pll_save_state(phy);
+ 	/*

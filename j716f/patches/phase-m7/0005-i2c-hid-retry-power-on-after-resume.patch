@@ -1,0 +1,25 @@
+--- a/drivers/hid/i2c-hid/i2c-hid-core.c
++++ b/drivers/hid/i2c-hid/i2c-hid-core.c
+@@ -440,6 +440,22 @@
+ 		ret = i2c_hid_set_power_command(ihid, I2C_HID_PWR_ON);
+ 	}
+ 
++	/*
++	 * Lenovo J716F: the detachable cover keyboard (17EF:610B on i2c-4)
++	 * and its touchpad (on i2c-1) answer with -ENXIO for hundreds of
++	 * milliseconds after an s2idle resume; the 400us retry above is far
++	 * too short, the resume fails with -6 and both devices stay dead
++	 * until they are unbound and rebound.  Give the devices up to 500ms
++	 * to come back, and report one error only if they really do not.
++	 * This only runs when the first two attempts failed, so a device
++	 * that is genuinely gone costs one extra half second per resume.
++	 */
++	for (int i = 0; ret == -ENXIO && power_state == I2C_HID_PWR_ON &&
++			i < 10; i++) {
++		msleep(50);
++		ret = i2c_hid_set_power_command(ihid, I2C_HID_PWR_ON);
++	}
++
+ 	if (ret)
+ 		dev_err(&ihid->client->dev,
+ 			"failed to change power setting.\n");

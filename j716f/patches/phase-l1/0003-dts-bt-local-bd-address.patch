@@ -1,0 +1,15 @@
+--- a/arch/arm64/boot/dts/qcom/sm8250-lenovo-j716f.dts
++++ b/arch/arm64/boot/dts/qcom/sm8250-lenovo-j716f.dts
+@@ -842,6 +842,12 @@
+ 		vddrfa0p8-supply = <&vreg_pmu_rfa_0p8>;
+ 		vddrfa1p2-supply = <&vreg_pmu_rfa_1p2>;
+ 		vddrfa1p7-supply = <&vreg_pmu_rfa_1p7>;
++
++		/*
++		 * Phase L2: 先用本地管理地址让 hci0 通过 valid BD address 检查；
++		 * 工厂地址可从 persist 分区读取后替换。
++		 */
++		local-bd-address = [02 00 00 00 5a ad];
+ 	};
+ };
+ 

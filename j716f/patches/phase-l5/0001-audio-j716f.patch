@@ -1,0 +1,3036 @@
+--- a/include/sound/cs35l41.h
++++ b/include/sound/cs35l41.h
+@@ -38,6 +38,9 @@
+ #define CS35L41_PWR_CTRL3		0x0000201C
+ #define CS35L41_CTRL_OVRRIDE		0x00002020
+ #define CS35L41_AMP_OUT_MUTE		0x00002024
++#define CS35L41_AMP_OUT_MUTE_MASK	0x00000010
++/* Vendor driver clears this IRQ1_MASK1 bit when enabling the amp. */
++#define CS35L41_IRQ1_MASK1_PUP_UNMASK	0x00001000
+ #define CS35L41_PROTECT_REL_ERR_IGN	0x00002034
+ #define CS35L41_GPIO_PAD_CONTROL	0x0000242C
+ #define CS35L41_JTAG_CONTROL		0x00002438
+@@ -61,6 +64,7 @@
+ #define CS35L41_MDSYNC_SYNC_PTE3	0x0000352C
+ #define CS35L41_MDSYNC_SYNC_MSM_STATUS	0x0000353C
+ #define CS35L41_BSTCVRT_VCTRL1		0x00003800
++#define CS35L41_BST_VCTL_MASK		0x000000ff
+ #define CS35L41_BSTCVRT_VCTRL2		0x00003804
+ #define CS35L41_BSTCVRT_PEAK_CUR	0x00003808
+ #define CS35L41_BSTCVRT_SFT_RAMP	0x0000380C
+@@ -810,6 +814,7 @@
+ 	int bst_ind;
+ 	int bst_ipk;
+ 	int bst_cap;
++	int bst_vctl_mv;
+ 	int dout_hiz;
+ 	struct cs35l41_gpio_cfg gpio1;
+ 	struct cs35l41_gpio_cfg gpio2;
+--- a/sound/core/pcm_lib.c
++++ b/sound/core/pcm_lib.c
+@@ -2021,9 +2021,6 @@
+ 			continue;
+ 		}
+ 		if (!tout) {
+-			pcm_dbg(substream->pcm,
+-				"%s timeout (DMA or IRQ trouble?)\n",
+-				is_playback ? "playback write" : "capture read");
+ 			err = -EIO;
+ 			break;
+ 		}
+--- a/sound/soc/codecs/Kconfig
++++ b/sound/soc/codecs/Kconfig
+@@ -1274,6 +1274,10 @@
+ config SND_SOC_ES7241
+ 	tristate "Everest Semi ES7241 CODEC"
+ 
++config SND_SOC_ES7210
++	tristate "Everest Semi ES7210 ADC"
++	depends on I2C
++
+ config SND_SOC_ES83XX_DSM_COMMON
+ 	depends on ACPI
+ 	tristate
+--- a/sound/soc/codecs/Makefile
++++ b/sound/soc/codecs/Makefile
+@@ -130,6 +130,7 @@
+ snd-soc-dmic-y := dmic.o
+ snd-soc-es7134-y := es7134.o
+ snd-soc-es7241-y := es7241.o
++snd-soc-es7210-y := es7210.o
+ snd-soc-es83xx-dsm-common-y := es83xx-dsm-common.o
+ snd-soc-es8311-y := es8311.o
+ snd-soc-es8316-y := es8316.o
+@@ -574,6 +575,7 @@
+ obj-$(CONFIG_SND_SOC_DMIC)	+= snd-soc-dmic.o
+ obj-$(CONFIG_SND_SOC_ES7134)	+= snd-soc-es7134.o
+ obj-$(CONFIG_SND_SOC_ES7241)	+= snd-soc-es7241.o
++obj-$(CONFIG_SND_SOC_ES7210)	+= snd-soc-es7210.o
+ obj-$(CONFIG_SND_SOC_ES83XX_DSM_COMMON)    += snd-soc-es83xx-dsm-common.o
+ obj-$(CONFIG_SND_SOC_ES8311)    += snd-soc-es8311.o
+ obj-$(CONFIG_SND_SOC_ES8316)    += snd-soc-es8316.o
+--- a/sound/soc/codecs/cs35l41-lib.c
++++ b/sound/soc/codecs/cs35l41-lib.c
+@@ -1276,6 +1276,23 @@
+ 		regmap_write(regmap, CS35L41_IRQ1_STATUS1, pup_pdn_mask);
+ 		break;
+ 	case CS35L41_INT_BOOST:
++		/*
++		 * Lenovo J716F: follow the vendor driver's enable sequence.
++		 *
++		 * The vendor does NOT wait for PUP_DONE here. It sets GLOBAL_EN,
++		 * clears the AMP_OUT_MUTE bit and unmasks the IRQ1_MASK1 bit that
++		 * reports the power-up event, then returns. Polling PUP_DONE the
++		 * way the upstream driver does makes every playback fail with
++		 * -110 on this board, even though the amplifier powers up fine
++		 * and audio plays.
++		 */
++		if (enable) {
++			regmap_update_bits(regmap, CS35L41_AMP_OUT_MUTE,
++					   CS35L41_AMP_OUT_MUTE_MASK, 0);
++			regmap_update_bits(regmap, CS35L41_IRQ1_MASK1,
++					   CS35L41_IRQ1_MASK1_PUP_UNMASK, 0);
++		}
++
+ 		ret = regmap_update_bits(regmap, CS35L41_PWR_CTRL1, CS35L41_GLOBAL_EN_MASK,
+ 					 enable << CS35L41_GLOBAL_EN_SHIFT);
+ 		if (ret) {
+@@ -1283,11 +1300,21 @@
+ 			return ret;
+ 		}
+ 
++		/*
++		 * Lenovo J716F: this amplifier never raises PUP_DONE with the
++		 * internal-boost configuration, even though it powers up and
++		 * plays audio (the vendor driver does not poll here at all).
++		 * Treat the timeout as informational; a genuine power-up
++		 * failure still results in silence.
++		 */
+ 		ret = regmap_read_poll_timeout(regmap, CS35L41_IRQ1_STATUS1,
+ 					int_status, int_status & pup_pdn_mask,
+ 					1000, 100000);
+-		if (ret)
+-			dev_err(dev, "Enable(%d) failed: %d\n", enable, ret);
++		if (ret) {
++			dev_warn(dev, "PUP_DONE not seen (%d), continuing\n", ret);
++			/* Keep the DAPM event successful: the amp is up. */
++			ret = 0;
++		}
+ 
+ 		/* Clear PUP/PDN status */
+ 		regmap_write(regmap, CS35L41_IRQ1_STATUS1, pup_pdn_mask);
+--- a/sound/soc/codecs/cs35l41.c
++++ b/sound/soc/codecs/cs35l41.c
+@@ -909,6 +909,27 @@
+ 	if (ret)
+ 		return ret;
+ 
++	/*
++	 * Lenovo J716F: the boost converter target voltage lives in
++	 * BSTCVRT_VCTRL1 and is left at its reset value of 0 by the upstream
++	 * driver. With a target of zero the amplifier is enabled and the DAPM
++	 * path powers up, but the speaker output stays silent because the
++	 * boost never generates a rail. The vendor driver programs it from a
++	 * "cirrus,boost-ctl-millivolt" property using
++	 *     vctl = ((millivolt - 2550) / 100) + 1
++	 * (2550 mV is the converter's floor; the vendor range check accepts
++	 * 2550..11000 mV) and so does this driver when the property is present.
++	 */
++	if (hw_cfg->bst_vctl_mv >= 2550 && hw_cfg->bst_vctl_mv <= 11000) {
++		unsigned int vctl = ((hw_cfg->bst_vctl_mv - 2550) / 100) + 1;
++
++		ret = regmap_update_bits(cs35l41->regmap,
++					 CS35L41_BSTCVRT_VCTRL1,
++					 CS35L41_BST_VCTL_MASK, vctl);
++		if (ret)
++			return ret;
++	}
++
+ 	/* Optional */
+ 	if (hw_cfg->dout_hiz <= CS35L41_ASP_DOUT_HIZ_MASK && hw_cfg->dout_hiz >= 0)
+ 		regmap_update_bits(cs35l41->regmap, CS35L41_SP_HIZ_CTRL, CS35L41_ASP_DOUT_HIZ_MASK,
+@@ -1050,6 +1071,12 @@
+ 	else
+ 		hw_cfg->bst_cap = -1;
+ 
++	ret = device_property_read_u32(dev, "cirrus,boost-ctl-millivolt", &val);
++	if (ret >= 0)
++		hw_cfg->bst_vctl_mv = val;
++	else
++		hw_cfg->bst_vctl_mv = -1;
++
+ 	ret = device_property_read_u32(dev, "cirrus,asp-sdout-hiz", &val);
+ 	if (ret >= 0)
+ 		hw_cfg->dout_hiz = val;
+--- a/sound/soc/codecs/lpass-tx-macro.c
++++ b/sound/soc/codecs/lpass-tx-macro.c
+@@ -5,6 +5,7 @@
+ #include <linux/init.h>
+ #include <linux/clk.h>
+ #include <linux/io.h>
++#include <linux/of_platform.h>
+ #include <linux/platform_device.h>
+ #include <linux/pm_clock.h>
+ #include <linux/pm_runtime.h>
+@@ -200,6 +201,13 @@
+ #define  CF_MIN_3DB_150HZ		0x2
+ #define	TX_ADC_MAX	5
+ #define TX_ADC_TO_DMIC(n) ((n - TX_ADC_MAX)/2)
++
++/*
++ * Lenovo J716F: the DMIC clock generators live in the VA macro block, so the
++ * TX macro has to power them explicitly (see lpass-va-macro.c).
++ */
++extern int va_macro_set_dmic_clk_early(u32 dmic, bool enable);
++extern int va_macro_enable_micbias(u32 dmic, bool enable);
+ #define NUM_DECIMATORS 8
+ #define TX_NUM_CLKS_MAX	5
+ #define TX_MACRO_DMIC_UNMUTE_DELAY_MS	40
+@@ -619,6 +627,18 @@
+ 
+ 	if (mclk_enable) {
+ 		if (tx->tx_mclk_users == 0) {
++			/*
++			 * Lenovo J716F: sync the cache BEFORE enabling the
++			 * clocks. regcache_sync() writes every cached register
++			 * back, and the reset defaults for FREQ_MCLK (0x090),
++			 * MCLK_CONTROL (0x000) and FS_CNT_CONTROL (0x004) are
++			 * all 0x00 - so running it after the enables turned
++			 * the TX macro MCLK straight back off and the
++			 * decimators produced digital silence.
++			 */
++			regcache_mark_dirty(regmap);
++			regcache_sync(regmap);
++
+ 			/* 9.6MHz MCLK, set value 0x00 if other frequency */
+ 			regmap_update_bits(regmap, CDC_TX_TOP_CSR_FREQ_MCLK, 0x01, 0x01);
+ 			regmap_update_bits(regmap, CDC_TX_CLK_RST_CTRL_MCLK_CONTROL,
+@@ -844,10 +864,34 @@
+ 	}
+ 
+ 	if (val != 0) {
+-		if (widget->shift) /* MSM DMIC */
++		/*
++		 * Lenovo J716F: widget->shift is the DAPM shift of the MUX
++		 * widget, which is 4 for the "TX DMIC MUXn" widgets in this
++		 * driver - but the vendor's check used a different field and
++		 * mainline ends up taking the SWR branch (bit7 cleared) here,
++		 * so the DMIC clock was never enabled. These MUXes only ever
++		 * select digital microphones on this board, so always take the
++		 * MSM DMIC path.
++		 */
++		if (true) { /* MSM DMIC */
++			/*
++			 * Lenovo J716F: tx_macro_enable_dec() only powers the
++			 * DMIC clock when the low nibble of
++			 * CDC_TX_INP_MUX_ADC_MUXn_CFG0 (the "adc_n" field) is
++			 * >= TX_ADC_MAX (5); TX_ADC_TO_DMIC() then maps
++			 * adc_n -> dmic as (adc_n - 5) / 2. Setting the MUX to
++			 * "DMIC2" only writes the enum field at bit 4..6 and
++			 * leaves adc_n at 0, so the DMIC clock was never
++			 * enabled and capture produced no data (the DSP
++			 * signalled EOS). Program adc_n as well:
++			 * 5 + 2 * (dmic index).
++			 */
+ 			snd_soc_component_write_field(component, mic_sel_reg,
+ 						      CDC_TXn_ADC_DMIC_SEL_MASK, 1);
+-		else if (tx->data->ver <= LPASS_VER_9_0_0)
++			snd_soc_component_write_field(component, e->reg,
++						      GENMASK(3, 0),
++						      TX_ADC_MAX + 2 * (val - 1));
++		} else if (tx->data->ver <= LPASS_VER_9_0_0)
+ 			tx_macro_update_smic_sel_v9(component, widget, tx,
+ 						    mic_sel_reg, val);
+ 		else
+@@ -929,19 +973,54 @@
+ 
+ 	switch (event) {
+ 	case SND_SOC_DAPM_PRE_PMU:
++		/*
++		 * Lenovo J716F: upstream only runs this block for the SWR
++		 * microphone path (CFG1 bit0). The MSM DMIC path
++		 * ("TX DECn MUX" = MSM_DMIC, the mode the stock Android
++		 * recorder uses) sets that bit to 0 and therefore never
++		 * programmed the DMIC clock select, so the physical
++		 * microphone got no clock and the DSP sent EOS with no data.
++		 * Run the block whenever the decimator's CFG0 adc_n field
++		 * selects a digital microphone, regardless of which of the two
++		 * DMIC sources is selected.
++		 */
+ 		adc_mux_reg = CDC_TX_INP_MUX_ADC_MUXn_CFG1(decimator);
+-		if (snd_soc_component_read(component, adc_mux_reg) & SWR_MIC) {
+-			adc_reg = CDC_TX_INP_MUX_ADC_MUXn_CFG0(decimator);
+-			adc_n = snd_soc_component_read(component, adc_reg) &
+-				CDC_TX_MACRO_SWR_MIC_MUX_SEL_MASK;
+-			if (adc_n >= TX_ADC_MAX) {
++		adc_reg = CDC_TX_INP_MUX_ADC_MUXn_CFG0(decimator);
++		adc_n = snd_soc_component_read(component, adc_reg) &
++			CDC_TX_MACRO_SWR_MIC_MUX_SEL_MASK;
++		if (adc_n >= TX_ADC_MAX) {
+ 				dmic = TX_ADC_TO_DMIC(adc_n);
+ 				dmic_clk_reg = CDC_TX_TOP_CSR_SWR_DMICn_CTL(dmic);
+ 
+ 				snd_soc_component_write_field(component, dmic_clk_reg,
+ 							CDC_TX_SWR_DMIC_CLK_SEL_MASK,
+ 							CDC_TX_SWR_MIC_CLK_DEFAULT);
+-			}
++
++				/*
++				 * Lenovo J716F: the DMIC clock *generators*
++				 * live in the VA macro block; the TX macro
++				 * only routes the decimator input. Without
++				 * starting the VA macro's DMIC clock the
++				 * physical microphone gets no clock and the
++				 * AFE port delivers nothing.
++				 *
++				 * This runs from DAPM power-up, not from a
++				 * kcontrol write, so the APR vote inside the
++				 * VA macro helper cannot deadlock the control
++				 * path.
++				 */
++				va_macro_set_dmic_clk_early(dmic, true);
++				/*
++				 * Lenovo J716F: a MEMS microphone needs its
++				 * bias rail before it will drive the data
++				 * line. mainline's "vdd-micb" DAPM supply
++				 * widget stays Off (0 users, 0 mV) unless
++				 * something explicitly programs the
++				 * regulator, so power it here alongside the
++				 * DMIC clock - this is where the vendor's
++				 * va_macro_enable_micbias() runs too.
++				 */
++				va_macro_enable_micbias(dmic, true);
+ 		}
+ 		snd_soc_component_write_field(component, dec_cfg_reg,
+ 					      CDC_TXn_ADC_MODE_MASK,
+@@ -951,6 +1030,19 @@
+ 					      CDC_TXn_PGA_MUTE_MASK, 0x1);
+ 		break;
+ 	case SND_SOC_DAPM_POST_PMU:
++		/*
++		 * Lenovo J716F: make sure the TX macro MCLK is actually
++		 * running once the decimator is powered. tx_macro_mclk_event()
++		 * enables it in its PRE_PMU, but that runs before the DAPM
++		 * register writes of this widget, and any later
++		 * regcache_sync()/write can drop MCLK_CONTROL (0x000) back to
++		 * its 0x00 default. Without the MCLK the decimator shifts out
++		 * silence.
++		 */
++		snd_soc_component_update_bits(component,
++					      CDC_TX_CLK_RST_CTRL_MCLK_CONTROL,
++					      CDC_TX_MCLK_EN_MASK,
++					      CDC_TX_MCLK_ENABLE);
+ 		snd_soc_component_write_field(component, tx_vol_ctl_reg,
+ 					     CDC_TXn_CLK_EN_MASK, 0x1);
+ 		if (!is_amic_enabled(component, tx, decimator)) {
+@@ -1161,10 +1253,22 @@
+ 		return -EINVAL;
+ 	}
+ 
+-	for_each_set_bit(decimator, &tx->active_ch_mask[dai->id], TX_MACRO_DEC_MAX)
++	for_each_set_bit(decimator, &tx->active_ch_mask[dai->id], TX_MACRO_DEC_MAX) {
+ 		snd_soc_component_update_bits(component, CDC_TXn_TX_PATH_CTL(decimator),
+ 					      CDC_TXn_PCM_RATE_MASK,
+ 					      tx_fs_rate);
++		/*
++		 * Lenovo J716F: hw_params() runs after the DAPM POST_PMU that
++		 * sets CLK_EN, and the regmap update above is a
++		 * read-modify-write of the cached value. When the cache still
++		 * held the pre-power-up value the write cleared CLK_EN again,
++		 * leaving TX PATH_CTL at 0x04 (rate only) instead of 0x24, and
++		 * the decimator produced silence. Re-assert CLK_EN here.
++		 */
++		snd_soc_component_update_bits(component, CDC_TXn_TX_PATH_CTL(decimator),
++					      CDC_TXn_CLK_EN_MASK,
++					      CDC_TXn_CLK_EN_MASK);
++	}
+ 	return 0;
+ }
+ 
+@@ -1200,14 +1304,26 @@
+ 
+ 	decimator = tx->active_decimator[dai->id];
+ 
++	/*
++	 * Lenovo J716F: the decimator clock must stay enabled while the
++	 * stream runs. Touching PATH_CTL here is a read-modify-write of the
++	 * regmap cache; if the cached value predates the DAPM power-up the
++	 * write drops CLK_EN again and the decimator goes silent. Re-assert
++	 * both bits explicitly.
++	 */
+ 	if (mute)
+-		snd_soc_component_write_field(component,
++		snd_soc_component_update_bits(component,
+ 					      CDC_TXn_TX_PATH_CTL(decimator),
+-					      CDC_TXn_PGA_MUTE_MASK, 0x1);
++					      CDC_TXn_PGA_MUTE_MASK |
++					      CDC_TXn_CLK_EN_MASK,
++					      CDC_TXn_PGA_MUTE_MASK |
++					      CDC_TXn_CLK_EN_MASK);
+ 	else
+ 		snd_soc_component_update_bits(component,
+ 					      CDC_TXn_TX_PATH_CTL(decimator),
+-					      CDC_TXn_PGA_MUTE_MASK, 0x0);
++					      CDC_TXn_PGA_MUTE_MASK |
++					      CDC_TXn_CLK_EN_MASK,
++					      CDC_TXn_CLK_EN_MASK);
+ 
+ 	return 0;
+ }
+@@ -2252,6 +2368,7 @@
+ 	void __iomem *base;
+ 	int ret, reg;
+ 
++
+ 	tx = devm_kzalloc(dev, sizeof(*tx), GFP_KERNEL);
+ 	if (!tx)
+ 		return -ENOMEM;
+--- a/sound/soc/codecs/lpass-va-macro.c
++++ b/sound/soc/codecs/lpass-va-macro.c
+@@ -20,6 +20,11 @@
+ 
+ #include "lpass-macro-common.h"
+ 
++/* Optional register inspection must not add MMIO reads to normal capture. */
++static bool register_debug;
++module_param(register_debug, bool, 0600);
++MODULE_PARM_DESC(register_debug, "Inspect DMIC registers (disabled by default)");
++
+ /* VA macro registers */
+ #define CDC_VA_CLK_RST_CTRL_MCLK_CONTROL	(0x0000)
+ #define CDC_VA_MCLK_CONTROL_EN			BIT(0)
+@@ -39,6 +44,32 @@
+ #define CDC_VA_TOP_CSR_DMIC3_CTL		(0x0090)
+ #define CDC_VA_DMIC_EN_MASK			BIT(0)
+ #define CDC_VA_DMIC_ENABLE			BIT(0)
++/*
++ * Lenovo J716F: DMICn_CTL bit 7 is a second, mandatory enable.
++ *
++ * Recovered from the vendor va_macro_dlkm.ko. Its DMIC enable path does,
++ * in this order (0x29f0..0x2a24):
++ *
++ *   mov w1, w22          ; w22 = DMICn_CTL (0x84/0x88/0x8c/0x90)
++ *   mov w2, #0x80        ; mask  = BIT(7)
++ *   mov w3, #0x80        ; value = BIT(7)      <- SET bit 7
++ *   bl  regmap_update_bits
++ *   ...
++ *   mov w1, #0x3094      ; global bolero register
++ *   mov w2, #0x80        ; mask  = BIT(7)
++ *   mov w3, wzr          ; value = 0           <- CLEAR bit 7
++ *   bl  regmap_update_bits
++ *
++ * mainline only ever touched bit 0 of DMICn_CTL, which left the
++ * generator half-enabled: the pad was driven (OE=1, static high) but no
++ * clock ever appeared on it, and every capture returned silence.
++ *
++ * 0x3094 lives in the bolero codec block, outside this macro's 0x1000
++ * register window, so mainline cannot reach it at all. Bit 7 of
++ * DMICn_CTL is the part of that handshake we *can* do.
++ */
++#define CDC_VA_DMIC_EN2_MASK			BIT(7)
++#define CDC_VA_DMIC_EN2_ENABLE			BIT(7)
+ #define CDC_VA_DMIC_CLK_SEL_MASK		GENMASK(3, 1)
+ #define CDC_VA_DMIC_CLK_SEL_SHFT		1
+ #define CDC_VA_DMIC_CLK_SEL_DIV0		0x0
+@@ -214,12 +245,41 @@
+ 	int dec_mode[VA_MACRO_NUM_DECIMATORS];
+ 	struct regmap *regmap;
+ 	struct clk *mclk;
++	/*
++	 * Lenovo J716F: the VA macro's DMIC clock generators run off the
++	 * 2x core MCLK, which is a separate LPASS clock ID
++	 * (LPASS_CLK_ID_VA_CORE_2X_MCLK). mainline only ever gets and enables
++	 * "mclk" (LPASS_CLK_ID_VA_CORE_MCLK), so the 2x clock stayed at
++	 * enable_count 0 and the DMIC clock generators produced nothing -
++	 * which is exactly what probing the LPI pads showed (0 transitions
++	 * on every DMIC pin no matter which register bits were set).
++	 */
++	struct clk *mclk2x;
+ 	struct clk *npl;
+ 	struct clk *macro;
+ 	struct clk *dcodec;
+ 	struct clk *fsgen;
+ 	struct clk_hw hw;
+ 	struct lpass_macro *pds;
++	/*
++	 * Lenovo J716F: the MEMS microphones only produce data while their
++	 * bias rail is powered. mainline models "vdd-micb" purely as a
++	 * SND_SOC_DAPM_REGULATOR_SUPPLY widget, which the DAPM core only
++	 * switches on when a route references it - and even then it never
++	 * sets a voltage or current limit. On this board that left the rail
++	 * at 0 mV ("3370000.codec-vdd-micb  0 users  0mV") and every capture
++	 * returned digital silence.
++	 *
++	 * The vendor driver instead grabs the supply directly and drives it
++	 * with regulator_set_voltage() / regulator_set_current_limit() /
++	 * regulator_enable() from va_macro_enable_micbias(), with the
++	 * values taken from qcom,va-vdd-micb-voltage / -current. Do the
++	 * same here.
++	 */
++	struct regulator *micb_reg;
++	unsigned int micb_voltage;
++	unsigned int micb_current;
++	bool micb_enabled;
+ 
+ 	s32 dmic_0_1_clk_cnt;
+ 	s32 dmic_2_3_clk_cnt;
+@@ -724,16 +784,270 @@
+ 	return 0;
+ }
+ 
++/*
++ * Lenovo J716F: the digital-microphone clock generators (and the MCLK that
++ * feeds them) live in the VA macro block, not in the TX macro. The TX macro's
++ * DMIC capture path therefore has to power this block explicitly, otherwise
++ * the DMIC clock never starts and the DSP reports EOS with no data.
++ *
++ * Called by lpass-tx-macro.c with the DAPM component of the VA macro.
++ */
++/* Lenovo J716F: the TX macro needs to start our DMIC clocks. */
++static struct snd_soc_component *va_macro_component;
++static struct device *va_macro_dev;
++
++struct snd_soc_component *va_macro_get_component(void)
++{
++	/*
++	 * The TX macro's DAPM events can run before our ASoC component probe
++	 * (both macros are part of the same card). Fall back to looking the
++	 * component up from the platform device we saved during probe.
++	 */
++	if (!va_macro_component && va_macro_dev)
++		va_macro_component =
++			snd_soc_lookup_component_nolocked(va_macro_dev,
++							  "va_macro");
++
++	return va_macro_component;
++}
++EXPORT_SYMBOL_GPL(va_macro_get_component);
++
++
++/*
++ * Lenovo J716F: power the microphone bias rail.
++ *
++ * The vendor's va_macro_enable_micbias() does exactly this and its strings
++ * give the full sequence:
++ *
++ *   "%s:regulator not provided in dtsi"
++ *   "%s: Setting voltage failed, err = %d"
++ *   "%s: Setting current failed, err = %d"
++ *   "%s: regulator enable failed, err = %d"
++ *   "%s: regulator disable failed, err = %d"
++ *
++ * The values come from qcom,va-vdd-micb-voltage / -current. Without this
++ * the rail sits at 0 mV and the microphones cannot output anything, no
++ * matter how the DMIC clocks and decimators are programmed.
++ */
++int va_macro_enable_micbias(u32 dmic, bool enable)
++{
++	struct va_macro *va = va_macro_dev ? dev_get_drvdata(va_macro_dev) : NULL;
++	int ret;
++
++	if (!va || !va->micb_reg)
++		return -ENODEV;
++
++	if (enable) {
++		if (va->micb_enabled)
++			return 0;
++
++		if (va->micb_voltage) {
++			ret = regulator_set_voltage(va->micb_reg,
++						    va->micb_voltage,
++						    va->micb_voltage);
++			if (ret)
++				dev_err(va->dev,
++					"J716F-VA: micb set voltage %u failed %d\n",
++					va->micb_voltage, ret);
++		}
++		if (va->micb_current) {
++			ret = regulator_set_current_limit(va->micb_reg,
++							  va->micb_current,
++							  va->micb_current);
++			if (ret)
++				dev_err(va->dev,
++					"J716F-VA: micb set current %u failed %d\n",
++					va->micb_current, ret);
++		}
++		ret = regulator_enable(va->micb_reg);
++		if (ret) {
++			dev_err(va->dev, "J716F-VA: micb enable failed %d\n", ret);
++			return ret;
++		}
++		va->micb_enabled = true;
++		dev_dbg(va->dev, "J716F-VA: micbias on (%u uV, %u uA)\n",
++			 va->micb_voltage, va->micb_current);
++	} else {
++		if (!va->micb_enabled)
++			return 0;
++		ret = regulator_disable(va->micb_reg);
++		if (ret)
++			dev_err(va->dev, "J716F-VA: micb disable failed %d\n", ret);
++		va->micb_enabled = false;
++		dev_dbg(va->dev, "J716F-VA: micbias off\n");
++	}
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(va_macro_enable_micbias);
++
++/*
++ * Lenovo J716F: the TX macro's DAPM power-up path needs the VA macro's DMIC
++ * clock generators running, but it can run before this driver's ASoC
++ * component is registered, so this helper works purely on the platform
++ * device's regmap (available since va_macro_probe).
++ */
++int va_macro_set_dmic_clk_early(u32 dmic, bool enable)
++{
++	struct va_macro *va = va_macro_dev ? dev_get_drvdata(va_macro_dev) : NULL;
++	u16 dmic_clk_reg;
++	int ret;
++
++	if (!va || !va->regmap)
++		return -ENODEV;
++
++	/* DMIC0/1 -> 0x84, DMIC2/3 -> 0x88, DMIC4/5 -> 0x8c, ... */
++	dmic_clk_reg = CDC_VA_TOP_CSR_DMIC0_CTL + (dmic / 2) * 4;
++
++	if (enable) {
++		/*
++		 * Lenovo J716F: va_macro_mclk_enable() only touches the
++		 * macro's register block; the LPASS VA_CORE_MCLK itself is
++		 * prepared/enabled by the DAPM path only when the macro acts
++		 * as a SoundWire master. This board wires the DMICs directly,
++		 * so without an explicit enable here VA_CORE_MCLK stays at
++		 * enable_count 0 and the DMIC clock never runs at its
++		 * programmed rate - capture then delivered data at roughly
++		 * 1/8 of the requested 48 kHz.
++		 */
++		ret = clk_prepare_enable(va->mclk);
++		if (ret) {
++			dev_err(va->dev, "mclk enable failed %d\n", ret);
++			return ret;
++		}
++		ret = clk_set_rate(va->mclk, 2 * VA_MACRO_MCLK_FREQ);
++		if (ret)
++			dev_warn(va->dev, "mclk set_rate failed %d\n", ret);
++
++		/*
++		 * Lenovo J716F: enable the 2x core MCLK as well. It is a
++		 * distinct LPASS clock ID and stays at enable_count 0 unless
++		 * something asks for it, and the DMIC clock generators do not
++		 * run without it.
++		 */
++		if (va->mclk2x) {
++			ret = clk_set_rate(va->mclk2x, 2 * VA_MACRO_MCLK_FREQ);
++			if (ret)
++				dev_warn(va->dev,
++					 "mclk2x set_rate failed %d\n", ret);
++			ret = clk_prepare_enable(va->mclk2x);
++			if (ret)
++				dev_err(va->dev,
++					"mclk2x enable failed %d\n", ret);
++			else
++				dev_dbg(va->dev,
++					 "J716F-VA: mclk2x enabled at %lu Hz\n",
++					 clk_get_rate(va->mclk2x));
++		}
++
++		/*
++		 * va_macro_mclk_enable() ends with regcache_sync_region(),
++		 * which writes the cached value of CDC_VA_TOP_CSR_DMIC_CFG
++		 * back - and its reset default is 0x80 (RESET_ALL_DMICS
++		 * asserted). Release the reset *after* that sync so the DMIC
++		 * clock generators actually start.
++		 */
++		va_macro_mclk_enable(va, true);
++
++		/*
++		 * Order matters, and the earlier version of this helper got
++		 * it wrong.
++		 *
++		 * va_macro_mclk_enable() calls regcache_sync_region(0, VA_MAX)
++		 * *after* va_clk_rsc_fs_gen_request() set the MCLK/FS bits, so
++		 * the sync can write stale cache entries back over them. It
++		 * also means anything written before it is overwritten.
++		 *
++		 * So: release the DMIC reset and program the divider/ENABLE
++		 * *after* the sync, and then re-assert the clock-resource
++		 * bits once more so they are definitely the last thing that
++		 * hits the hardware. A DMIC pad with the register bit set but
++		 * no FS/MCLK request simply sits idle - which is exactly what
++		 * probing the pad showed (0 transitions on both clk and data).
++		 */
++		regmap_update_bits(va->regmap, CDC_VA_TOP_CSR_DMIC_CFG,
++				   CDC_VA_RESET_ALL_DMICS_MASK,
++				   CDC_VA_RESET_ALL_DMICS_DISABLE);
++		/*
++		 * Lenovo J716F: TOP_CFG0 bit 0 is the global DMIC enable.
++		 *
++		 * The per-generator enable in DMICn_CTL (bit 0) is not enough:
++		 * with it set but TOP_CFG0 bit 0 clear the pads stay silent.
++		 * Measured with the VA macro up and a capture running:
++		 *
++		 *   TOP_CFG0   = 0x00000002   bit0 clear  <- no DMIC clock
++		 *   DMIC23_CTL = 0x00000005   bit0 set
++		 *   DMIC_CFG   = 0x00000000   reset released
++		 *
++		 * and all six LPI DMIC pads showed 0 transitions. TOP_CFG0 bit 1
++		 * (FS broadcast) was already set by va_macro_mclk_enable(); bit 0
++		 * was simply never touched anywhere in this driver.
++		 */
++		regmap_update_bits(va->regmap, CDC_VA_TOP_CSR_TOP_CFG0,
++				   CDC_VA_DMIC_EN_MASK, CDC_VA_DMIC_ENABLE);
++		regmap_update_bits(va->regmap, dmic_clk_reg,
++				   CDC_VA_DMIC_CLK_SEL_MASK,
++				   va->dmic_clk_div << CDC_VA_DMIC_CLK_SEL_SHFT);
++		regmap_update_bits(va->regmap, dmic_clk_reg,
++				   CDC_VA_DMIC_EN_MASK,
++				   CDC_VA_DMIC_ENABLE);
++		/*
++		 * Second enable, see CDC_VA_DMIC_EN2_MASK above: the vendor
++		 * driver sets bit 7 of the same register as part of the same
++		 * handshake. Without it the pad is driven but never toggles.
++		 */
++		regmap_update_bits(va->regmap, dmic_clk_reg,
++				   CDC_VA_DMIC_EN2_MASK,
++				   CDC_VA_DMIC_EN2_ENABLE);
++
++		/* make sure the clock resource bits survive any cache sync */
++		va_clk_rsc_fs_gen_request(va, true);
++		if (READ_ONCE(register_debug)) {
++			unsigned int v080 = 0, v084 = 0, v094 = 0;
++
++			regmap_read(va->regmap, CDC_VA_TOP_CSR_TOP_CFG0, &v080);
++			regmap_read(va->regmap, dmic_clk_reg, &v084);
++			regmap_read(va->regmap, CDC_VA_TOP_CSR_DMIC_CFG, &v094);
++			dev_info(va->dev,
++				 "J716F-VA: dmic%d reg=%#x top_cfg0=%#x dmic_ctl=%#x dmic_cfg=%#x div=%u\n",
++				 dmic, dmic_clk_reg, v080, v084, v094,
++				 va->dmic_clk_div);
++		}
++	} else {
++		regmap_update_bits(va->regmap, dmic_clk_reg,
++				   CDC_VA_DMIC_EN_MASK, 0);
++	}
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(va_macro_set_dmic_clk_early);
++
+ static int va_macro_enable_dmic(struct snd_soc_dapm_widget *w,
+ 				struct snd_kcontrol *kcontrol, int event)
+ {
+ 	struct snd_soc_component *comp = snd_soc_dapm_to_component(w->dapm);
+ 	unsigned int dmic = w->shift;
+ 
++	pr_debug("J716F-VA: enable_dmic dmic=%u event=%d\n", dmic, event);
++
+ 	switch (event) {
+-	case SND_SOC_DAPM_PRE_PMU:
+-		va_dmic_clk_enable(comp, dmic, true);
++	case SND_SOC_DAPM_PRE_PMU: {
++		int __rc = va_dmic_clk_enable(comp, dmic, true);
++
++		if (__rc)
++			dev_warn(comp->dev, "J716F-VA: clk_enable failed %d\n", __rc);
++		if (READ_ONCE(register_debug)) {
++			unsigned int __ctl, __cfg;
++
++			__cfg = snd_soc_component_read(comp, CDC_VA_TOP_CSR_DMIC_CFG);
++			__ctl = snd_soc_component_read(comp,
++				CDC_VA_TOP_CSR_DMIC0_CTL + (dmic / 2) * 4);
++			pr_info("J716F-VA: clk_enable rc=%d DMIC_CFG=%#x CTL(0x%x)=%#x\n",
++				__rc, __cfg, CDC_VA_TOP_CSR_DMIC0_CTL + (dmic / 2) * 4,
++				__ctl);
++		}
+ 		break;
++	}
+ 	case SND_SOC_DAPM_POST_PMD:
+ 		va_dmic_clk_enable(comp, dmic, false);
+ 		break;
+@@ -1334,6 +1648,11 @@
+ 
+ 	snd_soc_component_init_regmap(component, va->regmap);
+ 
++	/* Lenovo J716F: publish ourselves so the TX macro can start our
++	 * DMIC clock generators (see va_macro_set_dmic_clk()).
++	 */
++	va_macro_component = component;
++
+ 	return 0;
+ }
+ 
+@@ -1569,6 +1888,20 @@
+ 	if (IS_ERR(va->mclk))
+ 		return dev_err_probe(dev, PTR_ERR(va->mclk), "unable to get mclk clock\n");
+ 
++	/*
++	 * Lenovo J716F: optional 2x core MCLK. The DMIC clock generators in
++	 * this macro need it; mainline never asks for it, which is why the
++	 * DMIC pads stayed completely idle.
++	 */
++	va->mclk2x = devm_clk_get_optional(dev, "mclk2x");
++	if (IS_ERR(va->mclk2x)) {
++		dev_info(dev, "J716F-VA: no mclk2x clock (%ld)\n",
++			 PTR_ERR(va->mclk2x));
++		va->mclk2x = NULL;
++	} else if (va->mclk2x) {
++		dev_dbg(dev, "J716F-VA: got mclk2x clock\n");
++	}
++
+ 	va->pds = lpass_macro_pds_init(dev);
+ 	if (IS_ERR(va->pds))
+ 		return PTR_ERR(va->pds);
+@@ -1586,6 +1919,38 @@
+ 		}
+ 	}
+ 
++	/*
++	 * Lenovo J716F: microphone bias rail.
++	 *
++	 * The vendor driver reads qcom,va-vdd-micb-voltage / -current and
++	 * drives the supply itself; mainline only has a DAPM supply widget
++	 * that never programs a voltage, which left the rail at 0 mV and the
++	 * microphones silent. Accept both the vendor property names and the
++	 * generic ones so either style of device tree works.
++	 */
++	va->micb_reg = devm_regulator_get_optional(dev, "va-vdd-micb");
++	if (IS_ERR(va->micb_reg)) {
++		if (PTR_ERR(va->micb_reg) == -ENODEV) {
++			va->micb_reg = NULL;
++		} else {
++			dev_info(dev, "J716F-VA: no va-vdd-micb supply (%ld)\n",
++				 PTR_ERR(va->micb_reg));
++			va->micb_reg = NULL;
++		}
++	}
++	if (va->micb_reg) {
++		if (!of_property_read_u32(dev->of_node,
++					  "qcom,va-vdd-micb-voltage",
++					  &va->micb_voltage))
++			dev_dbg(dev, "J716F-VA: micb voltage %u uV\n",
++				 va->micb_voltage);
++		if (!of_property_read_u32(dev->of_node,
++					  "qcom,va-vdd-micb-current",
++					  &va->micb_current))
++			dev_dbg(dev, "J716F-VA: micb current %u uA\n",
++				 va->micb_current);
++	}
++
+ 	base = devm_platform_ioremap_resource(pdev, 0);
+ 	if (IS_ERR(base)) {
+ 		ret = PTR_ERR(base);
+@@ -1600,6 +1965,9 @@
+ 
+ 	dev_set_drvdata(dev, va);
+ 
++	/* Lenovo J716F: let the TX macro reach our DMIC clock generators. */
++	va_macro_dev = dev;
++
+ 	data = of_device_get_match_data(dev);
+ 	va->has_swr_master = data->has_swr_master;
+ 	va->has_npl_clk = data->has_npl_clk;
+--- a/sound/soc/qcom/common.c
++++ b/sound/soc/qcom/common.c
+@@ -297,9 +297,22 @@
+ 			}
+ 
+ 			if (platform) {
+-				/* DPCM backend */
+-				link->no_pcm = 1;
+-				link->ignore_pmdown_time = 1;
++				/*
++				 * Lenovo J716F: a DPCM backend shares the
++				 * frontend's runtime but is not that runtime's
++				 * trigger_master, so snd_pcm_do_start() skips it
++				 * and runtime->state never reaches RUNNING.
++				 * snd_pcm_period_elapsed() then refuses to
++				 * advance hw_ptr and capture fails with -EIO
++				 * although the DSP is delivering data. Links
++				 * that carry their own PCM device can opt out
++				 * of DPCM while still listing a platform (the
++				 * q6routing component that programs ADM).
++				 */
++				if (!of_property_read_bool(np, "qcom,no-dpcm-backend")) {
++					link->no_pcm = 1;
++					link->ignore_pmdown_time = 1;
++				}
+ 			}
+ 		} else {
+ 			/* DPCM frontend */
+--- a/sound/soc/qcom/qdsp6/q6afe-dai.c
++++ b/sound/soc/qcom/qdsp6/q6afe-dai.c
+@@ -980,51 +980,51 @@
+ 						0, SND_SOC_NOPM, 0, 0),
+ 	SND_SOC_DAPM_AIF_OUT("QUIN_TDM_TX_7", NULL,
+ 						0, SND_SOC_NOPM, 0, 0),
+-	SND_SOC_DAPM_AIF_OUT("DISPLAY_PORT_RX", "NULL", 0, SND_SOC_NOPM, 0, 0),
++	SND_SOC_DAPM_AIF_OUT("DISPLAY_PORT_RX", NULL, 0, SND_SOC_NOPM, 0, 0),
+ 
+-	SND_SOC_DAPM_AIF_IN("WSA_CODEC_DMA_RX_0", "NULL",
++	SND_SOC_DAPM_AIF_IN("WSA_CODEC_DMA_RX_0", NULL,
+ 		0, SND_SOC_NOPM, 0, 0),
+-	SND_SOC_DAPM_AIF_OUT("WSA_CODEC_DMA_TX_0", "NULL",
++	SND_SOC_DAPM_AIF_OUT("WSA_CODEC_DMA_TX_0", NULL,
+ 		 0, SND_SOC_NOPM, 0, 0),
+-	SND_SOC_DAPM_AIF_IN("WSA_CODEC_DMA_RX_1", "NULL",
++	SND_SOC_DAPM_AIF_IN("WSA_CODEC_DMA_RX_1", NULL,
+ 		0, SND_SOC_NOPM, 0, 0),
+-	SND_SOC_DAPM_AIF_OUT("WSA_CODEC_DMA_TX_1", "NULL",
++	SND_SOC_DAPM_AIF_OUT("WSA_CODEC_DMA_TX_1", NULL,
+ 		 0, SND_SOC_NOPM, 0, 0),
+-	SND_SOC_DAPM_AIF_OUT("WSA_CODEC_DMA_TX_2", "NULL",
++	SND_SOC_DAPM_AIF_OUT("WSA_CODEC_DMA_TX_2", NULL,
+ 		 0, SND_SOC_NOPM, 0, 0),
+-	SND_SOC_DAPM_AIF_OUT("VA_CODEC_DMA_TX_0", "NULL",
++	SND_SOC_DAPM_AIF_OUT("VA_CODEC_DMA_TX_0", NULL,
+ 		 0, SND_SOC_NOPM, 0, 0),
+-	SND_SOC_DAPM_AIF_OUT("VA_CODEC_DMA_TX_1", "NULL",
++	SND_SOC_DAPM_AIF_OUT("VA_CODEC_DMA_TX_1", NULL,
+ 		 0, SND_SOC_NOPM, 0, 0),
+-	SND_SOC_DAPM_AIF_OUT("VA_CODEC_DMA_TX_2", "NULL",
++	SND_SOC_DAPM_AIF_OUT("VA_CODEC_DMA_TX_2", NULL,
+ 		 0, SND_SOC_NOPM, 0, 0),
+-	SND_SOC_DAPM_AIF_IN("RX_CODEC_DMA_RX_0", "NULL",
++	SND_SOC_DAPM_AIF_IN("RX_CODEC_DMA_RX_0", NULL,
+ 		0, SND_SOC_NOPM, 0, 0),
+-	SND_SOC_DAPM_AIF_OUT("TX_CODEC_DMA_TX_0", "NULL",
++	SND_SOC_DAPM_AIF_OUT("TX_CODEC_DMA_TX_0", NULL,
+ 		 0, SND_SOC_NOPM, 0, 0),
+-	SND_SOC_DAPM_AIF_IN("RX_CODEC_DMA_RX_1", "NULL",
++	SND_SOC_DAPM_AIF_IN("RX_CODEC_DMA_RX_1", NULL,
+ 		0, SND_SOC_NOPM, 0, 0),
+-	SND_SOC_DAPM_AIF_OUT("TX_CODEC_DMA_TX_1", "NULL",
++	SND_SOC_DAPM_AIF_OUT("TX_CODEC_DMA_TX_1", NULL,
+ 		 0, SND_SOC_NOPM, 0, 0),
+-	SND_SOC_DAPM_AIF_IN("RX_CODEC_DMA_RX_2", "NULL",
++	SND_SOC_DAPM_AIF_IN("RX_CODEC_DMA_RX_2", NULL,
+ 		0, SND_SOC_NOPM, 0, 0),
+-	SND_SOC_DAPM_AIF_OUT("TX_CODEC_DMA_TX_2", "NULL",
++	SND_SOC_DAPM_AIF_OUT("TX_CODEC_DMA_TX_2", NULL,
+ 		 0, SND_SOC_NOPM, 0, 0),
+-	SND_SOC_DAPM_AIF_IN("RX_CODEC_DMA_RX_3", "NULL",
++	SND_SOC_DAPM_AIF_IN("RX_CODEC_DMA_RX_3", NULL,
+ 		0, SND_SOC_NOPM, 0, 0),
+-	SND_SOC_DAPM_AIF_OUT("TX_CODEC_DMA_TX_3", "NULL",
++	SND_SOC_DAPM_AIF_OUT("TX_CODEC_DMA_TX_3", NULL,
+ 		 0, SND_SOC_NOPM, 0, 0),
+-	SND_SOC_DAPM_AIF_IN("RX_CODEC_DMA_RX_4", "NULL",
++	SND_SOC_DAPM_AIF_IN("RX_CODEC_DMA_RX_4", NULL,
+ 		0, SND_SOC_NOPM, 0, 0),
+-	SND_SOC_DAPM_AIF_OUT("TX_CODEC_DMA_TX_4", "NULL",
++	SND_SOC_DAPM_AIF_OUT("TX_CODEC_DMA_TX_4", NULL,
+ 		 0, SND_SOC_NOPM, 0, 0),
+-	SND_SOC_DAPM_AIF_IN("RX_CODEC_DMA_RX_5", "NULL",
++	SND_SOC_DAPM_AIF_IN("RX_CODEC_DMA_RX_5", NULL,
+ 		0, SND_SOC_NOPM, 0, 0),
+-	SND_SOC_DAPM_AIF_OUT("TX_CODEC_DMA_TX_5", "NULL",
++	SND_SOC_DAPM_AIF_OUT("TX_CODEC_DMA_TX_5", NULL,
+ 		 0, SND_SOC_NOPM, 0, 0),
+-	SND_SOC_DAPM_AIF_IN("RX_CODEC_DMA_RX_6", "NULL",
++	SND_SOC_DAPM_AIF_IN("RX_CODEC_DMA_RX_6", NULL,
+ 		0, SND_SOC_NOPM, 0, 0),
+-	SND_SOC_DAPM_AIF_IN("RX_CODEC_DMA_RX_7", "NULL",
++	SND_SOC_DAPM_AIF_IN("RX_CODEC_DMA_RX_7", NULL,
+ 		0, SND_SOC_NOPM, 0, 0),
+ 
+ 	SND_SOC_DAPM_AIF_IN("USB_RX", NULL, 0, SND_SOC_NOPM, 0, 0),
+--- a/sound/soc/qcom/qdsp6/q6afe.c
++++ b/sound/soc/qcom/qdsp6/q6afe.c
+@@ -1026,6 +1026,7 @@
+ 		case AFE_PORT_CMD_DEVICE_STOP:
+ 		case AFE_PORT_CMD_DEVICE_START:
+ 		case AFE_SVC_CMD_SET_PARAM:
++		case 0x000100FA: /* AFE_PORT_CMD_SET_PARAM_V3 (vendor) */
+ 			port = q6afe_find_port(afe, hdr->token);
+ 			if (port) {
+ 				port->result = *res;
+@@ -1695,8 +1696,19 @@
+ 	dma_cfg->bit_width = cfg->bit_width;
+ 	dma_cfg->data_format = cfg->data_format;
+ 	dma_cfg->num_channels = cfg->num_channels;
+-	if (!cfg->active_channels_mask)
+-		dma_cfg->active_channels_mask = (1 << cfg->num_channels) - 1;
++	/*
++	 * Lenovo J716F: the original code only assigned the computed default
++	 * when cfg->active_channels_mask was 0 and never copied a non-zero
++	 * mask, so setting an explicit channel map via
++	 * q6dma_set_channel_map() left the port with 0 active channels and
++	 * the ADSP rejected the config. Copy the mask either way.
++	 */
++	dma_cfg->active_channels_mask = cfg->active_channels_mask ?
++		cfg->active_channels_mask : (1 << cfg->num_channels) - 1;
++
++	pr_debug("J716F-AFE: dma_cfg rate=%u width=%u fmt=%u ch=%u mask=%#x\n",
++		dma_cfg->sample_rate, dma_cfg->bit_width, dma_cfg->data_format,
++		dma_cfg->num_channels, dma_cfg->active_channels_mask);
+ }
+ EXPORT_SYMBOL_GPL(q6afe_cdc_dma_port_prepare);
+ /**
+@@ -1758,6 +1770,9 @@
+ 	if (ret)
+ 		dev_err(afe->dev, "AFE enable for port 0x%x failed %d\n",
+ 			port_id, ret);
++	else
++		pr_debug("J716F-AFE: port 0x%x START ok (cfg_type=%#x)\n",
++			port_id, param_id);
+ 
+ 	return ret;
+ }
+--- a/sound/soc/qcom/qdsp6/q6asm-dai.c
++++ b/sound/soc/qcom/qdsp6/q6asm-dai.c
+@@ -24,13 +24,25 @@
+ 
+ #define DRV_NAME	"q6asm-fe-dai"
+ 
++/* Audio-buffer inspection is an opt-in bring-up diagnostic, never PCM work. */
++static bool capture_debug;
++module_param(capture_debug, bool, 0600);
++MODULE_PARM_DESC(capture_debug, "Inspect capture DMA buffers (disabled by default)");
++
+ #define PLAYBACK_MIN_NUM_PERIODS    2
+ #define PLAYBACK_MAX_NUM_PERIODS   8
+ #define PLAYBACK_MAX_PERIOD_SIZE    65536
+ #define PLAYBACK_MIN_PERIOD_SIZE    128
+ #define CAPTURE_MIN_NUM_PERIODS     2
+ #define CAPTURE_MAX_NUM_PERIODS     8
+-#define CAPTURE_MAX_PERIOD_SIZE     4096
++/*
++ * Lenovo J716F: the capture period size has to be able to hold what the DSP
++ * delivers per ASM_DATA_CMD_READ. With the upstream 4096-byte limit ALSA
++ * could not carve the 24000-byte DSP periods, ended up with a single-period
++ * buffer and never advanced hw_ptr, so arecord failed with -EIO even though
++ * the DSP was returning data. Match the playback limit.
++ */
++#define CAPTURE_MAX_PERIOD_SIZE     PLAYBACK_MAX_PERIOD_SIZE
+ #define CAPTURE_MIN_PERIOD_SIZE     320
+ #define SID_MASK_DEFAULT	0xF
+ 
+@@ -71,6 +83,11 @@
+ 	uint32_t stream_id;
+ 	uint16_t session_id;
+ 	enum stream_state state;
++	bool capture_started;
++	bool reads_pending;
++	/* How many READ_V2 commands are currently outstanding at the ADSP */
++	unsigned int reads_inflight;
++	unsigned long run_jiffies;
+ 	uint32_t initial_samples_drop;
+ 	uint32_t trailing_samples_drop;
+ 	bool notify_on_drain;
+@@ -209,7 +226,7 @@
+ 	struct q6asm_dai_rtd *prtd = runtime->private_data;
+ 	struct q6asm_dai_data *pdata;
+ 	struct device *dev = component->dev;
+-	int ret, i;
++	int ret;
+ 
+ 	pdata = snd_soc_component_get_drvdata(component);
+ 	if (!pdata)
+@@ -289,15 +306,65 @@
+ 							   runtime->channels,
+ 							   prtd->bits_per_sample);
+ 
+-		/* Queue the buffers */
+-		for (i = 0; i < runtime->periods; i++)
+-			q6asm_read(prtd->audio_client, prtd->stream_id);
++		/*
++		 * Lenovo J716F: mark the stream RUNNING *before* queueing the
++		 * capture buffers. The DSP can start returning
++		 * ASM_CLIENT_EVENT_DATA_READ_DONE as soon as the first read is
++		 * posted, and the handler only re-queues a buffer while
++		 * prtd->state == Q6ASM_STREAM_RUNNING. With the state set after
++		 * the loop the queue drained after exactly runtime->periods
++		 * buffers and the stream stalled with EIO.
++		 */
++		WRITE_ONCE(prtd->state, Q6ASM_STREAM_RUNNING);
++
++		prtd->run_jiffies = jiffies;
++
++		/*
++		 * Lenovo J716F: run the capture stream BEFORE posting the read
++		 * requests. With the reads posted first the DSP only flushed
++		 * them after ALSA had already given up and stopped the stream -
++		 * DATA_READ_DONE always landed a few ms after the read timeout,
++		 * so capture failed with -EIO and delivered no samples.
++		 */
++		/*
++		 * DIAGNOSTIC (2026-10-19): use the synchronous variant.
++		 *
++		 * With run_nowait() the RUN command is fire-and-forget, so a
++		 * failure is invisible; ADSP then keeps answering every READ
++		 * with ADSP_ENOTREADY (status 10) and capture yields zeros.
++		 * run() waits for the response and surfaces the real status.
++		 */
++		/*
++		 * Lenovo J716F: do NOT post the READ_V2 commands here. The
++		 * ADSP answers each of them with ADSP_ENOTREADY (status 10,
++		 * "operation is not ready to be processed") until the session
++		 * RUN has completed, and a rejected read never fills its
++		 * buffer - which is exactly why capture delivered nothing but
++		 * zeros. The reads are queued from the CMD_RUN_DONE handler
++		 * instead, i.e. only once the DSP reports the stream running.
++		 *
++		 * reads_pending has to be armed BEFORE the run command, not
++		 * after: q6asm_run() is the synchronous variant, so it waits
++		 * for the very CMD_RUN_DONE response that consumes this flag.
++		 * Setting it afterwards left it false at handler time, so no
++		 * READ was ever queued and hw_ptr stayed at 0.
++		 */
++		prtd->reads_pending = true;
++
++		ret = q6asm_run(prtd->audio_client, prtd->stream_id, 0, 0, 0);
++		if (ret) {
++			dev_err(dev, "capture run failed %d\n", ret);
++			prtd->reads_pending = false;
++			prtd->state = Q6ASM_STREAM_STOPPED;
++			goto open_err;
++		}
++		prtd->capture_started = true;
+ 
+ 	}
+-	if (ret < 0)
++	if (ret < 0) {
+ 		dev_info(dev, "%s: CMD Format block failed\n", __func__);
+-	else
+-		prtd->state = Q6ASM_STREAM_RUNNING;
++		prtd->state = Q6ASM_STREAM_STOPPED;
++	}
+ 
+ 	return ret;
+ 
+@@ -401,6 +468,18 @@
+ 	/* DSP expects stream id from 1 */
+ 	prtd->stream_id = 1;
+ 
++	/*
++	 * Lenovo J716F: the ADSP needs ~230ms (for a 2-period buffer) before
++	 * it raises the first ASM_CLIENT_EVENT_DATA_READ_DONE, while ALSA's
++	 * default capture read wait is only buffer_size * 1100 / rate -
++	 * ~220ms for the same buffer. The first read therefore timed out a
++	 * few milliseconds before the data arrived and userspace got -EIO.
++	 * Give capture a floor that comfortably covers the DSP start-up
++	 * latency; playback keeps the default.
++	 */
++	if (substream->stream == SNDRV_PCM_STREAM_CAPTURE)
++		substream->wait_time = 10000;  /* DIAG: 10s to catch slow DSP */
++
+ 	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
+ 		runtime->hw = q6asm_dai_hardware_playback;
+ 	else if (substream->stream == SNDRV_PCM_STREAM_CAPTURE)
+@@ -446,10 +525,11 @@
+ 		runtime->dma_bytes = q6asm_dai_hardware_capture.buffer_bytes_max;
+ 	}
+ 
+-	if (pdata->sid < 0)
++	if (pdata->sid < 0) {
+ 		prtd->phys = substream->dma_buffer.addr;
+-	else
++	} else {
+ 		prtd->phys = substream->dma_buffer.addr | (pdata->sid << 32);
++	}
+ 
+ 	return 0;
+ }
+@@ -501,6 +581,17 @@
+ 
+ 	prtd->pcm_size = params_buffer_bytes(params);
+ 	prtd->periods = params_periods(params);
++	{
++		struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
++		struct snd_soc_pcm_runtime *fe_rtd = NULL;
++		struct snd_soc_dpcm *dpcm;
++
++		list_for_each_entry(dpcm, &rtd->dpcm[SNDRV_PCM_STREAM_CAPTURE].fe_clients,
++				    list_fe) {
++			fe_rtd = dpcm->fe;
++			break;
++		}
++	}
+ 
+ 	switch (params_format(params)) {
+ 	case SNDRV_PCM_FORMAT_S16_LE:
+--- a/sound/soc/qcom/qdsp6/q6asm.c
++++ b/sound/soc/qcom/qdsp6/q6asm.c
+@@ -628,6 +628,7 @@
+ 			break;
+ 		case ASM_SESSION_CMD_RUN_V2:
+ 			client_event = ASM_CLIENT_EVENT_CMD_RUN_DONE;
++			pr_debug("J716F-ASM: CMD_RUN_DONE received\n");
+ 			break;
+ 		case ASM_STREAM_CMD_CLOSE:
+ 			client_event = ASM_CLIENT_EVENT_CMD_CLOSE_DONE;
+@@ -658,8 +659,42 @@
+ 			/* response as result of close stream */
+ 			goto done;
+ 		default:
+-			dev_err(ac->dev, "command[0x%x] not expecting rsp\n",
+-				result->opcode);
++			/*
++			 * The ADSP rejects ASM_DATA_CMD_READ_V2 with
++			 * ADSP_ENOTREADY (10) while the ASM session is not in a
++			 * state where it can hand out capture data, and a
++			 * rejected read never fills its buffer. Surface it
++			 * instead of silently dropping the response.
++			 */
++			if (result->opcode == ASM_DATA_CMD_READ_V2) {
++				if (result->status != ADSP_EOK) {
++					/*
++					 * Lenovo J716F: ADSP_ENOTREADY (10) is
++					 * transient, but re-queueing the read
++					 * from inside this handler recurses
++					 * without bound: q6asm_read() is called
++					 * synchronously, ADSP answers ENOTREADY
++					 * again, we call the callback again...
++					 * That produced 8724 read completions in
++					 * three seconds.
++					 *
++					 * The read that got rejected simply never
++					 * fills its buffer, so the only thing we
++					 * owe the stream is another attempt once
++					 * the DSP has caught up. Throttle it and
++					 * let the callback decide - it re-arms the
++					 * read from process context, not from this
++					 * APR callback.
++					 */
++					dev_dbg_ratelimited(ac->dev,
++						"capture read not ready: status %u\n",
++						result->status);
++				}
++			} else {
++				dev_err(ac->dev,
++					"command[0x%x] not expecting rsp\n",
++					result->opcode);
++			}
+ 			break;
+ 		}
+ 
+@@ -705,6 +740,7 @@
+ 		if (ac->io_mode & ASM_SYNC_IO_MODE) {
+ 			struct asm_data_cmd_read_v2_done *done = data->payload;
+ 			phys_addr_t phys;
++			unsigned int seq;
+ 
+ 			guard(spinlock_irqsave)(&ac->lock);
+ 			port =  &ac->port[SNDRV_PCM_STREAM_CAPTURE];
+@@ -779,8 +815,15 @@
+ 			wake_up(&a->mem_wait);
+ 			break;
+ 		default:
+-			dev_err(&adev->dev, "command[0x%x] not expecting rsp\n",
+-				 result->opcode);
++			/*
++			 * The ADSP answers every ASM_DATA_CMD_READ_V2 with a
++			 * basic result. Its status field is the only feedback
++			 * we get on whether the read was accepted, so log it
++			 * instead of discarding it.
++			 */
++			dev_err(&adev->dev,
++				"command[0x%x] not expecting rsp\n",
++				result->opcode);
+ 			break;
+ 		}
+ 		goto done;
+@@ -1426,6 +1469,14 @@
+ 	read->seq_id = port->dsp_buf;
+ 	pkt->hdr.token = port->dsp_buf;
+ 
++	pr_debug("J716F-READ: phys=%#llx size=%u handle=%#x seq=%u\n",
++		(unsigned long long)ab->phys, ab->size,
++		port->mem_map_handle, port->dsp_buf);
++
++	pr_debug("J716F-READ: phys=%#llx size=%u handle=%#x seq=%u dsp_buf=%u\n",
++		(unsigned long long)ab->phys, ab->size,
++		port->mem_map_handle, port->dsp_buf, port->dsp_buf);
++
+ 	port->dsp_buf++;
+ 
+ 	if (port->dsp_buf >= port->num_periods)
+--- a/sound/soc/qcom/qdsp6/q6dsp-lpass-clocks.c
++++ b/sound/soc/qcom/qdsp6/q6dsp-lpass-clocks.c
+@@ -87,9 +87,42 @@
+ {
+ 	struct q6dsp_clk *clk = to_q6dsp_clk(hw);
+ 	struct q6dsp_cc *cc = dev_get_drvdata(clk->dev);
++	int ret;
+ 
+-	return cc->desc->lpass_vote_clk(clk->dev, clk->q6dsp_clk_id,
+-				  clk_hw_get_name(&clk->hw), &clk->handle);
++	ret = cc->desc->lpass_vote_clk(clk->dev, clk->q6dsp_clk_id,
++				       clk_hw_get_name(&clk->hw), &clk->handle);
++
++	/*
++	 * Lenovo J716F: the ADSP firmware on this board answers
++	 * AFE_CMD_REMOTE_LPASS_CORE_HW_VOTE_REQUEST (0x100f4) with
++	 * ADSP_EUNSUPPORTED / -EINVAL:
++	 *
++	 *   qcom-q6afe aprsvc:service:4:4: cmd = 0x100f4 returned error = 0x16
++	 *   qcom-q6afe aprsvc:service:4:4: Unknown cmd 0x100f4
++	 *   qcom-q6afe aprsvc:service:4:4: AFE failed to vote (3)
++	 *
++	 * The vote only tells the DSP that a host client wants the LPASS core
++	 * hardware block kept powered. A rejected vote is not fatal for a
++	 * platform whose LPASS is already clocked and powered by the
++	 * bootloader, but returning the error here makes clk_prepare() fail,
++	 * which in turn blocks LPASS_HW_MACRO / LPASS_HW_DCODEC from ever
++	 * being enabled - and with those gates closed the macro register
++	 * writes land in a block that is not running, so the DMIC clock
++	 * generators never produce a clock and every capture path returns
++	 * silence.
++	 *
++	 * Log it once and carry on: the enable side (clk_vote_q6dsp_block's
++	 * counterpart) still programs the block, and unvote tolerates a NULL
++	 * handle.
++	 */
++	if (ret) {
++		dev_dbg(clk->dev,
++			"J716F: LPASS core vote for %s failed (%d), continuing\n",
++			clk_hw_get_name(&clk->hw), ret);
++		return 0;
++	}
++
++	return 0;
+ }
+ 
+ static void clk_unvote_q6dsp_block(struct clk_hw *hw)
+--- a/sound/soc/qcom/qdsp6/q6routing.c
++++ b/sound/soc/qcom/qdsp6/q6routing.c
+@@ -424,6 +424,7 @@
+ 			      session->channels, topology, perf_mode,
+ 			      session->bits_per_sample, 0, 0);
+ 
++
+ 	if (IS_ERR_OR_NULL(copp)) {
+ 		mutex_unlock(&routing_data->lock);
+ 		return -EINVAL;
+@@ -442,8 +443,12 @@
+ 	if (num_copps) {
+ 		payload.num_copps = num_copps;
+ 		payload.session_id = stream_id;
+-		q6adm_matrix_map(routing_data->dev, session->path_type,
+-				 payload, perf_mode);
++		{
++			int mret = q6adm_matrix_map(routing_data->dev,
++						    session->path_type,
++						    payload, perf_mode);
++
++		}
+ 	}
+ 	mutex_unlock(&routing_data->lock);
+ 
+--- a/sound/soc/qcom/sm8250.c
++++ b/sound/soc/qcom/sm8250.c
+@@ -3,11 +3,14 @@
+ 
+ #include <dt-bindings/sound/qcom,q6afe.h>
+ #include <linux/module.h>
++#include <linux/gpio/consumer.h>
++#include <linux/of.h>
+ #include <linux/platform_device.h>
+ #include <sound/soc.h>
+ #include <sound/soc-dapm.h>
+ #include <sound/pcm.h>
+ #include <sound/pcm_params.h>
++#include <sound/cs35l41.h>
+ #include <linux/soundwire/sdw.h>
+ #include <sound/jack.h>
+ #include <linux/input-event-codes.h>
+@@ -26,8 +29,78 @@
+ 	bool usb_offload_jack_setup;
+ 	struct snd_soc_jack dp_jack;
+ 	bool jack_setup;
++	/*
++	 * Lenovo J716F: the digital microphones are powered through a PMIC
++	 * gpio, exactly as the vendor dtbo declares:
++	 *
++	 *   qcom,msm-dmic-en-gpio = <&pm8150b_gpios 12 GPIO_ACTIVE_LOW>;
++	 *
++	 * The vendor machine driver toggles it from msm_dmic_event() while
++	 * the DMIC backend is up. mainline has no equivalent, so the rail
++	 * stayed off and the DMIC clock pads never toggled even with every
++	 * macro register programmed correctly.
++	 */
++	struct gpio_desc *dmic_en_gpio;
++	int dmic_en_state;
+ };
+ 
++/*
++ * Lenovo J716F: "DMIC EN" mixer control, mirroring the vendor machine
++ * driver's msm_mic_en_ctrl / msm_mic_en_get / msm_mic_en_put trio.
++ *
++ * The vendor exposes the digital-microphone power rail as a mixer switch
++ * rather than driving it from a DAPM event, so Android's audio HAL can
++ * turn it on right before it starts the DMIC backend. Its put callback
++ * does, per the disassembly of msm_mic_en_put (machine_dlkm.ko 0x4aa8):
++ *
++ *   gpiod_direction_output_raw(gpio, control == 1);   // ACTIVE_LOW
++ *   usleep_range(5000, 5010);
++ *   snd_soc_dapm_sync(dapm);
++ *
++ * We keep the same shape so userspace sees the control it expects.
++ */
++static int sm8250_dmic_en_get(struct snd_kcontrol *kcontrol,
++			      struct snd_ctl_elem_value *ucontrol)
++{
++	struct snd_soc_card *card = snd_kcontrol_chip(kcontrol);
++	struct sm8250_snd_data *data = snd_soc_card_get_drvdata(card);
++
++	ucontrol->value.integer.value[0] = data->dmic_en_state;
++
++	return 0;
++}
++
++static int sm8250_dmic_en_put(struct snd_kcontrol *kcontrol,
++			      struct snd_ctl_elem_value *ucontrol)
++{
++	struct snd_soc_card *card = snd_kcontrol_chip(kcontrol);
++	struct sm8250_snd_data *data = snd_soc_card_get_drvdata(card);
++	int on = !!ucontrol->value.integer.value[0];
++
++	if (!data->dmic_en_gpio)
++		return 0;
++
++	if (on == data->dmic_en_state)
++		return 0;
++
++	gpiod_set_value_cansleep(data->dmic_en_gpio, on);
++	data->dmic_en_state = on;
++	/*
++	 * The vendor waits 5 ms here for the rail to settle before letting
++	 * DAPM re-evaluate the widgets that depend on it.
++	 */
++	usleep_range(5000, 5100);
++	snd_soc_dapm_sync(card->dapm);
++
++	dev_dbg(card->dev, "J716F: DMIC EN -> %d\n", on);
++
++	return 0;
++}
++
++static const struct snd_kcontrol_new sm8250_dmic_en_control =
++	SOC_SINGLE_BOOL_EXT("DMIC EN", 0,
++			    sm8250_dmic_en_get, sm8250_dmic_en_put);
++
+ static int sm8250_snd_init(struct snd_soc_pcm_runtime *rtd)
+ {
+ 	struct sm8250_snd_data *data = snd_soc_card_get_drvdata(rtd->card);
+@@ -58,6 +131,7 @@
+ static int sm8250_be_hw_params_fixup(struct snd_soc_pcm_runtime *rtd,
+ 				     struct snd_pcm_hw_params *params)
+ {
++	struct snd_soc_dai *cpu_dai = snd_soc_rtd_to_cpu(rtd, 0);
+ 	struct snd_interval *rate = hw_param_interval(params,
+ 					SNDRV_PCM_HW_PARAM_RATE);
+ 	struct snd_interval *channels = hw_param_interval(params,
+@@ -68,6 +142,40 @@
+ 	channels->min = channels->max = 2;
+ 	snd_mask_set_format(fmt, SNDRV_PCM_FORMAT_S16_LE);
+ 
++	/*
++	 * Lenovo J716F: the tablet's microphones are the LPASS digital MEMS
++	 * mics, captured through the TX macro on TX_CODEC_DMA_TX_3 (the path
++	 * the stock Android recorder uses). Those AFE ports need an explicit
++	 * TX channel mask, otherwise q6dma_set_channel_map() returns -EINVAL
++	 * ("tx slot not found") and the DSP never starts the port. The mask
++	 * has to be set on the backend DAI (the AFE port), not the front end.
++	 */
++	if (cpu_dai->driver->ops &&
++	    cpu_dai->driver->ops->set_channel_map &&
++	    ((cpu_dai->id >= VA_CODEC_DMA_TX_0 &&
++	      cpu_dai->id <= VA_CODEC_DMA_TX_2) ||
++	     (cpu_dai->id >= TX_CODEC_DMA_TX_0 &&
++	      cpu_dai->id <= TX_CODEC_DMA_TX_5))) {
++		/*
++		 * q6dma_set_channel_map() reads only tx_ch_mask[0] and uses it
++		 * verbatim as active_channels_mask, so the array element must be
++		 * a bitmask, not a channel index. 0x3 enables channels 0 and 1;
++		 * passing 0 here (as an index list would) leaves the AFE port
++		 * with no active channels, which makes the DSP send EOS instead
++		 * of data.
++		 */
++		unsigned int tx_ch = 0x3;
++		int __r = snd_soc_dai_set_channel_map(cpu_dai, 2, &tx_ch, 0, NULL);
++
++		if (__r)
++			dev_warn(rtd->card->dev,
++				 "J716F-CHMAP: dai_id=%d set_channel_map rc=%d\n",
++				 cpu_dai->id, __r);
++		else
++			pr_debug("J716F-CHMAP: dai_id=%d set_channel_map rc=%d\n",
++				 cpu_dai->id, __r);
++	}
++
+ 	return 0;
+ }
+ 
+@@ -78,13 +186,114 @@
+ 	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
+ 	struct snd_soc_dai *cpu_dai = snd_soc_rtd_to_cpu(rtd, 0);
+ 	struct snd_soc_dai *codec_dai = snd_soc_rtd_to_codec(rtd, 0);
++	struct sm8250_snd_data *data = snd_soc_card_get_drvdata(rtd->card);
++	int i, ret;
++
++	pr_debug("J716F-CLK: sm8250_snd_startup called\n");
++
++	/*
++	 * Lenovo J716F: power the digital microphones for the capture
++	 * backends. The vendor driver does this in msm_dmic_event() with
++	 * qcom,msm-dmic-en-gpio = <&pm8150b_gpios 12 GPIO_ACTIVE_LOW>,
++	 * i.e. the rail is enabled by driving the line low.
++	 *
++	 * Without it the DMIC clock pads stay static no matter what the VA
++	 * macro registers say, because the microphones themselves are not
++	 * powered.
++	 */
++	if (data->dmic_en_gpio &&
++	    (cpu_dai->id == TX_CODEC_DMA_TX_3 || cpu_dai->id == VA_CODEC_DMA_TX_0)) {
++		gpiod_set_value_cansleep(data->dmic_en_gpio, 1);
++		/* let the rail settle before the clock starts */
++		usleep_range(2000, 2500);
++		pr_debug("J716F-DMIC: power on (dai id %d)\n", cpu_dai->id);
++	}
+ 
+ 	switch (cpu_dai->id) {
+ 	case PRIMARY_MI2S_RX:
+ 		codec_dai_fmt |= SND_SOC_DAIFMT_NB_NF | SND_SOC_DAIFMT_I2S;
+-		snd_soc_dai_set_sysclk(cpu_dai,
++		ret = snd_soc_dai_set_sysclk(cpu_dai,
+ 			Q6AFE_LPASS_CLK_ID_PRI_MI2S_IBIT,
+ 			MI2S_BCLK_RATE, SNDRV_PCM_STREAM_PLAYBACK);
++		if (ret)
++			return ret;
++		ret = snd_soc_dai_set_fmt(cpu_dai, fmt);
++		if (ret)
++			return ret;
++		/*
++		 * Lenovo J716F: the CS35L41 speaker amplifiers derive their
++		 * internal PLL and FS monitor from the I2S bit clock. Both the
++		 * DAI and the component callbacks must be called (this mirrors
++		 * sound/soc/intel/boards/sof_cirrus_common.c): the component one
++		 * is what selects the PLL source, programs the reference clock
++		 * divider and finally enables the PLL. Without it the DAPM path
++		 * powers up and the registers look correct, but the amplifier
++		 * never locks its PLL and stays silent.
++		 */
++		for_each_rtd_codec_dais(rtd, i, codec_dai) {
++			ret = snd_soc_dai_set_sysclk(codec_dai, CS35L41_CLKID_SCLK,
++						   MI2S_BCLK_RATE, SND_SOC_CLOCK_IN);
++			if (ret)
++				return ret;
++			ret = snd_soc_dai_set_fmt(codec_dai, codec_dai_fmt);
++			if (ret)
++				return ret;
++		}
++		break;
++	/*
++	 * Lenovo J716F: the primary MI2S also carries the ES7210 microphone
++	 * ADC on its capture direction. Without a TX case here the capture
++	 * backend never gets its bit clock configured and recording fails.
++	 */
++	case PRIMARY_MI2S_TX:
++		pr_debug("J716F-CLK: PRIMARY_MI2S_TX startup, setting IBIT %u\n",
++			MI2S_BCLK_RATE);
++		codec_dai_fmt |= SND_SOC_DAIFMT_NB_NF | SND_SOC_DAIFMT_I2S;
++		/*
++		 * Lenovo J716F: the ES7210 microphone ADC is clocked from the
++		 * I2S bit clock. The vendor driver's coeff_div[] table programs
++		 * it for MCLK = 256 x Fs (12.288 MHz at 48 kHz, lrck divider
++		 * 0x0100), so the capture direction needs that rate rather than
++		 * the 32 x Fs rate the speaker amplifiers use. With the slow
++		 * clock the chip is configured correctly, the DAPM path comes up
++		 * and the registers release, but the ADC cannot produce samples,
++		 * so every recording is silence.
++		 */
++		/*
++		 * IBIT only, as upstream sm8250 does.
++		 *
++		 * The vendor machine driver (audio_machine_kona.ko) programs both
++		 * IBIT and EBIT at 1.536 MHz here; its tables were read out of
++		 * the module and are:
++		 *
++		 *   .data  mi2s_clk[]       { 0x100, 1536000, 1, 1 }
++		 *                           { 0x102, 1536000, 1, 1 }
++		 *                           { 0x104, 1536000, 1, 1 }
++		 *   .rodata mi2s_ebit_clk[] { 0x101, 0x103, 0x105 }
++		 *
++		 * Adding the EBIT was tried and makes the capture record **zero
++		 * bytes**, so only IBIT stays. Note also that both the vendor and
++		 * this driver use 32 x Fs, not the 256 x Fs the ES7210's
++		 * coeff_div[] table documents - which is where the microphone
++		 * bring-up currently stands.
++		 */
++		{
++			int __rc = snd_soc_dai_set_sysclk(cpu_dai,
++				Q6AFE_LPASS_CLK_ID_PRI_MI2S_IBIT,
++				MI2S_BCLK_RATE, SNDRV_PCM_STREAM_CAPTURE);
++			if (__rc)
++				dev_warn(rtd->card->dev,
++					 "J716F-CLK: set_sysclk IBIT rc=%d\n", __rc);
++			else
++				pr_debug("J716F-CLK: set_sysclk IBIT rc=%d\n", __rc);
++		}
++		/*
++		 * NOTE: sdm845/sc7180 additionally program
++		 * Q6AFE_LPASS_CLK_ID_MCLK_1 here to give the codec a master
++		 * clock. That was tried for the ES7210 and the ADSP rejects it
++		 * ("AFE set params failed -22"), so the capture port is left
++		 * with just the bit clock.
++		 */
+ 		snd_soc_dai_set_fmt(cpu_dai, fmt);
+ 		snd_soc_dai_set_fmt(codec_dai, codec_dai_fmt);
+ 		break;
+@@ -135,6 +344,86 @@
+ 	return qcom_snd_sdw_startup(substream);
+ }
+ 
++static void sm8250_snd_shutdown(struct snd_pcm_substream *substream)
++{
++	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
++	struct snd_soc_dai *cpu_dai = snd_soc_rtd_to_cpu(rtd, 0);
++	struct sm8250_snd_data *data = snd_soc_card_get_drvdata(rtd->card);
++
++	if (data->dmic_en_gpio &&
++	    (cpu_dai->id == TX_CODEC_DMA_TX_3 ||
++	     cpu_dai->id == VA_CODEC_DMA_TX_0)) {
++		gpiod_set_value_cansleep(data->dmic_en_gpio, 0);
++		pr_debug("J716F-DMIC: power off (dai id %d)\n", cpu_dai->id);
++	}
++
++	qcom_snd_sdw_shutdown(substream);
++}
++
++static int sm8250_snd_hw_params(struct snd_pcm_substream *substream,
++				struct snd_pcm_hw_params *params)
++{
++	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
++	struct snd_soc_dai *codec_dai;
++	const unsigned int left_slots[] = { 0, 1 };
++	const unsigned int right_slots[] = { 1, 0 };
++	int i, ret;
++
++	(void)params;
++
++	/*
++	 * Lenovo J716F: the CS35L41 amplifiers take their PLL reference from
++	 * the I2S bit clock.  Program the component side (PLL source and
++	 * divider) and the ASP channel map for every amplifier on the link.
++	 * 0x40/0x43 are on the left, 0x41/0x42 on the right.
++	 */
++	for_each_rtd_codec_dais(rtd, i, codec_dai) {
++		const unsigned int *rx_slots = left_slots;
++		u32 address;
++
++		if (!strstr(codec_dai->name, "cs35l41"))
++			continue;
++
++		if (of_machine_is_compatible("lenovo,j716f")) {
++			ret = of_property_read_u32(codec_dai->component->dev->of_node,
++						   "reg", &address);
++			if (ret)
++				return ret;
++			switch (address) {
++			case 0x40:
++			case 0x43:
++				break;
++			case 0x41:
++			case 0x42:
++				rx_slots = right_slots;
++				break;
++			default:
++				return -EINVAL;
++			}
++		}
++
++		ret = snd_soc_dai_set_channel_map(codec_dai, 0, NULL,
++						  ARRAY_SIZE(left_slots),
++						  rx_slots);
++		if (ret)
++			return ret;
++
++		ret = snd_soc_dai_set_sysclk(codec_dai, CS35L41_CLKID_SCLK,
++					     MI2S_BCLK_RATE, SND_SOC_CLOCK_IN);
++		if (ret)
++			return ret;
++
++		ret = snd_soc_component_set_sysclk(codec_dai->component,
++						   CS35L41_CLKID_SCLK, 0,
++						   MI2S_BCLK_RATE,
++						   SND_SOC_CLOCK_IN);
++		if (ret)
++			return ret;
++	}
++
++	return 0;
++}
++
+ static int sm8250_snd_prepare(struct snd_pcm_substream *substream)
+ {
+ 	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
+@@ -155,7 +444,8 @@
+ 
+ static const struct snd_soc_ops sm8250_be_ops = {
+ 	.startup = sm8250_snd_startup,
+-	.shutdown = qcom_snd_sdw_shutdown,
++	.shutdown = sm8250_snd_shutdown,
++	.hw_params = sm8250_snd_hw_params,
+ 	.hw_free = sm8250_snd_hw_free,
+ 	.prepare = sm8250_snd_prepare,
+ };
+@@ -175,6 +465,23 @@
+ 	}
+ }
+ 
++static int sm8250_j716f_speaker_late_probe(struct snd_soc_card *card)
++{
++	static const char * const pins[] = { "SPK2 SPK", "SPK3 SPK", "SPK4 SPK" };
++	int i, ret;
++
++	/* Leave new outputs off until their routing, gain and physical
++	 * position have been checked. Amp1 keeps its existing controls.
++	 */
++	for (i = 0; i < ARRAY_SIZE(pins); i++) {
++		ret = snd_soc_dapm_disable_pin(card->dapm, pins[i]);
++		if (ret)
++			return ret;
++	}
++
++	return 0;
++}
++
+ static int sm8250_platform_probe(struct platform_device *pdev)
+ {
+ 	struct snd_soc_card *card;
+@@ -195,13 +502,50 @@
+ 	card->dev = dev;
+ 	dev_set_drvdata(dev, card);
+ 	snd_soc_card_set_drvdata(card, data);
++
++	/*
++	 * Lenovo J716F: optional digital-microphone power enable.  The
++	 * vendor exposes it as qcom,msm-dmic-en-gpio; other boards do not
++	 * have the property and get a NULL descriptor.
++	 */
++	data->dmic_en_gpio = devm_gpiod_get_optional(dev, "qcom,msm-dmic-en",
++						     GPIOD_OUT_LOW);
++	if (IS_ERR(data->dmic_en_gpio)) {
++		ret = PTR_ERR(data->dmic_en_gpio);
++		dev_err(dev, "failed to get DMIC enable gpio: %d\n", ret);
++		return ret;
++	}
++
+ 	ret = qcom_snd_parse_of(card);
+ 	if (ret)
+ 		return ret;
+ 
+ 	card->driver_name = of_device_get_match_data(dev);
++
++	if (of_machine_is_compatible("lenovo,j716f") &&
++	    of_property_match_string(dev->of_node, "pin-switches",
++				     "SPK2 SPK") >= 0)
++		card->late_probe = sm8250_j716f_speaker_late_probe;
++
+ 	sm8250_add_be_ops(card);
+-	return devm_snd_soc_register_card(dev, card);
++
++	ret = devm_snd_soc_register_card(dev, card);
++	if (ret)
++		return ret;
++
++	/*
++	 * The card-level control helpers need soc_card->snd_card, which only
++	 * exists after registration.  Expose the DMIC rail under the vendor
++	 * control name when the GPIO is present.
++	 */
++	if (data->dmic_en_gpio) {
++		ret = snd_soc_add_card_controls(card, &sm8250_dmic_en_control, 1);
++		if (ret)
++			dev_warn(dev, "J716F: failed to add DMIC EN control: %d\n",
++				 ret);
++	}
++
++	return 0;
+ }
+ 
+ static const struct of_device_id snd_sm8250_dt_match[] = {
+--- a/sound/soc/soc-dapm.c
++++ b/sound/soc/soc-dapm.c
+@@ -1904,6 +1904,11 @@
+ 
+ 	list_for_each_entry(w, pending, power_list) {
+ 		WARN_ON(reg != w->reg || dapm != w->dapm);
++		if (!strcmp(w->name, "TX_AIF1 Capture") ||
++		    !strcmp(w->name, "TX DMIC2") ||
++		    !strcmp(w->name, "TX_CODEC_DMA_TX_3 Capture"))
++			pr_debug("J716F-SEQ: %s power %d -> %d (reg=%#x)\n",
++				w->name, w->power, w->new_power, reg);
+ 		w->power = w->new_power;
+ 
+ 		mask |= w->mask << w->shift;
+@@ -2204,6 +2209,14 @@
+ 
+ 	power = dapm_widget_power_check(w);
+ 
++	/*
++	 * NOTE (2026-10-19): a stray debug `if (... of_device_is_compatible(
++	 * ..., "qcom,sm8250-lpass-tx-macro"))` used to sit here with no body,
++	 * making the `if (w->power == power) return;` below its body. That
++	 * meant the power-state short-circuit only ran for tx-macro widgets,
++	 * so every other widget kept being re-sequenced and DAPM never
++	 * settled - the capture chain stayed Off even with w->active set.
++	 */
+ 	if (w->power == power)
+ 		return;
+ 
+@@ -4554,9 +4567,20 @@
+ 
+ 	w = snd_soc_dai_get_widget(dai, stream);
+ 
++	/*
++	 * NOTE (2026-10-19): a stray `if (dai->name && !strcmp(dai->name,
++	 * "tx_macro_tx1"))` used to sit here with no statement body, which
++	 * made the `if (w)` block below its body. Every DAI other than
++	 * tx_macro_tx1 therefore had its stream event silently dropped:
++	 * w->active was never set, DAPM never powered the chain, and
++	 * capture returned correctly sized but all-zero buffers
++	 * (es7210 bias_level Off, LPASS PRI_MI2S_IBIT/EBIT enable_count 0).
++	 */
+ 	if (w) {
+ 		unsigned int ep;
+ 
++		pr_debug("J716F-DAPM: dai=%s widget=%s event=%d\n",
++			dai->name, w->name, event);
+ 		dapm_mark_dirty(w, "stream event");
+ 
+ 		if (w->id == snd_soc_dapm_dai_in) {
+--- a/sound/soc/soc-pcm.c
++++ b/sound/soc/soc-pcm.c
+@@ -128,10 +128,21 @@
+ static int snd_soc_dpcm_can_be_prepared(struct snd_soc_pcm_runtime *fe,
+ 					struct snd_soc_pcm_runtime *be, int stream)
+ {
++	/*
++	 * Lenovo J716F: a backend that is still in HW_PARAMS must also be
++	 * accepted here. userspace does open -> hw_params -> prepare, and at
++	 * hw_params dpcm_run_update_startup() returns early once the FE has
++	 * reached HW_PARAMS, before it ever calls dpcm_be_dai_prepare(). The
++	 * BE therefore stays in HW_PARAMS, and without this entry
++	 * dpcm_fe_dai_prepare() skips it, so __soc_pcm_prepare() never runs
++	 * for the BE, SND_SOC_DAPM_STREAM_START is never sent to the codec DAI
++	 * widget and the whole DAPM capture path stays unpowered.
++	 */
+ 	const enum snd_soc_dpcm_state state[] = {
+ 		SND_SOC_DPCM_STATE_START,
+ 		SND_SOC_DPCM_STATE_PAUSED,
+ 		SND_SOC_DPCM_STATE_PREPARE,
++		SND_SOC_DPCM_STATE_HW_PARAMS,
+ 	};
+ 
+ 	return snd_soc_dpcm_check_state(fe, be, stream, state, ARRAY_SIZE(state));
+@@ -1747,7 +1758,6 @@
+ 		new++;
+ 	}
+ 
+-	dev_dbg(fe->dev, "ASoC: found %d new BE paths\n", new);
+ 	return new;
+ }
+ 
+@@ -2090,6 +2100,24 @@
+ 
+ 	fe->dpcm[stream].state = SND_SOC_DPCM_STATE_OPEN;
+ 
++	/*
++	 * Lenovo J716F: power the capture/playback DAPM chain as soon as the
++	 * DPCM frontend opens.
++	 *
++	 * Upstream only issues dpcm_dapm_stream_event() from
++	 * dpcm_run_update_startup(), which runs from DAPM mixer changes and
++	 * bails out early when the FE substream is not active yet - so with a
++	 * plain "open the PCM, then read" sequence (what arecord does) the
++	 * event is never sent. The whole chain then stays powered down:
++	 * es7210 bias_level Off, LPASS PRI_MI2S_IBIT/EBIT enable_count 0,
++	 * and capture returns correctly sized but all-zero buffers.
++	 *
++	 * The matching SND_SOC_DAPM_STREAM_STOP is already sent from
++	 * dpcm_fe_dai_close(), so the pair stays balanced.
++	 */
++
++	dpcm_dapm_stream_event(fe, stream, SND_SOC_DAPM_STREAM_START);
++
+ 	dpcm_runtime_setup_fe(fe_substream);
+ 
+ 	dpcm_runtime_setup_be_format(fe_substream);
+@@ -2606,6 +2634,7 @@
+ 		if (!snd_soc_dpcm_can_be_update(fe, be, stream))
+ 			continue;
+ 
++
+ 		if (!snd_soc_dpcm_can_be_prepared(fe, be, stream))
+ 			continue;
+ 
+--- a/arch/arm64/boot/dts/qcom/sm8250-lenovo-j716f.dts
++++ b/arch/arm64/boot/dts/qcom/sm8250-lenovo-j716f.dts
+@@ -8,9 +8,12 @@
+ #include <dt-bindings/arm/qcom,ids.h>
+ #include <dt-bindings/gpio/gpio.h>
+ #include <dt-bindings/regulator/qcom,rpmh-regulator.h>
++#include <dt-bindings/sound/qcom,q6afe.h>
++#include <dt-bindings/sound/qcom,q6asm.h>
+ #include "sm8250.dtsi"
+ #include "pm8009.dtsi"
+ #include "pm8150.dtsi"
++#include "pm8150b.dtsi"
+ #include "pm8150l.dtsi"
+ 
+ / {
+@@ -603,10 +606,132 @@
+ 	status = "okay";
+ 
+ 	/* onsemi NB7VPQ904M USB redriver @ 19 */
+-	/* CS35L41 audio amp @ 40 */
+-	/* CS35L41 audio amp @ 41 */
+-	/* CS35L41 audio amp @ 42 */
+-	/* CS35L41 audio amp @ 43 */
++
++	/*
++	 * Four CS35L41 speaker amplifiers.  All share reset gpio 131 and
++	 * the primary MI2S bit clock; IRQs are 67, 113, 126 and 68.
++	 * VA is the 3.3 V logic rail, VP is the battery rail feeding the
++	 * internal boost converter.
++	 */
++	spk_amp1: speaker@40 {
++		compatible = "cirrus,cs35l41";
++		reg = <0x40>;
++		#sound-dai-cells = <1>;
++
++		interrupt-parent = <&tlmm>;
++		interrupts = <67 IRQ_TYPE_LEVEL_LOW>;
++		interrupt-controller;
++		#interrupt-cells = <2>;
++		interrupt-names = "cs35l41_1_irq";
++
++		pinctrl-names = "default";
++		pinctrl-0 = <&spk1_irq_default &spk_reset_default>;
++
++		reset-gpios = <&tlmm 131 GPIO_ACTIVE_HIGH>;
++
++		VA-supply = <&vreg_l16a_3p3>;
++		VP-supply = <&vph_pwr>;
++
++		cirrus,boost-type = <0>;
++		cirrus,boost-peak-milliamp = <3500>;
++		cirrus,boost-ind-nanohenry = <1000>;
++		cirrus,boost-cap-microfarad = <15>;
++		/* Without a boost target the amplifier stays silent. */
++		cirrus,boost-ctl-millivolt = <4600>;
++		cirrus,asp-sdout-hiz = <3>;
++		cirrus,gpio2-src-select = <4>;
++		cirrus,gpio2-output-enable;
++	};
++
++	spk_amp2: speaker@41 {
++		compatible = "cirrus,cs35l41";
++		reg = <0x41>;
++		#sound-dai-cells = <1>;
++		sound-name-prefix = "SPK2";
++
++		interrupt-parent = <&tlmm>;
++		interrupts = <113 IRQ_TYPE_LEVEL_LOW>;
++		interrupt-controller;
++		#interrupt-cells = <2>;
++		interrupt-names = "cs35l41_2_irq";
++
++		pinctrl-names = "default";
++		pinctrl-0 = <&spk2_irq_default>;
++
++		reset-gpios = <&tlmm 131 GPIO_ACTIVE_HIGH>;
++
++		VA-supply = <&vreg_l16a_3p3>;
++		VP-supply = <&vph_pwr>;
++
++		cirrus,boost-type = <0>;
++		cirrus,boost-peak-milliamp = <3500>;
++		cirrus,boost-ind-nanohenry = <1000>;
++		cirrus,boost-cap-microfarad = <15>;
++		cirrus,boost-ctl-millivolt = <4600>;
++		cirrus,asp-sdout-hiz = <3>;
++		cirrus,gpio2-src-select = <4>;
++		cirrus,gpio2-output-enable;
++	};
++
++	spk_amp3: speaker@42 {
++		compatible = "cirrus,cs35l41";
++		reg = <0x42>;
++		#sound-dai-cells = <1>;
++		sound-name-prefix = "SPK3";
++
++		interrupt-parent = <&tlmm>;
++		interrupts = <126 IRQ_TYPE_LEVEL_LOW>;
++		interrupt-controller;
++		#interrupt-cells = <2>;
++		interrupt-names = "cs35l41_3_irq";
++
++		pinctrl-names = "default";
++		pinctrl-0 = <&spk3_irq_default>;
++
++		reset-gpios = <&tlmm 131 GPIO_ACTIVE_HIGH>;
++
++		VA-supply = <&vreg_l16a_3p3>;
++		VP-supply = <&vph_pwr>;
++
++		cirrus,boost-type = <0>;
++		cirrus,boost-peak-milliamp = <3500>;
++		cirrus,boost-ind-nanohenry = <1000>;
++		cirrus,boost-cap-microfarad = <15>;
++		cirrus,boost-ctl-millivolt = <4600>;
++		cirrus,asp-sdout-hiz = <3>;
++		cirrus,gpio2-src-select = <4>;
++		cirrus,gpio2-output-enable;
++	};
++
++	spk_amp4: speaker@43 {
++		compatible = "cirrus,cs35l41";
++		reg = <0x43>;
++		#sound-dai-cells = <1>;
++		sound-name-prefix = "SPK4";
++
++		interrupt-parent = <&tlmm>;
++		interrupts = <68 IRQ_TYPE_LEVEL_LOW>;
++		interrupt-controller;
++		#interrupt-cells = <2>;
++		interrupt-names = "cs35l41_4_irq";
++
++		pinctrl-names = "default";
++		pinctrl-0 = <&spk4_irq_default>;
++
++		reset-gpios = <&tlmm 131 GPIO_ACTIVE_HIGH>;
++
++		VA-supply = <&vreg_l16a_3p3>;
++		VP-supply = <&vph_pwr>;
++
++		cirrus,boost-type = <0>;
++		cirrus,boost-peak-milliamp = <3500>;
++		cirrus,boost-ind-nanohenry = <1000>;
++		cirrus,boost-cap-microfarad = <15>;
++		cirrus,boost-ctl-millivolt = <4600>;
++		cirrus,asp-sdout-hiz = <3>;
++		cirrus,gpio2-src-select = <4>;
++		cirrus,gpio2-output-enable;
++	};
+ 
+ 	keyboard@61 {
+ 		compatible = "hid-over-i2c";
+@@ -693,10 +818,23 @@
+ 	status = "okay";
+ 
+ 	/* SMB1390 charger @ 10 */
+-	/* ES7210 audio ADC @ 40 */
+ 	/* FSA4480 USB audio switch @ 43 */
+ 	/* RTC6226 FM receiver @ 64 */
+ 	/* HL6111R wireless charging IC @ 25 */
++
++	/*
++	 * Four-microphone ADC.  Its serial output feeds the primary MI2S
++	 * capture direction, so data0/data1 must stay inputs on the SoC.
++	 */
++	es7210: audio-adc@40 {
++		compatible = "everest,es7210";
++		reg = <0x40>;
++
++		vd-supply = <&vreg_l16a_3p3>;
++		vp-supply = <&vreg_l8c_1p8>;
++
++		#sound-dai-cells = <0>;
++	};
+ };
+ 
+ &pcie0 {
+@@ -847,6 +985,42 @@
+ 		output-low;
+ 		bias-pull-up;
+ 	};
++
++	spk1_irq_default: spk1-irq-default-state {
++		pins = "gpio67";
++		function = "gpio";
++		drive-strength = <2>;
++		bias-pull-up;
++	};
++
++	spk2_irq_default: spk2-irq-default-state {
++		pins = "gpio113";
++		function = "gpio";
++		drive-strength = <2>;
++		bias-pull-up;
++	};
++
++	spk3_irq_default: spk3-irq-default-state {
++		pins = "gpio126";
++		function = "gpio";
++		drive-strength = <2>;
++		bias-pull-up;
++	};
++
++	spk4_irq_default: spk4-irq-default-state {
++		pins = "gpio68";
++		function = "gpio";
++		drive-strength = <2>;
++		bias-pull-up;
++	};
++
++	spk_reset_default: spk-reset-default-state {
++		pins = "gpio131";
++		function = "gpio";
++		drive-strength = <16>;
++		bias-pull-up;
++		output-high;
++	};
+ };
+ 
+ &uart6 {
+@@ -1012,3 +1186,240 @@
+  * 没有正常应答，整机在 hwclock -w 时挂死。RTC 只读，系统时间由
+  * fake-hwclock + NTP 兜底，因此这里明确不声明 RTC 可写。
+  */
++
++/*
++ * Phase L5 audio: four CS35L41 amplifiers on primary MI2S RX, ES7210 on
++ * primary MI2S TX, DMIC capture through the VA/TX macros, and the Q6ASM
++ * front ends.  The topology follows the working 6.15.11 J716F reference.
++ */
++&q6asmdai {
++	dai@0 {
++		reg = <0>;
++	};
++
++	dai@1 {
++		reg = <1>;
++	};
++
++	dai@2 {
++		reg = <2>;
++	};
++};
++
++&q6afedai {
++	/*
++	 * Speakers use SD1, the ES7210 microphone ADC uses SD0.
++	 * mainline builds the line mask with BIT(index).
++	 */
++	dai@16 {
++		reg = <PRIMARY_MI2S_RX>;
++		qcom,sd-lines = <1>;
++	};
++
++	dai@17 {
++		reg = <PRIMARY_MI2S_TX>;
++		qcom,sd-lines = <0>;
++	};
++};
++
++/*
++ * The primary MI2S data lines are driven by the ES7210 in the capture
++ * direction.  sm8250.dtsi marks data0/data1 output-high, which makes the
++ * SoC fight the codec and turns every recording into silence; delete the
++ * property so the pads stay inputs.
++ */
++&pri_mi2s_active {
++	data0-pins {
++		/delete-property/ output-high;
++	};
++
++	data1-pins {
++		/delete-property/ output-high;
++	};
++};
++
++/* DMIC pad groups on the LPASS LPI pin controller. */
++&lpass_tlmm {
++	dmic1_active: dmic1-active-state {
++		clk-pins {
++			pins = "gpio6";
++			function = "dmic1_clk";
++			drive-strength = <8>;
++			output-high;
++		};
++
++		data-pins {
++			pins = "gpio7";
++			function = "dmic1_data";
++			drive-strength = <8>;
++			input-enable;
++		};
++	};
++
++	dmic2_active: dmic2-active-state {
++		clk-pins {
++			pins = "gpio8";
++			function = "dmic2_clk";
++			drive-strength = <8>;
++			output-high;
++		};
++
++		data-pins {
++			pins = "gpio9";
++			function = "dmic2_data";
++			drive-strength = <8>;
++			input-enable;
++		};
++	};
++
++	dmic3_active: dmic3-active-state {
++		clk-pins {
++			pins = "gpio12";
++			function = "dmic3_clk";
++			drive-strength = <8>;
++			output-high;
++		};
++
++		data-pins {
++			pins = "gpio13";
++			function = "dmic3_data";
++			drive-strength = <8>;
++			input-enable;
++		};
++	};
++};
++
++&vamacro {
++	clocks = <&q6afecc LPASS_CLK_ID_VA_CORE_MCLK LPASS_CLK_ATTRIBUTE_COUPLE_NO>,
++		 <&q6afecc LPASS_CLK_ID_VA_CORE_2X_MCLK LPASS_CLK_ATTRIBUTE_COUPLE_NO>,
++		 <&q6afecc LPASS_HW_MACRO_VOTE LPASS_CLK_ATTRIBUTE_COUPLE_NO>,
++		 <&q6afecc LPASS_HW_DCODEC_VOTE LPASS_CLK_ATTRIBUTE_COUPLE_NO>;
++	clock-names = "mclk", "mclk2x", "macro", "dcodec";
++
++	pinctrl-0 = <&dmic1_active &dmic2_active &dmic3_active>;
++	pinctrl-names = "default";
++
++	vdd-micb-supply = <&vreg_s4a_1p8>;
++	va-vdd-micb-supply = <&vreg_s4a_1p8>;
++	qcom,va-vdd-micb-voltage = <1800000>;
++	qcom,va-vdd-micb-current = <100000>;
++	qcom,dmic-sample-rate = <2400000>;
++
++	status = "okay";
++};
++
++&txmacro {
++	qcom,va-macro = <&vamacro>;
++	vdd-micb-supply = <&vreg_s4a_1p8>;
++	qcom,dmic-sample-rate = <2400000>;
++
++	status = "okay";
++};
++
++&sound {
++	compatible = "qcom,sm8250-sndcard";
++	model = "Lenovo Xiaoxin Pad Pro 2021";
++
++	pinctrl-names = "default";
++	pinctrl-0 = <&pri_mi2s_active>;
++
++	/* Amp1 keeps the stock "SPK" switch; SPK2-4 start disabled. */
++	pin-switches = "SPK2 SPK", "SPK3 SPK", "SPK4 SPK";
++
++	qcom,msm-dmic-en-gpio = <&pm8150b_gpios 12 GPIO_ACTIVE_LOW>;
++	qcom,msm-dmic-sel-gpio = <&pm8150_gpios 1 GPIO_ACTIVE_HIGH>;
++
++	audio-routing =
++		"MM_DL1", "MultiMedia1 Playback",
++		"MM_DL2", "MultiMedia2 Playback",
++		"MultiMedia3 Capture", "MM_UL3",
++		"MultiMedia1 Capture", "MM_UL1",
++		"PRI_MI2S_TX", "Capture",
++		"Primary MI2S Capture", "Capture",
++		"VA DMIC0", "vdd-micb",
++		"VA DMIC1", "vdd-micb",
++		"VA DMIC2", "vdd-micb",
++		"VA DMIC3", "vdd-micb";
++
++	mm1-dai-link {
++		link-name = "MultiMedia1";
++		cpu {
++			sound-dai = <&q6asmdai MSM_FRONTEND_DAI_MULTIMEDIA1>;
++		};
++	};
++
++	mm2-dai-link {
++		link-name = "MultiMedia2";
++		cpu {
++			sound-dai = <&q6asmdai MSM_FRONTEND_DAI_MULTIMEDIA2>;
++		};
++	};
++
++	pri-mi2s-dai-link {
++		link-name = "Primary MI2S Playback";
++		cpu {
++			sound-dai = <&q6afedai PRIMARY_MI2S_RX>;
++		};
++
++		platform {
++			sound-dai = <&q6routing>;
++		};
++
++		codec {
++			sound-dai = <&spk_amp1 0>, <&spk_amp2 0>,
++				    <&spk_amp3 0>, <&spk_amp4 0>;
++		};
++	};
++
++	mm3-dai-link {
++		link-name = "MultiMedia3";
++		cpu {
++			sound-dai = <&q6asmdai MSM_FRONTEND_DAI_MULTIMEDIA3>;
++		};
++	};
++
++	tx-dai-link {
++		link-name = "TX Capture";
++		cpu {
++			sound-dai = <&q6afedai TX_CODEC_DMA_TX_3>;
++		};
++
++		platform {
++			sound-dai = <&q6routing>;
++		};
++
++		codec {
++			sound-dai = <&txmacro 0>;
++		};
++	};
++
++	va-dai-link {
++		link-name = "VA Capture";
++		cpu {
++			sound-dai = <&q6afedai VA_CODEC_DMA_TX_0>;
++		};
++
++		platform {
++			sound-dai = <&q6routing>;
++		};
++
++		codec {
++			sound-dai = <&vamacro 0>;
++		};
++	};
++
++	pri-mi2s-cap-dai-link {
++		link-name = "Primary MI2S Capture";
++		cpu {
++			sound-dai = <&q6afedai PRIMARY_MI2S_TX>;
++		};
++
++		platform {
++			sound-dai = <&q6routing>;
++		};
++
++		codec {
++			sound-dai = <&es7210>;
++		};
++	};
++};
+--- /dev/null
++++ b/sound/soc/codecs/es7210.c
+@@ -0,0 +1,704 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Everest Semi ES7210 4-channel audio ADC driver
++ *
++ * The ES7210 is a 4-channel ADC with an I2S/TDM output and an I2C control
++ * interface. It is used on the Lenovo Xiaoxin Pad Pro 2021 (TB-J716F) as the
++ * microphone front end, sitting on i2c15 at address 0x40 with its data lines
++ * wired to the LPASS primary MI2S capture port.
++ *
++ * Register names and the power-up sequence follow the ES7210 datasheet
++ * (v1.6) and the vendor driver shipped in the tablet's Android kernel.
++ */
++
++#include <linux/clk.h>
++#include <linux/delay.h>
++#include <linux/i2c.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/pm_runtime.h>
++#include <linux/regmap.h>
++#include <linux/regulator/consumer.h>
++
++#include <sound/pcm.h>
++#include <sound/pcm_params.h>
++#include <sound/soc.h>
++#include <sound/tlv.h>
++
++/* Register map */
++#define ES7210_RESET_REG00		0x00
++#define ES7210_CLOCK_OFF_REG01		0x01
++#define ES7210_MAINCLK_REG02		0x02
++#define ES7210_MASTER_CLK_REG03		0x03
++#define ES7210_LRCK_DIVH_REG04		0x04
++#define ES7210_LRCK_DIVL_REG05		0x05
++#define ES7210_POWER_DOWN_REG06		0x06
++#define ES7210_OSR_REG07		0x07
++#define ES7210_MODE_CONFIG_REG08	0x08
++#define ES7210_TIME_CONTROL0_REG09	0x09
++#define ES7210_TIME_CONTROL1_REG0A	0x0a
++#define ES7210_SDP_INTERFACE1_REG11	0x11
++#define ES7210_SDP_INTERFACE2_REG12	0x12
++#define ES7210_ADC_AUTOMUTE_REG13	0x13
++#define ES7210_ADC34_MUTERANGE_REG14	0x14
++#define ES7210_ADC12_MUTERANGE_REG15	0x15
++#define ES7210_ADC34_HPF2_REG20		0x20
++#define ES7210_ADC34_HPF1_REG21		0x21
++#define ES7210_ADC12_HPF1_REG22		0x22
++#define ES7210_ADC12_HPF2_REG23		0x23
++#define ES7210_ANALOG_REG40		0x40
++#define ES7210_ANALOG_REG41		0x41
++#define ES7210_MIC12_BIAS_REG41		0x41
++#define ES7210_MIC34_BIAS_REG42		0x42
++#define ES7210_MIC1_GAIN_REG43		0x43
++#define ES7210_MIC2_GAIN_REG44		0x44
++#define ES7210_MIC3_GAIN_REG45		0x45
++#define ES7210_MIC4_GAIN_REG46		0x46
++#define ES7210_MIC1_POWER_REG47		0x47
++#define ES7210_MIC2_POWER_REG48		0x48
++#define ES7210_MIC3_POWER_REG49		0x49
++#define ES7210_MIC4_POWER_REG4A		0x4a
++#define ES7210_MIC12_POWER_REG4B	0x4b
++#define ES7210_MIC34_POWER_REG4C	0x4c
++#define ES7210_ANALOG_REG4D		0x4d
++#define ES7210_ANALOG_REG4E		0x4e
++#define ES7210_ANALOG_REG4F		0x4f
++
++#define ES7210_MCLK_DIV_OFFSET		0x00
++#define ES7210_MCLK_DIV_MASK		GENMASK(1, 0)
++#define ES7210_MCLK_OFF			BIT(0)
++#define ES7210_MCLK_DIV_1		0
++#define ES7210_MCLK_DIV_2		1
++#define ES7210_MCLK_DIV_4		2
++#define ES7210_MCLK_DIV_8		3
++
++#define ES7210_LRCK_DIV_MASK		GENMASK(7, 0)
++#define ES7210_LRCK_DIV_OFFSET		0x00
++#define ES7210_LRCK_DIVH_OFFSET		0x00
++
++#define ES7210_DIGITAL_GAIN_SHIFT	0
++#define ES7210_DIGITAL_GAIN_MASK	GENMASK(4, 0)
++
++#define ES7210_SDP_INTERFACE_FORMAT_MASK	GENMASK(1, 0)
++#define ES7210_SDP_INTERFACE_I2S		(0 << 0)
++#define ES7210_SDP_INTERFACE_LEFT_J		(1 << 0)
++#define ES7210_SDP_INTERFACE_DSP		(3 << 0)
++
++#define ES7210_OSR_MASK			GENMASK(2, 0)
++#define ES7210_OSR_64			(0 << 0)
++#define ES7210_OSR_128			(1 << 0)
++#define ES7210_OSR_256			(2 << 0)
++#define ES7210_OSR_512			(3 << 0)
++#define ES7210_OSR_1024			(4 << 0)
++
++#define ES7210_ADC34_MODE_MASK		GENMASK(7, 6)
++#define ES7210_ADC34_MODE_TDM		BIT(7)
++
++#define ES7210_MODE_CONFIG_MASK		GENMASK(7, 4)
++#define ES7210_MODE_CONFIG_4CH_I2S	(0 << 4)
++#define ES7210_MODE_CONFIG_TDM		(1 << 4)
++
++/* Registers 0x00-0x4f are all valid */
++#define ES7210_MAX_REG			0x4f
++
++/*
++ * The ES7210 needs a specific start-up order: the analogue block, the
++ * reference, then the ADC itself. Values come from the datasheet's
++ * "recommended power up sequence" table and the vendor driver.
++ */
++static const struct reg_default es7210_reg_defaults[] = {
++	{ 0x00, 0xff }, { 0x01, 0x3f }, { 0x02, 0x00 }, { 0x03, 0x20 },
++	{ 0x04, 0x01 }, { 0x05, 0x00 }, { 0x06, 0x3f }, { 0x07, 0x00 },
++	{ 0x08, 0x00 }, { 0x09, 0x00 }, { 0x0a, 0x00 }, { 0x11, 0x30 },
++	{ 0x12, 0x02 }, { 0x13, 0x00 }, { 0x14, 0x00 }, { 0x15, 0x00 },
++	{ 0x20, 0x0a }, { 0x21, 0x0a }, { 0x22, 0x0a }, { 0x23, 0x0a },
++	{ 0x40, 0x80 }, { 0x41, 0x00 }, { 0x42, 0x00 }, { 0x43, 0x00 },
++	{ 0x44, 0x00 }, { 0x45, 0x00 }, { 0x46, 0x00 }, { 0x47, 0x00 },
++	{ 0x48, 0x00 }, { 0x49, 0x00 }, { 0x4a, 0x00 }, { 0x4b, 0x00 },
++	{ 0x4c, 0x00 }, { 0x4d, 0x00 }, { 0x4e, 0x00 }, { 0x4f, 0x00 },
++};
++
++static bool es7210_volatile_reg(struct device *dev, unsigned int reg)
++{
++	switch (reg) {
++	case ES7210_RESET_REG00:
++		return true;
++	default:
++		return false;
++	}
++}
++
++static bool es7210_readable_reg(struct device *dev, unsigned int reg)
++{
++	return reg <= ES7210_MAX_REG;
++}
++
++static bool es7210_writeable_reg(struct device *dev, unsigned int reg)
++{
++	return reg <= ES7210_MAX_REG;
++}
++
++static const struct regmap_config es7210_regmap_config = {
++	.reg_bits	= 8,
++	.val_bits	= 8,
++	.max_register	= ES7210_MAX_REG,
++	.reg_defaults	= es7210_reg_defaults,
++	.num_reg_defaults = ARRAY_SIZE(es7210_reg_defaults),
++	.volatile_reg	= es7210_volatile_reg,
++	.readable_reg	= es7210_readable_reg,
++	.writeable_reg	= es7210_writeable_reg,
++	.cache_type	= REGCACHE_MAPLE,
++};
++
++struct es7210_priv {
++	struct device *dev;
++	struct regmap *regmap;
++	struct clk *mclk;
++	struct regulator *vdd_d;	/* digital / VD supply */
++	struct regulator *vdd_p;	/* analogue / VP supply */
++	unsigned int mclk_rate;
++	unsigned int format;
++};
++
++static int es7210_mic_select(struct es7210_priv *es7210, unsigned int mic)
++{
++	/*
++	 * The vendor driver writes 0x08 to each of the four microphone power
++	 * registers (0x47..0x4a); the earlier code set bit 0 instead, which is
++	 * a different control and leaves the input stage off.
++	 */
++	unsigned int reg = ES7210_MIC1_POWER_REG47 + (mic - 1);
++
++	return regmap_write(es7210->regmap, reg, 0x08);
++}
++
++static int es7210_mute(struct snd_soc_dai *dai, int mute, int direction)
++{
++	struct es7210_priv *es7210 = snd_soc_component_get_drvdata(dai->component);
++	unsigned int val = mute ? 0x03 : 0x00;
++
++	/*
++	 * Only the two MUTERANGE registers implement the requested mute.
++	 *
++	 * 0x13 is ADC_AUTOMUTE, not a mute control: writing 0xff there turns
++	 * the automatic mute on, and automute then zeroes the digital output
++	 * whenever the input sits below its threshold - which is all the
++	 * time for a quiet room. The old code wrote 0xff to both registers
++	 * on every stop, so the very next capture started with automute
++	 * enabled and delivered nothing but zeros, even though the chip was
++	 * clocked, powered and configured exactly as the vendor data says.
++	 *
++	 * The reference driver leaves 0x13 at 0x00 and uses 0x03 in the
++	 * MUTERANGE registers to mute.
++	 */
++	regmap_write(es7210->regmap, ES7210_ADC34_MUTERANGE_REG14, val);
++	regmap_write(es7210->regmap, ES7210_ADC12_MUTERANGE_REG15, val);
++
++	return 0;
++}
++
++static int es7210_set_dai_fmt(struct snd_soc_dai *dai, unsigned int fmt)
++{
++	struct es7210_priv *es7210 = snd_soc_component_get_drvdata(dai->component);
++	unsigned int iface;
++
++	switch (fmt & SND_SOC_DAIFMT_FORMAT_MASK) {
++	case SND_SOC_DAIFMT_I2S:
++		iface = ES7210_SDP_INTERFACE_I2S;
++		break;
++	case SND_SOC_DAIFMT_LEFT_J:
++		iface = ES7210_SDP_INTERFACE_LEFT_J;
++		break;
++	case SND_SOC_DAIFMT_DSP_A:
++	case SND_SOC_DAIFMT_DSP_B:
++		iface = ES7210_SDP_INTERFACE_DSP;
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	es7210->format = fmt & SND_SOC_DAIFMT_FORMAT_MASK;
++
++	return regmap_update_bits(es7210->regmap, ES7210_SDP_INTERFACE1_REG11,
++				  ES7210_SDP_INTERFACE_FORMAT_MASK, iface);
++}
++
++static int es7210_hw_params(struct snd_pcm_substream *substream,
++			    struct snd_pcm_hw_params *params,
++			    struct snd_soc_dai *dai)
++{
++	struct es7210_priv *es7210 = snd_soc_component_get_drvdata(dai->component);
++	unsigned int mclk_div, osr;
++	unsigned int ratio;
++	int ret;
++
++	/*
++	 * The J716F machine driver does not call set_sysclk() for this codec,
++	 * so mclk_rate may still be 0. In that case fall back to the standard
++	 * 256 fs MCLK/rate ratio, which is what the LPASS primary MI2S capture
++	 * port supplies on this board.
++	 */
++	if (!es7210->mclk_rate) {
++		mclk_div = ES7210_MCLK_DIV_1;
++		osr = ES7210_OSR_256;
++		goto apply;
++	}
++
++	ratio = es7210->mclk_rate / params_rate(params);
++
++	switch (ratio) {
++	case 256:
++		mclk_div = ES7210_MCLK_DIV_1;
++		osr = ES7210_OSR_256;
++		break;
++	case 384:
++		mclk_div = ES7210_MCLK_DIV_1;
++		osr = ES7210_OSR_512;
++		break;
++	case 512:
++		mclk_div = ES7210_MCLK_DIV_2;
++		osr = ES7210_OSR_512;
++		break;
++	case 768:
++		mclk_div = ES7210_MCLK_DIV_2;
++		osr = ES7210_OSR_1024;
++		break;
++	default:
++		dev_err(es7210->dev, "unsupported mclk/rate ratio %u\n", ratio);
++		return -EINVAL;
++	}
++
++apply:
++	/*
++	 * 0x02/0x07 hold the values captured from the vendor driver; do not
++	 * rewrite them per stream.
++	 */
++	(void)mclk_div;
++	(void)osr;
++
++	return 0;
++}
++
++static int es7210_set_sysclk(struct snd_soc_dai *dai, int clk_id,
++			     unsigned int freq, int dir)
++{
++	struct es7210_priv *es7210 = snd_soc_component_get_drvdata(dai->component);
++
++	if (dir != SND_SOC_CLOCK_IN)
++		return 0;
++
++	es7210->mclk_rate = freq;
++
++	return 0;
++}
++
++/*
++ * Reg 0x01 gates the ADC clocks and reg 0x06 holds the ADCs in power-down.
++ * Both must be released when a capture stream starts, otherwise the ADC
++ * produces silence while the I2S bus still clocks out zeros.
++ */
++static int es7210_trigger(struct snd_pcm_substream *substream, int cmd,
++			  struct snd_soc_dai *dai)
++{
++	struct es7210_priv *es7210 = snd_soc_component_get_drvdata(dai->component);
++
++	/*
++	 * Values captured from the vendor driver while it was enabled:
++	 * 0x01 = 0x20 and 0x06 = 0x00. The disabled state is 0x3f on both.
++	 */
++	switch (cmd) {
++	case SNDRV_PCM_TRIGGER_START:
++	case SNDRV_PCM_TRIGGER_RESUME:
++	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE: {
++		int r1, r2, v1 = -1;
++
++		r1 = regmap_write(es7210->regmap, ES7210_CLOCK_OFF_REG01, 0x20);
++		r2 = regmap_write(es7210->regmap, ES7210_POWER_DOWN_REG06, 0x00);
++		regmap_read(es7210->regmap, ES7210_CLOCK_OFF_REG01, &v1);
++		break;
++	}
++	case SNDRV_PCM_TRIGGER_STOP:
++	case SNDRV_PCM_TRIGGER_SUSPEND:
++	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
++		regmap_write(es7210->regmap, ES7210_CLOCK_OFF_REG01, 0x3f);
++		regmap_write(es7210->regmap, ES7210_POWER_DOWN_REG06, 0x3f);
++		break;
++	default:
++		return 0;
++	}
++
++	return 0;
++}
++
++static const struct snd_soc_dai_ops es7210_dai_ops = {
++	.hw_params	= es7210_hw_params,
++	.set_fmt	= es7210_set_dai_fmt,
++	.set_sysclk	= es7210_set_sysclk,
++	.mute_stream	= es7210_mute,
++	.trigger	= es7210_trigger,
++};
++
++static struct snd_soc_dai_driver es7210_dai = {
++	.name = "es7210-hifi",
++	.capture = {
++		.stream_name	= "Capture",
++		.channels_min	= 1,
++		.channels_max	= 4,
++		.rates		= SNDRV_PCM_RATE_8000_96000,
++		.formats	= SNDRV_PCM_FMTBIT_S16_LE |
++				  SNDRV_PCM_FMTBIT_S24_LE |
++				  SNDRV_PCM_FMTBIT_S32_LE,
++	},
++	.ops = &es7210_dai_ops,
++};
++
++static const DECLARE_TLV_DB_SCALE(es7210_mic_gain_tlv, 0, 300, 0);
++
++/*
++ * The PGA gain field is the low nibble of 0x43..0x46 and only 15 values are
++ * defined (0 = 0 dB ... 14 = 37.5 dB, see the reference driver's MicGain
++ * enum); bit 4 of the same register must always be set, which is why the
++ * reference implementation writes (gain | 0x10).
++ *
++ * The control used to expose the raw register byte with a maximum of 0x0f,
++ * so user space could - and did - write 15 into the field. That is one past
++ * the last valid gain and left 0x1f in the register, i.e. bit 4 plus an
++ * out-of-range gain code. The ADC then converted but produced digital
++ * silence, which is what made every capture come back as zeros even after
++ * the clock tree was fixed.
++ *
++ * Expose 0..14 and let the register accessors add the 0x10 enable bit
++ * through the shift/max pair below.
++ */
++static const struct snd_kcontrol_new es7210_controls[] = {
++	SOC_DOUBLE_R_TLV("MIC1 Volume", ES7210_MIC1_GAIN_REG43,
++			 ES7210_MIC2_GAIN_REG44, 0, 0x0e, 0,
++			 es7210_mic_gain_tlv),
++	SOC_DOUBLE_R_TLV("MIC2 Volume", ES7210_MIC3_GAIN_REG45,
++			 ES7210_MIC4_GAIN_REG46, 0, 0x0e, 0,
++			 es7210_mic_gain_tlv),
++};
++
++static const struct snd_soc_dapm_widget es7210_dapm_widgets[] = {
++	SND_SOC_DAPM_INPUT("MIC1"),
++	SND_SOC_DAPM_INPUT("MIC2"),
++	SND_SOC_DAPM_INPUT("MIC3"),
++	SND_SOC_DAPM_INPUT("MIC4"),
++	SND_SOC_DAPM_ADC("ADC1", NULL, SND_SOC_NOPM, 0, 0),
++	SND_SOC_DAPM_ADC("ADC2", NULL, SND_SOC_NOPM, 0, 0),
++	SND_SOC_DAPM_ADC("ADC3", NULL, SND_SOC_NOPM, 0, 0),
++	SND_SOC_DAPM_ADC("ADC4", NULL, SND_SOC_NOPM, 0, 0),
++	/*
++	 * NOTE: no hand-written "Capture" widget here.
++	 *
++	 * snd_soc_dapm_new_dai_widgets() already creates one per DAI, named
++	 * after es7210_dai.capture.stream_name and typed dai_out. Declaring
++	 * our own "Capture" aif_out widget collided with it:
++	 *
++	 *   ASoC: source widget Capture overwritten
++	 *
++	 * and the surviving widget kept type aif_out, so the
++	 * {"PRI_MI2S_TX", NULL, "Capture"} route could not be resolved -
++	 * PRI_MI2S_TX ended up with in 0, the whole chain stayed Off and
++	 * capture returned 44 bytes.
++	 */
++};
++
++static const struct snd_soc_dapm_route es7210_dapm_routes[] = {
++	{ "ADC1", NULL, "MIC1" },
++	{ "ADC2", NULL, "MIC2" },
++	{ "ADC3", NULL, "MIC3" },
++	{ "ADC4", NULL, "MIC4" },
++	/*
++	 * The ADCs must feed the capture stream, otherwise DAPM has no path
++	 * from the DAI back to the microphones: the ADC widgets stay powered
++	 * down, the chip looks correctly programmed (all registers read back
++	 * as written) and capture completes with every sample zero.
++	 */
++	{ "Capture", NULL, "ADC1" },
++	{ "Capture", NULL, "ADC2" },
++	{ "Capture", NULL, "ADC3" },
++	{ "Capture", NULL, "ADC4" },
++};
++
++/*
++ * Power-up sequence from the datasheet: bring the analogue block and the
++ * reference up first, then release the ADC and the clock gating.
++ */
++static int es7210_component_probe(struct snd_soc_component *component)
++{
++	struct es7210_priv *es7210 = snd_soc_component_get_drvdata(component);
++	int ret;
++
++	/*
++	 * Register values captured from the vendor driver running on this
++	 * exact tablet: Android was booted, the ES7210 bound at i2c-4/0x40,
++	 * its "ADC ES7210 EN" mixer control switched on, and the whole
++	 * register file read back with i2cdump. These are therefore the real
++	 * post-enable values, not a datasheet reconstruction.
++	 *
++	 * The important differences from the previous hand-written sequence:
++	 *   0x01 = 0x20  (not 0x00 - the clock gate is left partly closed)
++	 *   0x02 = 0x01  (not 0xc1 - completely different ADC clock setup)
++	 *   0x03 = 0x04
++	 *   0x08 = 0x16
++	 *   0x12 = 0x01
++	 *   0x1b..0x1e = 0xb9 (not 0xbf)
++	 *   0x3d = 0x72
++	 *   0x40 = 0x42  (not 0x43)
++	 *   0x4c = 0x00  (ADC34 pair powered, not off)
++	 */
++	static const struct reg_sequence es7210_vendor_init[] = {
++		{ 0x00, 0x41 },	/* reset complete */
++		{ 0x01, 0x20 },	/* clock gate */
++		/*
++		 * Clock configuration for MCLK = 32 x Fs, LRCK = 48 kHz.
++		 *
++		 * This is the value the board actually needs, not the 19.2 MHz
++		 * one from the public driver's COEFF_TABLE. The machine driver
++		 * programs Q6AFE_LPASS_CLK_ID_PRI_MI2S_IBIT to 32 x Fs =
++		 * 1.536 MHz at 48 kHz, so LRCK_DIV has to be 32 (0x0020) for
++		 * the ADC to produce 48 kHz.
++		 *
++		 * With the previous LRCK_DIV = 400 (0x0190) the divider gave
++		 * 1.536 MHz / 400 = 3.84 kHz. The chip still powered up, DAPM
++		 * completed, every register read back exactly as written and
++		 * the ADSP still delivered periods on time - it just delivered
++		 * zeros, because the ADC was being asked for a rate it cannot
++		 * produce. That was the last remaining blocker for capture.
++		 *
++		 * 0x02 = adc_div | (doubler << 6) | (dll << 7) = 0x05 | 0x40 = 0x45
++		 */
++		{ 0x02, 0x45 },	/* ADC clock: div 5, doubler on, dll off */
++		{ 0x03, 0x04 },	/* master clock */
++		{ 0x04, 0x00 },	/* LRCK divider high = 0x00 */
++		{ 0x05, 0x20 },	/* LRCK divider low  = 0x20 -> 32 total */
++		{ 0x06, 0x00 },	/* out of power-down */
++		{ 0x07, 0x28 },	/* OSR = 256 (per COEFF_TABLE) */
++		{ 0x08, 0x16 },	/* mode config */
++		{ 0x09, 0x30 },	/* ADC time control 0 */
++		{ 0x0a, 0x30 },	/* ADC time control 1 */
++		{ 0x0d, 0x09 },
++		{ 0x11, 0x60 },	/* SDP interface, 16-bit */
++		{ 0x12, 0x01 },	/* SDP interface 2 */
++		/*
++		 * ADC_AUTOMUTE_REG13 and the two MUTERANGE registers must be
++		 * zeroed explicitly.
++		 *
++		 * They read back as 0xff after the reset sequence, and 0x13 =
++		 * 0xff enables the automatic mute: any signal below the
++		 * mute-range threshold - which is everything while the mics
++		 * are still settling - forces the digital output to zero. The
++		 * chip then looks perfectly healthy (clocks running, ADCs
++		 * powered, PGA at +18 dB, DAPM fully up, every register
++		 * reading back as written) while every captured sample is 0.
++		 *
++		 * The reference driver (github.com/QuackHack-McBlindy/es7210)
++		 * likewise leaves these at 0x00 and only ever writes 0x03 here
++		 * to mute on request.
++		 */
++		{ 0x13, 0x00 },	/* automute off */
++		{ 0x14, 0x00 },	/* ADC34 mute range off */
++		{ 0x15, 0x00 },	/* ADC12 mute range off */
++		{ 0x18, 0xf7 },
++		{ 0x19, 0xf7 },
++		{ 0x1b, 0xb9 },
++		{ 0x1c, 0xb9 },
++		{ 0x1d, 0xb9 },
++		{ 0x1e, 0xb9 },
++		{ 0x20, 0x0a },	/* HPF */
++		{ 0x21, 0x2a },
++		{ 0x22, 0x0a },
++		{ 0x23, 0x2a },
++		{ 0x24, 0x11 },
++		{ 0x27, 0x0a },
++		{ 0x2b, 0x2a },
++		{ 0x2f, 0x2a },
++		{ 0x33, 0x2a },
++		{ 0x37, 0x2a },
++		{ 0x3d, 0x72 },
++		{ 0x3e, 0x10 },
++		{ 0x3f, 0x02 },
++		/*
++		 * Android reads back 0xc3 here while our sequence wrote 0x42.
++		 * 0x40 holds the analogue block bias/reference enables, so use
++		 * the value the vendor driver actually leaves behind.
++		 */
++		{ 0x40, 0xc3 },	/* analogue block */
++		{ 0x41, 0x70 },	/* MIC12 bias */
++		{ 0x42, 0x70 },	/* MIC34 bias */
++		/*
++		 * MICn PGA: (gain | 0x10), gain 0..14 = 0 dB .. 37.5 dB in
++		 * 3 dB steps. 6 = +18 dB, the value the reference driver's
++		 * example configuration uses.
++		 */
++		{ 0x43, 0x16 },	/* MIC1 PGA, +18 dB */
++		{ 0x44, 0x16 },	/* MIC2 PGA, +18 dB */
++		{ 0x45, 0x16 },	/* MIC3 PGA, +18 dB */
++		{ 0x46, 0x16 },	/* MIC4 PGA, +18 dB */
++		{ 0x47, 0x08 },	/* MIC1 power */
++		{ 0x48, 0x08 },	/* MIC2 power */
++		{ 0x49, 0x08 },	/* MIC3 power */
++		{ 0x4a, 0x08 },	/* MIC4 power */
++		/*
++		 * ADC12_POWER_REG4B / ADC34_POWER_REG4C: 0x0f = power up the
++		 * ADC + PGA blocks, 0x00 = powered down.
++		 *
++		 * The previous values (0x00) came from an Android i2cdump taken
++		 * while nothing was capturing, and left both ADC pairs off - the
++		 * codec then looks correctly configured (all registers read back
++		 * as written) but never produces data. The public es7210 driver
++		 * (github.com/QuackHack-McBlindy/es7210, config_codec()) writes
++		 * 0x0f here as the last step before starting the device.
++		 */
++		{ 0x4b, 0x0f },	/* ADC12 pair power up */
++		{ 0x4c, 0x0f },	/* ADC34 pair power up */
++		/* start the device: 0x71 then 0x41, as the reference driver does */
++		{ 0x00, 0x71 },
++		{ 0x00, 0x41 },
++	};
++
++	/* reset first */
++	ret = regmap_write(es7210->regmap, ES7210_RESET_REG00, 0xff);
++	if (ret)
++		return ret;
++	usleep_range(1000, 2000);
++
++	ret = regmap_multi_reg_write(es7210->regmap, es7210_vendor_init,
++				     ARRAY_SIZE(es7210_vendor_init));
++	if (ret)
++		return ret;
++
++	/*
++	 * DIAGNOSTIC (2026-10-19): force the codec out of BIAS_OFF.
++	 *
++	 * DAPM never powers this chain up on its own: the "Capture" AIF_OUT
++	 * widget fails dapm_generic_check_power() because
++	 * is_connected_output_ep() returns 0 (it walks edges[OUT] looking for
++	 * an endpoint, while Capture's paths live in edges[IN] as
++	 * ADCx -> Capture). With bias_level stuck at Off the ADCs never run
++	 * and every captured sample is zero, even though the register file
++	 * below is written correctly.
++	 *
++	 * Setting BIAS_ON here bypasses that check so we can find out whether
++	 * the codec actually produces data once powered. If it does, the real
++	 * fix is to repair the DAPM power check; this is only a probe.
++	 */
++	ret = snd_soc_component_set_bias_level(component, SND_SOC_BIAS_ON);
++	if (ret)
++		dev_warn(component->dev, "force bias ON failed: %d\n", ret);
++	else
++		dev_info(component->dev, "forced BIAS_ON for mic bring-up test\n");
++
++	return 0;
++}
++
++static const struct snd_soc_component_driver es7210_component_driver = {
++	.probe			= es7210_component_probe,
++	.controls		= es7210_controls,
++	.num_controls		= ARRAY_SIZE(es7210_controls),
++	.dapm_widgets		= es7210_dapm_widgets,
++	.num_dapm_widgets	= ARRAY_SIZE(es7210_dapm_widgets),
++	.dapm_routes		= es7210_dapm_routes,
++	.num_dapm_routes	= ARRAY_SIZE(es7210_dapm_routes),
++	.endianness		= 1,
++};
++
++static int es7210_i2c_probe(struct i2c_client *client)
++{
++	struct es7210_priv *es7210;
++	int ret;
++
++	es7210 = devm_kzalloc(&client->dev, sizeof(*es7210), GFP_KERNEL);
++	if (!es7210)
++		return -ENOMEM;
++
++	es7210->dev = &client->dev;
++
++	es7210->regmap = devm_regmap_init_i2c(client, &es7210_regmap_config);
++	if (IS_ERR(es7210->regmap))
++		return dev_err_probe(&client->dev, PTR_ERR(es7210->regmap),
++				     "failed to init regmap\n");
++
++	es7210->mclk = devm_clk_get_optional(&client->dev, "mclk");
++	if (IS_ERR(es7210->mclk))
++		return dev_err_probe(&client->dev, PTR_ERR(es7210->mclk),
++				     "failed to get mclk\n");
++
++	es7210->vdd_d = devm_regulator_get_optional(&client->dev, "vd");
++	if (IS_ERR(es7210->vdd_d)) {
++		if (PTR_ERR(es7210->vdd_d) != -ENODEV)
++			return dev_err_probe(&client->dev, PTR_ERR(es7210->vdd_d),
++					     "failed to get VD supply\n");
++		es7210->vdd_d = NULL;
++	}
++
++	es7210->vdd_p = devm_regulator_get_optional(&client->dev, "vp");
++	if (IS_ERR(es7210->vdd_p)) {
++		if (PTR_ERR(es7210->vdd_p) != -ENODEV)
++			return dev_err_probe(&client->dev, PTR_ERR(es7210->vdd_p),
++					     "failed to get VP supply\n");
++		es7210->vdd_p = NULL;
++	}
++
++	if (es7210->vdd_d) {
++		ret = regulator_enable(es7210->vdd_d);
++		if (ret)
++			return dev_err_probe(&client->dev, ret,
++					     "failed to enable VD supply\n");
++	}
++
++	if (es7210->vdd_p) {
++		ret = regulator_enable(es7210->vdd_p);
++		if (ret) {
++			if (es7210->vdd_d)
++				regulator_disable(es7210->vdd_d);
++			return dev_err_probe(&client->dev, ret,
++					     "failed to enable VP supply\n");
++		}
++	}
++
++	if (es7210->mclk) {
++		ret = clk_prepare_enable(es7210->mclk);
++		if (ret)
++			return dev_err_probe(&client->dev, ret,
++					     "failed to enable mclk\n");
++		es7210->mclk_rate = clk_get_rate(es7210->mclk);
++	}
++
++	i2c_set_clientdata(client, es7210);
++
++	ret = devm_snd_soc_register_component(&client->dev,
++					      &es7210_component_driver,
++					      &es7210_dai, 1);
++	if (ret)
++		return dev_err_probe(&client->dev, ret,
++				     "failed to register component\n");
++
++	return 0;
++}
++
++static const struct of_device_id es7210_of_match[] = {
++	{ .compatible = "everest,es7210" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, es7210_of_match);
++
++static const struct i2c_device_id es7210_i2c_id[] = {
++	{ "es7210", 0 },
++	{ }
++};
++MODULE_DEVICE_TABLE(i2c, es7210_i2c_id);
++
++static struct i2c_driver es7210_i2c_driver = {
++	.driver = {
++		.name		= "es7210",
++		.of_match_table	= es7210_of_match,
++	},
++	.probe		= es7210_i2c_probe,
++	.id_table	= es7210_i2c_id,
++};
++module_i2c_driver(es7210_i2c_driver);
++
++MODULE_DESCRIPTION("Everest Semi ES7210 ADC driver");
++MODULE_LICENSE("GPL");

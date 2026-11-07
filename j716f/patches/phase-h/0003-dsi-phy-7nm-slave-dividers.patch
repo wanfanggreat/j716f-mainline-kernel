@@ -1,0 +1,36 @@
+--- a/drivers/gpu/drm/msm/dsi/phy/dsi_phy_7nm.c
++++ b/drivers/gpu/drm/msm/dsi/phy/dsi_phy_7nm.c
+@@ -504,6 +504,33 @@
+ 	writel(BIT(0), pll_7nm->phy->base + REG_DSI_7nm_PHY_CMN_PLL_CNTRL);
+ 
+ 	/*
++	 * Mirror the master's post-dividers onto the bonded slave.
++	 *
++	 * CLK_CFG0 holds bit_clk_div (bits 0-3) and pix_clk_div (bits 4-7).
++	 * It is written in exactly one place -- dsi_pll_cmn_clk_cfg0_write() --
++	 * which is only reachable from dsi_7nm_pll_restore_state(), and that
++	 * requires phy->state_saved, which save_pll_state() only sets for the
++	 * master PHY (dsi_mgr_bridge_post_disable()). On a fresh enable the
++	 * slave therefore keeps its reset dividers, so copy just the divider
++	 * fields across from the master.
++	 */
++	if (pll_7nm->slave) {
++		const u32 div_mask =
++			DSI_7nm_PHY_CMN_CLK_CFG0_DIV_CTRL_3_0__MASK |
++			DSI_7nm_PHY_CMN_CLK_CFG0_DIV_CTRL_7_4__MASK;
++		void __iomem *mbase = pll_7nm->phy->base;
++		void __iomem *sbase = pll_7nm->slave->phy->base;
++		u32 m = readl(mbase + REG_DSI_7nm_PHY_CMN_CLK_CFG0);
++		u32 s = readl(sbase + REG_DSI_7nm_PHY_CMN_CLK_CFG0);
++
++		if ((m & div_mask) != (s & div_mask)) {
++			writel((s & ~div_mask) | (m & div_mask),
++			       sbase + REG_DSI_7nm_PHY_CMN_CLK_CFG0);
++			wmb();
++		}
++	}
++
++	/*
+ 	 * ensure all PLL configurations are written prior to checking
+ 	 * for PLL lock.
+ 	 */

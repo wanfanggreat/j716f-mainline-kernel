@@ -1,0 +1,31 @@
+--- a/drivers/base/dd.c
++++ b/drivers/base/dd.c
+@@ -783,6 +783,8 @@
+ 	int ret;
+ 
+ 	calltime = ktime_get();
++	printk(KERN_DEBUG "probe start: %s with driver %s (probe_count=%d)\n",
++	       dev_name(dev), drv->name, atomic_read(&probe_count));
+ 	ret = really_probe(dev, drv);
+ 	rettime = ktime_get();
+ 	/*
+@@ -815,12 +817,19 @@
+  */
+ void wait_for_device_probe(void)
+ {
++	printk(KERN_DEBUG "wait_for_device_probe: enter probe_count=%d\n",
++	       atomic_read(&probe_count));
++
+ 	/* wait for the deferred probe workqueue to finish */
+ 	flush_work(&deferred_probe_work);
++	printk(KERN_DEBUG "wait_for_device_probe: after flush probe_count=%d\n",
++	       atomic_read(&probe_count));
+ 
+ 	/* wait for the known devices to complete their probing */
+ 	wait_event(probe_waitqueue, atomic_read(&probe_count) == 0);
++	printk(KERN_DEBUG "wait_for_device_probe: probe_count reached 0\n");
+ 	async_synchronize_full();
++	printk(KERN_DEBUG "wait_for_device_probe: async done\n");
+ }
+ EXPORT_SYMBOL_GPL(wait_for_device_probe);
+ 

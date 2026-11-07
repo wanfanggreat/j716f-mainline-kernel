@@ -1,0 +1,17 @@
+--- a/arch/arm64/boot/dts/qcom/sm8250-lenovo-j716f.dts
++++ b/arch/arm64/boot/dts/qcom/sm8250-lenovo-j716f.dts
+@@ -62,6 +62,14 @@
+ 			reg = <0x0 0x9c000000 0x0 0x2300000>;
+ 			no-map;
+ 		};
++
++		ramoops@b0000000 {
++			compatible = "ramoops";
++			reg = <0x0 0xb0000000 0x0 0x100000>;
++			record-size = <0x20000>;
++			console-size = <0x40000>;
++			pmsg-size = <0x20000>;
++		};
+ 	};
+ 
+ 	vph_pwr: regulator-vph-pwr {

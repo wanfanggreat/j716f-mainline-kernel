@@ -1,0 +1,224 @@
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c
+@@ -11,6 +11,7 @@
+ #include <linux/debugfs.h>
+ #include <linux/ktime.h>
+ #include <linux/bits.h>
++#include <linux/backlight.h>
+ 
+ #include <drm/drm_atomic.h>
+ #include <drm/drm_blend.h>
+@@ -44,6 +45,126 @@
+ #define	CONVERT_S3_15(val) \
+ 	(((((u64)val) & ~BIT_ULL(63)) >> 17) & GENMASK_ULL(17, 0))
+ 
++/*
++ * Lenovo J716F: the EDO/RM69380 panel has a slightly warm native white
++ * point, and the vendor display stack corrects it with a PCC matrix that
++ * the Android HAL programs (there is no mainline equivalent).  Every
++ * mainline kernel on this tablet therefore shows the same mild yellow
++ * cast, including the 6.15.11 reference tree.
++ *
++ * Keep a default diagonal PCC gain that userspace can use to neutralise
++ * it.  The values are Q10 (1024 = 1.0) and are only applied when
++ * userspace has not set a CTM itself, so a real colour management stack
++ * still wins.  The block is re-programmed on every atomic commit, which
++ * makes the parameters live: write them and look at the screen.
++ *
++ *   echo 1100 > /sys/module/msm/parameters/pcc_white_b
++ *   echo 1000 > /sys/module/msm/parameters/pcc_white_r
++ *
++ * The proper long-term fix is to recover the vendor calibration and bake
++ * it in, or to ship an ICC profile; this is the bring-up knob.
++ *
++ * The panel's white point also drifts warm as its brightness goes down, so
++ * one gain only holds at one level (v38b: neutral at max, yellow again at
++ * low).  pcc_white_* is the gain at full backlight and pcc_white_min_* is
++ * the gain at the bottom of the range; the active gain interpolates linearly
++ * with the class backlight level.  Tune pcc_white_* at max brightness and
++ * pcc_white_min_* at minimum brightness.
++ *
++ * Defaults are the values the user dialed in on 2026-11-07 with the RGB
++ * tuner: hi 949/973/1172 was accepted straight away, lo 970/772/1328 came
++ * from dragging the sliders because every preset guess was still too green
++ * (the panel loses far more green than assumed at low brightness).  Kept in
++ * the source so a fresh rootfs boots already calibrated.
++ */
++static unsigned int pcc_white_r = 949;
++static unsigned int pcc_white_g = 973;
++static unsigned int pcc_white_b = 1172;
++static unsigned int pcc_white_min_r = 970;
++static unsigned int pcc_white_min_g = 772;
++static unsigned int pcc_white_min_b = 1328;
++module_param(pcc_white_r, uint, 0644);
++MODULE_PARM_DESC(pcc_white_r, "J716F: PCC red gain at max backlight, Q10 (1024 = 1.0)");
++module_param(pcc_white_g, uint, 0644);
++MODULE_PARM_DESC(pcc_white_g, "J716F: PCC green gain at max backlight, Q10 (1024 = 1.0)");
++module_param(pcc_white_b, uint, 0644);
++MODULE_PARM_DESC(pcc_white_b, "J716F: PCC blue gain at max backlight, Q10 (1024 = 1.0)");
++module_param(pcc_white_min_r, uint, 0644);
++MODULE_PARM_DESC(pcc_white_min_r, "J716F: PCC red gain at min backlight, Q10");
++module_param(pcc_white_min_g, uint, 0644);
++MODULE_PARM_DESC(pcc_white_min_g, "J716F: PCC green gain at min backlight, Q10");
++module_param(pcc_white_min_b, uint, 0644);
++MODULE_PARM_DESC(pcc_white_min_b, "J716F: PCC blue gain at min backlight, Q10");
++
++static inline bool dpu_default_pcc_active(void)
++{
++	return pcc_white_r != 1024 || pcc_white_g != 1024 || pcc_white_b != 1024 ||
++	       pcc_white_min_r != 1024 || pcc_white_min_g != 1024 ||
++	       pcc_white_min_b != 1024;
++}
++
++/*
++ * Q10 -> the S3.15 the PCC register wants.  1.0 is 0x8000 and the positive
++ * range stops at 0x1ffff (3.9999), so 4096 must clamp to 4095: 4096 << 5 is
++ * 0x20000, which the block reads as -4.0 and would blank the screen.
++ */
++static inline u32 dpu_pcc_gain_s3_15(unsigned int q10)
++{
++	if (q10 > 4095)
++		q10 = 4095;
++
++	return q10 << 5;
++}
++
++/*
++ * Backlight level for the white-point trim.  The class backlight of the
++ * panel registers some time after the display pipeline comes up, so the
++ * device pointer is resolved from a work queue; afterwards the level is
++ * read directly from the cached properties (a plain int read, safe in the
++ * commit path).  Until it is found, or if there is none, behave as if the
++ * panel sits at full brightness.
++ */
++static struct backlight_device *pcc_bl;
++static unsigned int pcc_bl_tries;
++
++static void dpu_pcc_find_backlight(struct work_struct *work)
++{
++	pcc_bl = backlight_device_get_by_type(BACKLIGHT_RAW);
++	if (!pcc_bl && ++pcc_bl_tries < 4)
++		schedule_delayed_work(to_delayed_work(work), 10 * HZ);
++}
++static DECLARE_DELAYED_WORK(dpu_pcc_bl_work, dpu_pcc_find_backlight);
++
++/* Backlight level scaled to 0..1024, 1024 = full brightness. */
++static unsigned int dpu_pcc_brightness_frac(void)
++{
++	unsigned int level, max;
++
++	if (!pcc_bl)
++		return 1024;
++
++	level = READ_ONCE(pcc_bl->props.brightness);
++	max = READ_ONCE(pcc_bl->props.max_brightness);
++	if (!max)
++		return 1024;
++	if (level > max)
++		level = max;
++
++	return level * 1024 / max;
++}
++
++/* Interpolate between the min- and max-backlight gains. */
++static u32 dpu_pcc_gain_interp(unsigned int hi, unsigned int lo,
++			       unsigned int frac)
++{
++	int q10 = (int)lo + (((int)hi - (int)lo) * (int)frac >> 10);
++
++	if (q10 < 0)
++		q10 = 0;
++
++	return dpu_pcc_gain_s3_15(q10);
++}
++
+ static struct dpu_kms *_dpu_crtc_get_kms(struct drm_crtc *crtc)
+ {
+ 	struct msm_drm_private *priv = crtc->dev->dev_private;
+@@ -856,7 +977,14 @@
+ 	int i;
+ 
+ 
+-	if (!state->color_mgmt_changed && !drm_atomic_crtc_needs_modeset(state))
++	bool default_pcc = dpu_default_pcc_active();
++
++	/*
++	 * J716F: the default PCC has to be rewritten on every commit so a
++	 * parameter write shows up immediately.
++	 */
++	if (!state->color_mgmt_changed && !drm_atomic_crtc_needs_modeset(state) &&
++	    !default_pcc)
+ 		return;
+ 
+ 	for (i = 0; i < cstate->num_mixers; i++) {
+@@ -867,11 +995,38 @@
+ 			continue;
+ 
+ 		if (dspp->ops.setup_pcc) {
+-			if (!state->ctm) {
+-				dspp->ops.setup_pcc(dspp, NULL);
+-			} else {
++			if (state->ctm) {
+ 				_dpu_crtc_get_pcc_coeff(state, &cfg);
+ 				dspp->ops.setup_pcc(dspp, &cfg);
++			} else if (default_pcc) {
++				static unsigned int logged_frac = 0xffffffff;
++				static unsigned int logged_r, logged_g, logged_b;
++				unsigned int frac = dpu_pcc_brightness_frac();
++				unsigned int r, g, b;
++
++				r = dpu_pcc_gain_interp(pcc_white_r, pcc_white_min_r, frac);
++				g = dpu_pcc_gain_interp(pcc_white_g, pcc_white_min_g, frac);
++				b = dpu_pcc_gain_interp(pcc_white_b, pcc_white_min_b, frac);
++
++				memset(&cfg, 0, sizeof(cfg));
++				cfg.r.r = r;
++				cfg.g.g = g;
++				cfg.b.b = b;
++				dspp->ops.setup_pcc(dspp, &cfg);
++				/* one line per change, not per frame */
++				if (logged_frac != frac || logged_r != r ||
++				    logged_g != g || logged_b != b) {
++					logged_frac = frac;
++					logged_r = r;
++					logged_g = g;
++					logged_b = b;
++					pr_info("J716F pcc: dspp%d base=%#x bl=%u/1024 r/g/b=%#x/%#x/%#x\n",
++						dspp->idx - DSPP_0,
++						dspp->cap->sblk->pcc.base,
++						frac, cfg.r.r, cfg.g.g, cfg.b.b);
++				}
++			} else {
++				dspp->ops.setup_pcc(dspp, NULL);
+ 			}
+ 
+ 			/* stage config flush mask */
+@@ -1423,7 +1578,13 @@
+ 	else
+ 		topology.num_lm = 1;
+ 
+-	if (crtc_state->ctm || crtc_state->gamma_lut)
++	/*
++	 * J716F: the DSPP is only reserved when the CRTC state asks for a
++	 * CTM or a gamma LUT.  Our default white-balance gain needs the same
++	 * block, and without it hw_dspp stays NULL and the PCC writes are
++	 * simply skipped (v37: parameters accepted, registers stayed 0).
++	 */
++	if (crtc_state->ctm || crtc_state->gamma_lut || dpu_default_pcc_active())
+ 		topology.num_dspp = topology.num_lm;
+ 
+ 	return topology;
+@@ -1912,6 +2073,13 @@
+ 
+ 	drm_crtc_helper_add(crtc, &dpu_crtc_helper_funcs);
+ 
++	/*
++	 * The panel's class backlight registers a little later than the
++	 * display pipeline; resolve it from a work queue so the white-point
++	 * trim can follow the panel's brightness-dependent white point.
++	 */
++	schedule_delayed_work(&dpu_pcc_bl_work, 5 * HZ);
++
+ 	if (dpu_kms->catalog->dspp_count) {
+ 		const struct dpu_dspp_cfg *dspp = &dpu_kms->catalog->dspp[0];
+ 

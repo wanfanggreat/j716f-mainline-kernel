@@ -1,0 +1,45 @@
+--- a/drivers/spmi/spmi-pmic-arb.c
++++ b/drivers/spmi/spmi-pmic-arb.c
+@@ -1397,6 +1397,12 @@
+  * v5 offset per ee and per apid for observer channels and per apid for
+  * read/write channels.
+  */
++static bool pmic_arb_is_rtc_ppid(u8 sid, u16 addr)
++{
++	/* PM8150 RTC: PPID 0x60 (time) and 0x61 (alarm). */
++	return sid == 0 && ((addr >> 8) == 0x60 || (addr >> 8) == 0x61);
++}
++
+ static int pmic_arb_offset_v5(struct spmi_pmic_arb_bus *bus, u8 sid, u16 addr,
+ 			      enum pmic_arb_channel ch_type)
+ {
+@@ -1416,7 +1422,8 @@
+ 		offset = 0x10000 * pmic_arb->ee + 0x80 * apid;
+ 		break;
+ 	case PMIC_ARB_CHANNEL_RW:
+-		if (bus->apid_data[apid].write_ee != pmic_arb->ee) {
++		if (bus->apid_data[apid].write_ee != pmic_arb->ee &&
++		    !pmic_arb_is_rtc_ppid(sid, addr)) {
+ 			dev_err(&bus->spmic->dev, "disallowed SPMI write to sid=%u, addr=0x%04X\n",
+ 				sid, addr);
+ 			return -EPERM;
+@@ -1516,7 +1523,8 @@
+ 		offset = 0x8000 * pmic_arb->ee + 0x20 * apid;
+ 		break;
+ 	case PMIC_ARB_CHANNEL_RW:
+-		if (bus->apid_data[apid].write_ee != pmic_arb->ee) {
++		if (bus->apid_data[apid].write_ee != pmic_arb->ee &&
++		    !pmic_arb_is_rtc_ppid(sid, addr)) {
+ 			dev_err(&bus->spmic->dev, "disallowed SPMI write to sid=%u, addr=0x%04X\n",
+ 				sid, addr);
+ 			return -EPERM;
+@@ -1612,7 +1620,8 @@
+ 		offset = 0x40000 * pmic_arb->ee + 0x20 * apid;
+ 		break;
+ 	case PMIC_ARB_CHANNEL_RW:
+-		if (bus->apid_data[apid].write_ee != pmic_arb->ee) {
++		if (bus->apid_data[apid].write_ee != pmic_arb->ee &&
++		    !pmic_arb_is_rtc_ppid(sid, addr)) {
+ 			dev_err(&bus->spmic->dev, "disallowed SPMI write to sid=%u, addr=0x%04X\n",
+ 				sid, addr);
+ 			return -EPERM;

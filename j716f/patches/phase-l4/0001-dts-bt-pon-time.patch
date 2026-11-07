@@ -1,0 +1,54 @@
+--- a/arch/arm64/boot/dts/qcom/sm8250-lenovo-j716f.dts
++++ b/arch/arm64/boot/dts/qcom/sm8250-lenovo-j716f.dts
+@@ -736,6 +736,25 @@
+ 	};
+ };
+ 
++&pon {
++	/*
++	 * Phase L4: PM8150 PON 的 soft reboot reason，ABL 用它决定冷启动目标。
++	 * 数值沿用 Sony/Xiaomi SM8250 主线 DTS 的 GEN2 约定。
++	 */
++	mode-bootloader = <0x2>;
++	mode-recovery = <0x1>;
++};
++
++/*
++ * Phase L4: reboot-mode class 用 driver name（"qcom-pon"）给设备命名，
++ * 同一时刻只能注册一个。pm8009 的 PON 没有 pwrkey，却会先占用这个名字，
++ * 导致 PM8150 PON probe 失败（-EEXIST），连带 pwrkey/resin 都不注册。
++ * 把它禁用，让 PM8150 PON 注册并写入正确的 reboot reason。
++ */
++&pm8009_pon {
++	status = "disabled";
++};
++
+ &pon_pwrkey {
+ 	status = "okay";
+ };
+@@ -842,6 +861,12 @@
+ 		vddrfa0p8-supply = <&vreg_pmu_rfa_0p8>;
+ 		vddrfa1p2-supply = <&vreg_pmu_rfa_1p2>;
+ 		vddrfa1p7-supply = <&vreg_pmu_rfa_1p7>;
++
++		/*
++		 * Phase L4: 属性按 LSB-first 编码。内核把它解释为
++		 * 02:00:00:00:5A:AD（本地管理、单播），不是数组顺序。
++		 */
++		local-bd-address = [ad 5a 00 00 00 02];
+ 	};
+ };
+ 
+@@ -978,3 +1003,12 @@
+ 
+ 	vdds-supply = <&vreg_l5a_0p88>;
+ };
++
++/*
++ * Phase L4: 不开 allow-set-time。
++ *
++ * v22 证明 AP 对 PM8150 RTC 的写通道被 SPMI arbiter 的 APID owner 拒绝，
++ * 返回 EPERM（安全失败）；v23 绕过该检查后，写请求真正下发，PMIC 总线
++ * 没有正常应答，整机在 hwclock -w 时挂死。RTC 只读，系统时间由
++ * fake-hwclock + NTP 兜底，因此这里明确不声明 RTC 可写。
++ */

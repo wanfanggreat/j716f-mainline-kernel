@@ -1,0 +1,86 @@
+--- a/sound/soc/qcom/qdsp6/q6asm-dai.c
++++ b/sound/soc/qcom/qdsp6/q6asm-dai.c
+@@ -262,10 +262,19 @@
+ }
+ 
+ /*
+- * Lenovo J716F: map the period ring into the ADSP.  The address keeps the
+- * upstream layout (IOVA | sid << 32); what makes the kona ADSP accept it is
+- * the 29-bit DMA mask set in q6asm_dai_pcm_new(), which keeps the IOVA inside
+- * the LPASS audio window.
++ * Lenovo J716F: map the period ring into the ADSP.
++ *
++ * The address keeps the upstream layout (IOVA | sid << 32); the 29-bit DMA
++ * mask set in q6asm_dai_pcm_new() keeps the IOVA inside the LPASS audio
++ * window 0x1000_0000-0x1FFF_FFFF, which is what the kona ADSP requires.
++ *
++ * The ADSP still rejects that first attempt now and then (early boot, when
++ * PipeWire opens the card before the audio protection domain is fully up:
++ * "DSP returned error[1]" and then every retry of the same address fails).
++ * A mapping without the SID in the upper 32 bits is a different key for the
++ * firmware and is accepted, so fall back to it once before giving up; that
++ * is the difference between the desktop getting sound and PipeWire
++ * retrying every five seconds forever.
+  *
+  * q6asm_map_memory_regions() returns a positive value on success (see
+  * q6asm_apr_send_session_pkt()), so "not negative" is the success test.  It
+@@ -279,33 +288,44 @@
+ 	dma_addr_t dma_addr = substream->dma_buffer.addr;
+ 	phys_addr_t phys;
+ 	size_t period_sz;
+-	int ret;
++	int ret, attempt;
+ 
+ 	if (!prtd->periods) {
+ 		dev_err(dev, "J716F: no periods for the DMA map\n");
+ 		return -EINVAL;
+ 	}
+ 	period_sz = prtd->pcm_size / prtd->periods;
+-	phys = dma_addr | sid_bits;
+ 
+-	ret = q6asm_map_memory_regions(substream->stream, prtd->audio_client,
+-				       phys, period_sz, prtd->periods);
+-	if (ret < 0) {
++	for (attempt = 0; attempt < 2; attempt++) {
++		/* 0: upstream layout, 1: plain IOVA (no SID in the msw) */
++		if (attempt == 0)
++			phys = dma_addr | sid_bits;
++		else
++			phys = (phys_addr_t)lower_32_bits(dma_addr);
++
++		ret = q6asm_map_memory_regions(substream->stream,
++					       prtd->audio_client, phys,
++					       period_sz, prtd->periods);
++		if (ret >= 0) {
++			prtd->phys = phys;
++			prtd->mapped = true;
++			dev_info(dev,
++				 "J716F: map dir=%d mode=%d phys=%#llx dma=%#llx period=%zu periods=%u accepted\n",
++				 substream->stream, attempt,
++				 (unsigned long long)phys,
++				 (unsigned long long)dma_addr, period_sz,
++				 prtd->periods);
++			return 0;
++		}
++
+ 		dev_err(dev,
+-			"J716F: map dir=%d phys=%#llx dma=%#llx period=%zu periods=%u failed (%d)\n",
+-			substream->stream, (unsigned long long)phys,
++			"J716F: map dir=%d mode=%d phys=%#llx dma=%#llx period=%zu periods=%u failed (%d)\n",
++			substream->stream, attempt, (unsigned long long)phys,
+ 			(unsigned long long)dma_addr, period_sz,
+ 			prtd->periods, ret);
+-		return -ENOMEM;
+ 	}
+ 
+-	prtd->phys = phys;
+-	prtd->mapped = true;
+-	dev_dbg(dev, "J716F: map dir=%d phys=%#llx period=%zu periods=%u ok\n",
+-		substream->stream, (unsigned long long)phys, period_sz,
+-		prtd->periods);
+-
+-	return 0;
++	return -ENOMEM;
+ }
+ 
+ static int q6asm_dai_prepare(struct snd_soc_component *component,

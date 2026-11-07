@@ -1,0 +1,105 @@
+--- a/kernel/async.c
++++ b/kernel/async.c
+@@ -47,6 +47,7 @@
+ #include <linux/async.h>
+ #include <linux/atomic.h>
+ #include <linux/export.h>
++#include <linux/instruction_pointer.h>
+ #include <linux/ktime.h>
+ #include <linux/pid.h>
+ #include <linux/sched.h>
+@@ -307,6 +308,69 @@
+  * synchronization domain specified by @domain submitted prior to @cookie
+  * have been done.
+  */
++/**
++ * async_synchronize_cookie_domain - synchronize asynchronous function calls within a certain domain with cookie checkpointing
++ * @cookie: async_cookie_t to use as checkpoint
++ * @domain: the domain to synchronize (%NULL for all registered domains)
++ *
++ * This function waits until all asynchronous function calls for the
++ * synchronization domain specified by @domain submitted prior to @cookie
++ * have been done.
++ */
++/*
++ * J716F: a single async work item that never returns wedges every
++ * async_synchronize_full() caller for good.  That is not hypothetical here:
++ * v39 hung udev (so no module could load, so no Wi-Fi), hung
++ * device_shutdown() and timed out every suspend, all in one boot, and the
++ * logs only ever showed "async_synchronize_cookie_domain" - never which
++ * work item was outstanding.  Report that once per stall so the next
++ * occurrence names the culprit instead of costing another round trip.
++ *
++ * Diagnostic only: it never changes the wait or aborts it.
++ */
++#define ASYNC_STUCK_MS		10000
++#define ASYNC_STUCK_REPEAT_MS	60000
++#define ASYNC_STUCK_MAX		8
++
++static void async_report_stuck(async_cookie_t cookie, struct async_domain *domain,
++			       void *caller, unsigned long waited_ms)
++{
++	struct async_entry *entry;
++	unsigned long flags;
++	unsigned int nr = 0, total = 0, i;
++	async_func_t funcs[ASYNC_STUCK_MAX];
++	async_cookie_t cookies[ASYNC_STUCK_MAX];
++
++	spin_lock_irqsave(&async_lock, flags);
++	if (domain) {
++		list_for_each_entry(entry, &domain->pending, domain_list) {
++			total++;
++			if (nr >= ASYNC_STUCK_MAX)
++				continue;
++			cookies[nr] = entry->cookie;
++			funcs[nr] = entry->func;
++			nr++;
++		}
++	} else {
++		list_for_each_entry(entry, &async_global_pending, global_list) {
++			total++;
++			if (nr >= ASYNC_STUCK_MAX)
++				continue;
++			cookies[nr] = entry->cookie;
++			funcs[nr] = entry->func;
++			nr++;
++		}
++	}
++	spin_unlock_irqrestore(&async_lock, flags);
++
++	pr_err("J716F async: %ps stalled %lu ms for cookie %llu (%u pending, lowest %llu)\n",
++	       caller, waited_ms, cookie, total, lowest_in_progress(domain));
++
++	for (i = 0; i < nr; i++)
++		pr_err("J716F async:   pending cookie=%llu func=%ps\n",
++		       cookies[i], (void *)funcs[i]);
++}
++
+ void async_synchronize_cookie_domain(async_cookie_t cookie, struct async_domain *domain)
+ {
+ 	ktime_t starttime;
+@@ -314,7 +378,23 @@
+ 	pr_debug("async_waiting @ %i\n", task_pid_nr(current));
+ 	starttime = ktime_get();
+ 
+-	wait_event(async_done, lowest_in_progress(domain) >= cookie);
++	{
++		unsigned long waited_ms = 0, next_report = ASYNC_STUCK_MS;
++
++		while (lowest_in_progress(domain) < cookie) {
++			if (wait_event_timeout(async_done,
++					       lowest_in_progress(domain) >= cookie,
++					       HZ))
++				break;
++
++			waited_ms += 1000;
++			if (waited_ms >= next_report) {
++				async_report_stuck(cookie, domain,
++						   (void *)_RET_IP_, waited_ms);
++				next_report = waited_ms + ASYNC_STUCK_REPEAT_MS;
++			}
++		}
++	}
+ 
+ 	pr_debug("async_continuing @ %i after %lli usec\n", task_pid_nr(current),
+ 		 microseconds_since(starttime));

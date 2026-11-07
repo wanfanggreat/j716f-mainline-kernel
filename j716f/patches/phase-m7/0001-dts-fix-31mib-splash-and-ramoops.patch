@@ -1,0 +1,20 @@
+--- a/arch/arm64/boot/dts/qcom/sm8250-lenovo-j716f.dts
++++ b/arch/arm64/boot/dts/qcom/sm8250-lenovo-j716f.dts
+@@ -36,7 +36,7 @@
+ 
+ 		framebuffer: framebuffer@9c000000 {
+ 			compatible = "simple-framebuffer";
+-			reg = <0x0 0x9c000000 0x0 0x1f000000>;
++			reg = <0x0 0x9c000000 0x0 0x1f00000>;
+ 			width = <2560>;
+ 			height = <1600>;
+ 			stride = <(2560 * 4)>;
+@@ -69,7 +69,7 @@
+ 		 * bounds the simple-framebuffer below (see chosen).
+ 		 */
+ 		cont_splash_mem: memory@9c000000 {
+-			reg = <0x0 0x9c000000 0x0 0x1f000000>;
++			reg = <0x0 0x9c000000 0x0 0x1f00000>;
+ 			no-map;
+ 		};
+ 

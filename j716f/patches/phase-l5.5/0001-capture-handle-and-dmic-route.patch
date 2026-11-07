@@ -1,0 +1,107 @@
+--- a/sound/soc/qcom/qdsp6/q6asm.c
++++ b/sound/soc/qcom/qdsp6/q6asm.c
+@@ -363,13 +363,14 @@
+ 	pkt->hdr.dest_port = 0;
+ 	pkt->hdr.pkt_size = pkt_size;
+ 	/*
+-	 * Lenovo J716F: the kona ADSP takes the direction in the flag byte of
+-	 * the token (bit 0 of byte 3), exactly like the vendor kernel's
+-	 * q6asm_update_token(), not in the stream-id byte. Playback (dir 0) is
+-	 * identical either way; capture was being sent as stream 1 and the
+-	 * ADSP rejected the following OPEN_READ with ADSP_EALREADY.
++	 * Keep the direction in the low nibble: q6asm_stream_callback()
++	 * recovers it with "hdr->token & 0x0F" to store the memory-map handle
++	 * in the right port.  Sending it in the flag byte (the vendor
++	 * kernel's layout) made every capture response land on the playback
++	 * port, so capture reads used a zero mem_map_handle and returned
++	 * silence.
+ 	 */
+-	pkt->hdr.token = ((ac->session << 8) | (dir << 24));
++	pkt->hdr.token = ((ac->session << 8) | dir);
+ 
+ 	pkt->hdr.opcode = ASM_CMD_SHARED_MEM_UNMAP_REGIONS;
+ 	mem_unmap->mem_map_handle = ac->port[dir].mem_map_handle;
+@@ -473,8 +474,8 @@
+ 	pkt->hdr.src_port = 0;
+ 	pkt->hdr.dest_port = 0;
+ 	pkt->hdr.pkt_size = pkt_size;
+-	/* Direction goes in the token flag byte, see __q6asm_memory_unmap(). */
+-	pkt->hdr.token = ((ac->session << 8) | (dir << 24));
++	/* Direction in the low nibble, see __q6asm_memory_unmap(). */
++	pkt->hdr.token = ((ac->session << 8) | dir);
+ 	pkt->hdr.opcode = ASM_CMD_SHARED_MEM_MAP_REGIONS;
+ 
+ 	cmd->mem_pool_id = ADSP_MEMORY_MAP_SHMEM8_4K_POOL;
+--- a/sound/soc/qcom/sm8250.c
++++ b/sound/soc/qcom/sm8250.c
+@@ -42,6 +42,14 @@
+ 	 */
+ 	struct gpio_desc *dmic_en_gpio;
+ 	int dmic_en_state;
++	/*
++	 * Lenovo J716F: PM8150B GPIO1 selects the internal microphone path
++	 * (vendor: qcom,msm-dmic-sel-gpio = <&pm8150b_gpios 1
++	 * GPIO_ACTIVE_HIGH>, driven by the "DMIC SEL" mixer control in the
++	 * Android HAL).  mainline has no consumer for it; without it the
++	 * on-board DMICs are not connected to the SoC.
++	 */
++	struct gpio_desc *dmic_sel_gpio;
+ };
+ 
+ /*
+@@ -201,11 +209,18 @@
+ 	 * macro registers say, because the microphones themselves are not
+ 	 * powered.
+ 	 */
+-	if (data->dmic_en_gpio &&
+-	    (cpu_dai->id == TX_CODEC_DMA_TX_3 || cpu_dai->id == VA_CODEC_DMA_TX_0)) {
+-		gpiod_set_value_cansleep(data->dmic_en_gpio, 1);
+-		/* let the rail settle before the clock starts */
+-		usleep_range(2000, 2500);
++	if (cpu_dai->id == TX_CODEC_DMA_TX_3 || cpu_dai->id == VA_CODEC_DMA_TX_0) {
++		/*
++		 * Select the internal microphone path first, then power the
++		 * rail, so the mics are connected when the DMIC clock starts.
++		 */
++		if (data->dmic_sel_gpio)
++			gpiod_set_value_cansleep(data->dmic_sel_gpio, 1);
++		if (data->dmic_en_gpio) {
++			gpiod_set_value_cansleep(data->dmic_en_gpio, 1);
++			/* let the rail settle before the clock starts */
++			usleep_range(2000, 2500);
++		}
+ 		pr_debug("J716F-DMIC: power on (dai id %d)\n", cpu_dai->id);
+ 	}
+ 
+@@ -516,6 +531,19 @@
+ 		return ret;
+ 	}
+ 
++	/*
++	 * Lenovo J716F: internal-microphone path selector.  The vendor HAL
++	 * drives it high before it starts a DMIC capture; do the same from
++	 * the machine driver so the mainline capture path works too.
++	 */
++	data->dmic_sel_gpio = devm_gpiod_get_optional(dev, "qcom,msm-dmic-sel",
++						      GPIOD_OUT_LOW);
++	if (IS_ERR(data->dmic_sel_gpio)) {
++		ret = PTR_ERR(data->dmic_sel_gpio);
++		dev_err(dev, "failed to get DMIC selector gpio: %d\n", ret);
++		return ret;
++	}
++
+ 	ret = qcom_snd_parse_of(card);
+ 	if (ret)
+ 		return ret;
+--- a/arch/arm64/boot/dts/qcom/sm8250-lenovo-j716f.dts
++++ b/arch/arm64/boot/dts/qcom/sm8250-lenovo-j716f.dts
+@@ -1327,7 +1327,8 @@
+ 	pin-switches = "SPK2 SPK", "SPK3 SPK", "SPK4 SPK";
+ 
+ 	qcom,msm-dmic-en-gpio = <&pm8150b_gpios 12 GPIO_ACTIVE_LOW>;
+-	qcom,msm-dmic-sel-gpio = <&pm8150_gpios 1 GPIO_ACTIVE_HIGH>;
++	/* vendor: <0x08 0x01 0x00> — same PMIC as the DMIC EN, GPIO1 */
++	qcom,msm-dmic-sel-gpio = <&pm8150b_gpios 1 GPIO_ACTIVE_HIGH>;
+ 
+ 	audio-routing =
+ 		"MM_DL1", "MultiMedia1 Playback",

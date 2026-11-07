@@ -1,0 +1,21 @@
+--- a/drivers/watchdog/qcom-wdt.c
++++ b/drivers/watchdog/qcom-wdt.c
+@@ -321,6 +321,18 @@
+ 		}
+ 	}
+ 
++	/*
++	 * Lenovo J716F: CONFIG_WATCHDOG_NOWAYOUT alone does nothing here.
++	 * The watchdog core only keeps the WDOG_NO_WAY_OUT bit that the
++	 * driver put into wdd->status, and this driver never set it.  During
++	 * shutdown systemd then closes /dev/watchdog, the hardware watchdog
++	 * is disarmed, and a hung shutdown stays hung forever (seen on
++	 * 2026-11-07: six minutes at systemd-shutdown, manual power cycle).
++	 * Honour the build-time default so a watchdog reset can still save
++	 * the device after the daemon is gone.
++	 */
++	wdt->wdd.status = WATCHDOG_NOWAYOUT_INIT_STATUS;
++
+ 	wdt->wdd.ops = &qcom_wdt_ops;
+ 	wdt->wdd.min_timeout = 1;
+ 	wdt->wdd.max_timeout = data->max_tick_count / wdt->rate;

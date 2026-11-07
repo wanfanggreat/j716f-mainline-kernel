@@ -1,0 +1,89 @@
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c
+@@ -44,6 +44,49 @@
+ #define	CONVERT_S3_15(val) \
+ 	(((((u64)val) & ~BIT_ULL(63)) >> 17) & GENMASK_ULL(17, 0))
+ 
++/*
++ * Lenovo J716F: the EDO/RM69380 panel has a slightly warm native white
++ * point, and the vendor display stack corrects it with a PCC matrix that
++ * the Android HAL programs (there is no mainline equivalent).  Every
++ * mainline kernel on this tablet therefore shows the same mild yellow
++ * cast, including the 6.15.11 reference tree.
++ *
++ * Keep a default diagonal PCC gain that userspace can use to neutralise
++ * it.  The values are Q10 (1024 = 1.0) and are only applied when
++ * userspace has not set a CTM itself, so a real colour management stack
++ * still wins.  The block is re-programmed on every atomic commit, which
++ * makes the parameters live: write them and look at the screen.
++ *
++ *   echo 1100 > /sys/module/msm/parameters/pcc_white_b
++ *   echo 1000 > /sys/module/msm/parameters/pcc_white_r
++ *
++ * The proper long-term fix is to recover the vendor calibration and bake
++ * it in, or to ship an ICC profile; this is the bring-up knob.
++ */
++static unsigned int pcc_white_r = 1024;
++static unsigned int pcc_white_g = 1024;
++static unsigned int pcc_white_b = 1024;
++module_param(pcc_white_r, uint, 0644);
++MODULE_PARM_DESC(pcc_white_r, "J716F: default PCC red gain, Q10 (1024 = 1.0)");
++module_param(pcc_white_g, uint, 0644);
++MODULE_PARM_DESC(pcc_white_g, "J716F: default PCC green gain, Q10 (1024 = 1.0)");
++module_param(pcc_white_b, uint, 0644);
++MODULE_PARM_DESC(pcc_white_b, "J716F: default PCC blue gain, Q10 (1024 = 1.0)");
++
++static inline bool dpu_default_pcc_active(void)
++{
++	return pcc_white_r != 1024 || pcc_white_g != 1024 || pcc_white_b != 1024;
++}
++
++/* Q10 -> the S3.15 the PCC register wants; clamp to the 4.0 it can hold. */
++static inline u32 dpu_pcc_gain_s3_15(unsigned int q10)
++{
++	if (q10 > 4096)
++		q10 = 4096;
++
++	return q10 << 5;
++}
++
+ static struct dpu_kms *_dpu_crtc_get_kms(struct drm_crtc *crtc)
+ {
+ 	struct msm_drm_private *priv = crtc->dev->dev_private;
+@@ -856,7 +899,14 @@
+ 	int i;
+ 
+ 
+-	if (!state->color_mgmt_changed && !drm_atomic_crtc_needs_modeset(state))
++	bool default_pcc = dpu_default_pcc_active();
++
++	/*
++	 * J716F: the default PCC has to be rewritten on every commit so a
++	 * parameter write shows up immediately.
++	 */
++	if (!state->color_mgmt_changed && !drm_atomic_crtc_needs_modeset(state) &&
++	    !default_pcc)
+ 		return;
+ 
+ 	for (i = 0; i < cstate->num_mixers; i++) {
+@@ -867,11 +917,17 @@
+ 			continue;
+ 
+ 		if (dspp->ops.setup_pcc) {
+-			if (!state->ctm) {
+-				dspp->ops.setup_pcc(dspp, NULL);
+-			} else {
++			if (state->ctm) {
+ 				_dpu_crtc_get_pcc_coeff(state, &cfg);
+ 				dspp->ops.setup_pcc(dspp, &cfg);
++			} else if (default_pcc) {
++				memset(&cfg, 0, sizeof(cfg));
++				cfg.r.r = dpu_pcc_gain_s3_15(pcc_white_r);
++				cfg.g.g = dpu_pcc_gain_s3_15(pcc_white_g);
++				cfg.b.b = dpu_pcc_gain_s3_15(pcc_white_b);
++				dspp->ops.setup_pcc(dspp, &cfg);
++			} else {
++				dspp->ops.setup_pcc(dspp, NULL);
+ 			}
+ 
+ 			/* stage config flush mask */

@@ -1,0 +1,24 @@
+# v39 freeze-forensics build: config + cmdline deltas (applied to the
+# phase-m4 .config in out/linux-7.3.1-phasei, then olddefconfig).
+#
+# config (lib/Kconfig.debug, kernel/watchdog, drivers/watchdog/Kconfig):
+CONFIG_ARM64_PSEUDO_NMI=y          # GIC priority-masking pseudo-NMI
+CONFIG_SOFTLOCKUP_DETECTOR=y
+CONFIG_HARDLOCKUP_DETECTOR=y       # buddy detector (HAVE_HARDLOCKUP_DETECTOR_BUDDY)
+CONFIG_DETECT_HUNG_TASK=y
+CONFIG_PANIC_TIMEOUT=10
+CONFIG_WATCHDOG_PRETIMEOUT_GOV=y
+CONFIG_WATCHDOG_PRETIMEOUT_GOV_DUMP=y
+CONFIG_WATCHDOG_PRETIMEOUT_GOV_NOOP=y
+CONFIG_WATCHDOG_PRETIMEOUT_GOV_PANIC=y
+CONFIG_WATCHDOG_PRETIMEOUT_DEFAULT_GOV_PANIC=y
+#
+# cmdline addition (both ncm/rndis variants):
+irqchip.gicv3_pseudo_nmi=1
+#
+# userspace sysctl drop-in 60-j716f-panic.conf:
+kernel.panic = 10
+kernel.panic_print = 64        # SYS_INFO_ALL_BT: all-CPU backtrace at panic
+kernel.hung_task_timeout_secs = 60
+#
+# build identity: phase-m5-build2, Image 598595a9...

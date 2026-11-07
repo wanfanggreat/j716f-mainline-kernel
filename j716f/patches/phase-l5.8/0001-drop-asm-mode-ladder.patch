@@ -1,0 +1,168 @@
+--- a/sound/soc/qcom/qdsp6/q6asm-dai.c
++++ b/sound/soc/qcom/qdsp6/q6asm-dai.c
+@@ -24,11 +24,6 @@
+ 
+ #define DRV_NAME	"q6asm-fe-dai"
+ 
+-/* Audio-buffer inspection is an opt-in bring-up diagnostic, never PCM work. */
+-static bool capture_debug;
+-module_param(capture_debug, bool, 0600);
+-MODULE_PARM_DESC(capture_debug, "Inspect capture DMA buffers (disabled by default)");
+-
+ /*
+  * Lenovo J716F (SM8250-AC / kona ADSP): the ADSP answers
+  * ASM_CMD_SHARED_MEM_MAP_REGIONS with ADSP_EFAILED for any buffer address
+@@ -37,27 +32,10 @@
+  * msm-audio-ion node); with the upstream 32-bit DMA mask iommu-dma hands out
+  * an IOVA near the top of the 32-bit space and the DSP rejects it.
+  * q6asm_dai_pcm_new() therefore limits the audio DMA mask to 29 bits, which
+- * puts the IOVA at 0x1FFF_xxxx inside that window - that is the actual fix.
+- *
+- * The 64-bit address field encoding still differs between ASM firmware
+- * generations, so keep the upstream layout as mode 0 and fall back through
+- * the other plausible encodings if the DSP ever rejects it:
+- *
+- *  0: dma_addr | (sid << 32)   upstream / vendor ION layout (accepted here)
+- *  1: dma_addr                 no SID, low 32 bits of the IOVA
+- *  2: phys_addr | (sid << 32)  SID with the real physical address
+- *  3: phys_addr                no SID, physical address
+- *
+- * The accepted mode is remembered per direction; map_mode >= 0 forces one
+- * from userspace through the module parameter node under /sys/module.
+- * Bring-up scaffolding: reduce to mode 0 once the window assumption has been
+- * re-verified on a second boot (TD-042).
++ * puts the IOVA at 0x1FFF_xxxx inside that window; with that in place the
++ * upstream address layout (dma_addr | sid << 32) is what the kona ADSP
++ * accepts for both directions (confirmed on hardware 2026-11-07).
+  */
+-static int map_mode = -1;
+-module_param(map_mode, int, 0644);
+-MODULE_PARM_DESC(map_mode, "J716F: force ASM shared-memory address mode (-1 = auto)");
+-/* Accepted mode per direction (SNDRV_PCM_STREAM_PLAYBACK/CAPTURE). */
+-static int map_mode_ok[2] = { -1, -1 };
+ 
+ #define PLAYBACK_MIN_NUM_PERIODS    2
+ #define PLAYBACK_MAX_NUM_PERIODS   8
+@@ -284,96 +262,50 @@
+ }
+ 
+ /*
+- * Lenovo J716F: send ASM_CMD_SHARED_MEM_MAP_REGIONS with every plausible
+- * encoding of the 64-bit shared-memory address until the ADSP accepts one.
+- * See the map_mode comment near the top of the file.
++ * Lenovo J716F: map the period ring into the ADSP.  The address keeps the
++ * upstream layout (IOVA | sid << 32); what makes the kona ADSP accept it is
++ * the 29-bit DMA mask set in q6asm_dai_pcm_new(), which keeps the IOVA inside
++ * the LPASS audio window.
++ *
++ * q6asm_map_memory_regions() returns a positive value on success (see
++ * q6asm_apr_send_session_pkt()), so "not negative" is the success test.  It
++ * also returns 0 early when the port already has a mapping, which is success
++ * as well.
+  */
+ static int q6asm_dai_map_regions(struct device *dev,
+ 				 struct snd_pcm_substream *substream,
+ 				 struct q6asm_dai_rtd *prtd, u64 sid_bits)
+ {
+-	struct snd_pcm_runtime *runtime = substream->runtime;
+ 	dma_addr_t dma_addr = substream->dma_buffer.addr;
+-	phys_addr_t phys_addr = 0;
++	phys_addr_t phys;
+ 	size_t period_sz;
+-	int order[4], n = 0, i, mode, ret;
++	int ret;
+ 
+ 	if (!prtd->periods) {
+-		dev_err(dev, "J716F-ASM: no periods for the DMA map\n");
++		dev_err(dev, "J716F: no periods for the DMA map\n");
+ 		return -EINVAL;
+ 	}
+ 	period_sz = prtd->pcm_size / prtd->periods;
++	phys = dma_addr | sid_bits;
+ 
+-	if (runtime->dma_area && !is_vmalloc_addr(runtime->dma_area))
+-		phys_addr = virt_to_phys(runtime->dma_area);
+-
+-	if (map_mode >= 0) {
+-		order[n++] = map_mode;
+-	} else {
+-		int cached = map_mode_ok[substream->stream];
+-
+-		if (cached >= 0)
+-			order[n++] = cached;
+-		for (i = 0; i < 4; i++)
+-			if (i != cached)
+-				order[n++] = i;
+-	}
+-
+-	for (i = 0; i < n; i++) {
+-		phys_addr_t phys;
+-
+-		mode = order[i];
+-		switch (mode) {
+-		case 0:
+-			phys = dma_addr | sid_bits;
+-			break;
+-		case 1:
+-			phys = (phys_addr_t)lower_32_bits(dma_addr);
+-			break;
+-		case 2:
+-			if (!phys_addr)
+-				continue;
+-			phys = phys_addr | sid_bits;
+-			break;
+-		case 3:
+-		default:
+-			if (!phys_addr)
+-				continue;
+-			phys = phys_addr;
+-			break;
+-		}
+-
+-		/*
+-		 * q6asm_map_memory_regions() returns a positive value on
+-		 * success (see q6asm_apr_send_session_pkt()), so "not
+-		 * negative" is the success test, not "== 0". It also returns
+-		 * 0 early when the port already has a mapping, which is
+-		 * success as well.
+-		 */
+-		ret = q6asm_map_memory_regions(substream->stream,
+-					       prtd->audio_client, phys,
+-					       period_sz, prtd->periods);
+-		if (ret >= 0) {
+-			prtd->phys = phys;
+-			prtd->mapped = true;
+-			map_mode_ok[substream->stream] = mode;
+-			dev_info(dev,
+-				 "J716F-ASM: map dir=%d mode=%d phys=%#llx dma=%#llx period=%zu periods=%u accepted\n",
+-				 substream->stream, mode,
+-				 (unsigned long long)phys,
+-				 (unsigned long long)dma_addr,
+-				 period_sz, prtd->periods);
+-			return 0;
+-		}
+-
++	ret = q6asm_map_memory_regions(substream->stream, prtd->audio_client,
++				       phys, period_sz, prtd->periods);
++	if (ret < 0) {
+ 		dev_err(dev,
+-			"J716F-ASM: map dir=%d mode=%d phys=%#llx dma=%#llx period=%zu periods=%u rejected (%d)\n",
+-			substream->stream, mode, (unsigned long long)phys,
++			"J716F: map dir=%d phys=%#llx dma=%#llx period=%zu periods=%u failed (%d)\n",
++			substream->stream, (unsigned long long)phys,
+ 			(unsigned long long)dma_addr, period_sz,
+ 			prtd->periods, ret);
++		return -ENOMEM;
+ 	}
+ 
+-	return -ENOMEM;
++	prtd->phys = phys;
++	prtd->mapped = true;
++	dev_dbg(dev, "J716F: map dir=%d phys=%#llx period=%zu periods=%u ok\n",
++		substream->stream, (unsigned long long)phys, period_sz,
++		prtd->periods);
++
++	return 0;
+ }
+ 
+ static int q6asm_dai_prepare(struct snd_soc_component *component,

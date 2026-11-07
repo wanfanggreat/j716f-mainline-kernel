@@ -1,0 +1,54 @@
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_crtc.c
+@@ -63,9 +63,9 @@
+  * The proper long-term fix is to recover the vendor calibration and bake
+  * it in, or to ship an ICC profile; this is the bring-up knob.
+  */
+-static unsigned int pcc_white_r = 1024;
++static unsigned int pcc_white_r = 1018;
+ static unsigned int pcc_white_g = 1024;
+-static unsigned int pcc_white_b = 1024;
++static unsigned int pcc_white_b = 1095;
+ module_param(pcc_white_r, uint, 0644);
+ MODULE_PARM_DESC(pcc_white_r, "J716F: default PCC red gain, Q10 (1024 = 1.0)");
+ module_param(pcc_white_g, uint, 0644);
+@@ -921,11 +921,24 @@
+ 				_dpu_crtc_get_pcc_coeff(state, &cfg);
+ 				dspp->ops.setup_pcc(dspp, &cfg);
+ 			} else if (default_pcc) {
++				static unsigned int logged_r, logged_g, logged_b;
++
+ 				memset(&cfg, 0, sizeof(cfg));
+ 				cfg.r.r = dpu_pcc_gain_s3_15(pcc_white_r);
+ 				cfg.g.g = dpu_pcc_gain_s3_15(pcc_white_g);
+ 				cfg.b.b = dpu_pcc_gain_s3_15(pcc_white_b);
+ 				dspp->ops.setup_pcc(dspp, &cfg);
++				/* one line per change, not per frame */
++				if (logged_r != pcc_white_r || logged_g != pcc_white_g ||
++				    logged_b != pcc_white_b) {
++					logged_r = pcc_white_r;
++					logged_g = pcc_white_g;
++					logged_b = pcc_white_b;
++					pr_info("J716F pcc: dspp%d base=%#x r/g/b=%#x/%#x/%#x\n",
++						dspp->idx - DSPP_0,
++						dspp->cap->sblk->pcc.base,
++						cfg.r.r, cfg.g.g, cfg.b.b);
++				}
+ 			} else {
+ 				dspp->ops.setup_pcc(dspp, NULL);
+ 			}
+@@ -1479,7 +1492,13 @@
+ 	else
+ 		topology.num_lm = 1;
+ 
+-	if (crtc_state->ctm || crtc_state->gamma_lut)
++	/*
++	 * J716F: the DSPP is only reserved when the CRTC state asks for a
++	 * CTM or a gamma LUT.  Our default white-balance gain needs the same
++	 * block, and without it hw_dspp stays NULL and the PCC writes are
++	 * simply skipped (v37: parameters accepted, registers stayed 0).
++	 */
++	if (crtc_state->ctm || crtc_state->gamma_lut || dpu_default_pcc_active())
+ 		topology.num_dspp = topology.num_lm;
+ 
+ 	return topology;
