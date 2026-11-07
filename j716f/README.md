@@ -16,7 +16,8 @@ Snapdragon 870 / SM8250-AC）主线 Linux 移植的**完整内核源码**，
 | 上游基线 tag | `upstream-7.3.1` |
 | 基线提交 | `788e48f`（chore(kernel): import Linux 7.3.1 from kernel.org tarball） |
 | M10 构建源码 tag | `j716f-m10` = `e562462a3c039afd27f3ab5e1cc584d8bc24b77a` |
-| 归档工作树 tag | `j716f-worktree-20261108` = `b6276810bda3402ea33d2a9f1cca22e998143b07`（分支 `main` HEAD） |
+| 归档工作树 tag | `j716f-worktree-20261108` = `15a8792c970c8544d21dfa7c2529f7ca36c785ac` |
+| 归档文档 tag | `j716f-archive-20261108`（分支 `main` HEAD，含本说明修正） |
 | 许可 | GPL-2.0（见 `COPYING`） |
 
 上游 tarball 不携带 git 历史，因此本仓把**未修改的 7.3.1 树**作为单个
@@ -29,8 +30,9 @@ M10 镜像构建完成后（2026-11-08 00:59），工作树又增加了一处
 避免把 panic 数据排到共享请求里。该改动**没有重新编译**，因此：
 
 - `Image`/DTB/模块等构建产物对应 **`j716f-m10`**；
-- 当前分支 HEAD 对应 **`j716f-worktree-20261108`**，比构建源码多
-  7 insertions / 1 deletion（净 +6 行）。
+- 当前分支 HEAD 对应 **`j716f-archive-20261108`**，工作树源码与
+  `j716f-worktree-20261108` 相同，比构建源码多 7 insertions / 1 deletion
+  （净 +6 行）。
 
 ## 本地改动范围
 
