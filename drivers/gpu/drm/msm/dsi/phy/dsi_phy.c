@@ -774,14 +774,22 @@ int msm_dsi_phy_enable(struct msm_dsi_phy *phy,
 	 * which will confuse clock driver and result in wrong output rate of
 	 * link clocks. Restore PLL status if its PLL is being used as clock
 	 * source.
+	 *
+	 * The bonded slave PHY must also have its state restored: it has its own
+	 * CLK_CFG0 post-dividers, which otherwise stay at reset values while the
+	 * master's are programmed, leaving the two links asymmetric:
+	 *
+	 *   dsi0 CLK_CFG0=0x61 -> bit_clk_div 1, pix_clk_div 6
+	 *   dsi1 CLK_CFG0=0xf1 -> bit_clk_div 1, pix_clk_div 15
+	 *
+	 * Restoring both PHYs (and mirroring the dividers in
+	 * dsi_pll_7nm_vco_prepare() for a fresh enable) keeps them matched.
 	 */
-	if (phy->usecase != MSM_DSI_PHY_SLAVE) {
-		ret = msm_dsi_phy_pll_restore_state(phy);
-		if (ret) {
-			DRM_DEV_ERROR(dev, "%s: failed to restore phy state, %d\n",
-				__func__, ret);
-			goto pll_restor_fail;
-		}
+	ret = msm_dsi_phy_pll_restore_state(phy);
+	if (ret) {
+		DRM_DEV_ERROR(dev, "%s: failed to restore phy state, %d\n",
+			__func__, ret);
+		goto pll_restor_fail;
 	}
 
 	return 0;

@@ -1904,6 +1904,11 @@ static void dapm_seq_run_coalesced(struct snd_soc_card *card,
 
 	list_for_each_entry(w, pending, power_list) {
 		WARN_ON(reg != w->reg || dapm != w->dapm);
+		if (!strcmp(w->name, "TX_AIF1 Capture") ||
+		    !strcmp(w->name, "TX DMIC2") ||
+		    !strcmp(w->name, "TX_CODEC_DMA_TX_3 Capture"))
+			pr_debug("J716F-SEQ: %s power %d -> %d (reg=%#x)\n",
+				w->name, w->power, w->new_power, reg);
 		w->power = w->new_power;
 
 		mask |= w->mask << w->shift;
@@ -2204,6 +2209,14 @@ static void dapm_power_one_widget(struct snd_soc_dapm_widget *w,
 
 	power = dapm_widget_power_check(w);
 
+	/*
+	 * NOTE (2026-10-19): a stray debug `if (... of_device_is_compatible(
+	 * ..., "qcom,sm8250-lpass-tx-macro"))` used to sit here with no body,
+	 * making the `if (w->power == power) return;` below its body. That
+	 * meant the power-state short-circuit only ran for tx-macro widgets,
+	 * so every other widget kept being re-sequenced and DAPM never
+	 * settled - the capture chain stayed Off even with w->active set.
+	 */
 	if (w->power == power)
 		return;
 
@@ -4554,9 +4567,20 @@ static void dapm_dai_stream_event(struct snd_soc_dai *dai, int stream, int event
 
 	w = snd_soc_dai_get_widget(dai, stream);
 
+	/*
+	 * NOTE (2026-10-19): a stray `if (dai->name && !strcmp(dai->name,
+	 * "tx_macro_tx1"))` used to sit here with no statement body, which
+	 * made the `if (w)` block below its body. Every DAI other than
+	 * tx_macro_tx1 therefore had its stream event silently dropped:
+	 * w->active was never set, DAPM never powered the chain, and
+	 * capture returned correctly sized but all-zero buffers
+	 * (es7210 bias_level Off, LPASS PRI_MI2S_IBIT/EBIT enable_count 0).
+	 */
 	if (w) {
 		unsigned int ep;
 
+		pr_debug("J716F-DAPM: dai=%s widget=%s event=%d\n",
+			dai->name, w->name, event);
 		dapm_mark_dirty(w, "stream event");
 
 		if (w->id == snd_soc_dapm_dai_in) {

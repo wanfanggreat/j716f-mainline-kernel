@@ -128,10 +128,21 @@ static int snd_soc_dpcm_can_be_params(struct snd_soc_pcm_runtime *fe,
 static int snd_soc_dpcm_can_be_prepared(struct snd_soc_pcm_runtime *fe,
 					struct snd_soc_pcm_runtime *be, int stream)
 {
+	/*
+	 * Lenovo J716F: a backend that is still in HW_PARAMS must also be
+	 * accepted here. userspace does open -> hw_params -> prepare, and at
+	 * hw_params dpcm_run_update_startup() returns early once the FE has
+	 * reached HW_PARAMS, before it ever calls dpcm_be_dai_prepare(). The
+	 * BE therefore stays in HW_PARAMS, and without this entry
+	 * dpcm_fe_dai_prepare() skips it, so __soc_pcm_prepare() never runs
+	 * for the BE, SND_SOC_DAPM_STREAM_START is never sent to the codec DAI
+	 * widget and the whole DAPM capture path stays unpowered.
+	 */
 	const enum snd_soc_dpcm_state state[] = {
 		SND_SOC_DPCM_STATE_START,
 		SND_SOC_DPCM_STATE_PAUSED,
 		SND_SOC_DPCM_STATE_PREPARE,
+		SND_SOC_DPCM_STATE_HW_PARAMS,
 	};
 
 	return snd_soc_dpcm_check_state(fe, be, stream, state, ARRAY_SIZE(state));
@@ -1747,7 +1758,6 @@ int dpcm_add_paths(struct snd_soc_pcm_runtime *fe, int stream,
 		new++;
 	}
 
-	dev_dbg(fe->dev, "ASoC: found %d new BE paths\n", new);
 	return new;
 }
 
@@ -2089,6 +2099,24 @@ static int dpcm_fe_dai_startup(struct snd_pcm_substream *fe_substream)
 		goto unwind;
 
 	fe->dpcm[stream].state = SND_SOC_DPCM_STATE_OPEN;
+
+	/*
+	 * Lenovo J716F: power the capture/playback DAPM chain as soon as the
+	 * DPCM frontend opens.
+	 *
+	 * Upstream only issues dpcm_dapm_stream_event() from
+	 * dpcm_run_update_startup(), which runs from DAPM mixer changes and
+	 * bails out early when the FE substream is not active yet - so with a
+	 * plain "open the PCM, then read" sequence (what arecord does) the
+	 * event is never sent. The whole chain then stays powered down:
+	 * es7210 bias_level Off, LPASS PRI_MI2S_IBIT/EBIT enable_count 0,
+	 * and capture returns correctly sized but all-zero buffers.
+	 *
+	 * The matching SND_SOC_DAPM_STREAM_STOP is already sent from
+	 * dpcm_fe_dai_close(), so the pair stays balanced.
+	 */
+
+	dpcm_dapm_stream_event(fe, stream, SND_SOC_DAPM_STREAM_START);
 
 	dpcm_runtime_setup_fe(fe_substream);
 
@@ -2605,6 +2633,7 @@ int dpcm_be_dai_prepare(struct snd_soc_pcm_runtime *fe, int stream)
 		/* is this op for this BE ? */
 		if (!snd_soc_dpcm_can_be_update(fe, be, stream))
 			continue;
+
 
 		if (!snd_soc_dpcm_can_be_prepared(fe, be, stream))
 			continue;

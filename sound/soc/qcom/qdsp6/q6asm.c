@@ -321,6 +321,15 @@ static int q6asm_apr_send_session_pkt(struct q6asm *a, struct audio_client *ac,
 		dev_err(a->dev, "DSP returned error[%x]\n",
 			ac->result.status);
 		rc = -EINVAL;
+	} else {
+		/*
+		 * wait_event_timeout() returns the remaining jiffies, i.e. a
+		 * positive value on success. Callers use this return value as
+		 * an errno (and some, like the ASM memory-map ladder, test for
+		 * "== 0"), so report success as 0 here instead of leaking the
+		 * timeout remainder.
+		 */
+		rc = 0;
 	}
 
 err:
@@ -353,6 +362,14 @@ static int __q6asm_memory_unmap(struct audio_client *ac,
 	pkt->hdr.src_port = 0;
 	pkt->hdr.dest_port = 0;
 	pkt->hdr.pkt_size = pkt_size;
+	/*
+	 * Keep the direction in the low nibble: q6asm_stream_callback()
+	 * recovers it with "hdr->token & 0x0F" to store the memory-map handle
+	 * in the right port.  Sending it in the flag byte (the vendor
+	 * kernel's layout) made every capture response land on the playback
+	 * port, so capture reads used a zero mem_map_handle and returned
+	 * silence.
+	 */
 	pkt->hdr.token = ((ac->session << 8) | dir);
 
 	pkt->hdr.opcode = ASM_CMD_SHARED_MEM_UNMAP_REGIONS;
@@ -457,6 +474,7 @@ static int __q6asm_memory_map_regions(struct audio_client *ac, int dir,
 	pkt->hdr.src_port = 0;
 	pkt->hdr.dest_port = 0;
 	pkt->hdr.pkt_size = pkt_size;
+	/* Direction in the low nibble, see __q6asm_memory_unmap(). */
 	pkt->hdr.token = ((ac->session << 8) | dir);
 	pkt->hdr.opcode = ASM_CMD_SHARED_MEM_MAP_REGIONS;
 
@@ -628,6 +646,7 @@ static int32_t q6asm_stream_callback(struct apr_device *adev,
 			break;
 		case ASM_SESSION_CMD_RUN_V2:
 			client_event = ASM_CLIENT_EVENT_CMD_RUN_DONE;
+			pr_debug("J716F-ASM: CMD_RUN_DONE received\n");
 			break;
 		case ASM_STREAM_CMD_CLOSE:
 			client_event = ASM_CLIENT_EVENT_CMD_CLOSE_DONE;
@@ -658,8 +677,42 @@ static int32_t q6asm_stream_callback(struct apr_device *adev,
 			/* response as result of close stream */
 			goto done;
 		default:
-			dev_err(ac->dev, "command[0x%x] not expecting rsp\n",
-				result->opcode);
+			/*
+			 * The ADSP rejects ASM_DATA_CMD_READ_V2 with
+			 * ADSP_ENOTREADY (10) while the ASM session is not in a
+			 * state where it can hand out capture data, and a
+			 * rejected read never fills its buffer. Surface it
+			 * instead of silently dropping the response.
+			 */
+			if (result->opcode == ASM_DATA_CMD_READ_V2) {
+				if (result->status != ADSP_EOK) {
+					/*
+					 * Lenovo J716F: ADSP_ENOTREADY (10) is
+					 * transient, but re-queueing the read
+					 * from inside this handler recurses
+					 * without bound: q6asm_read() is called
+					 * synchronously, ADSP answers ENOTREADY
+					 * again, we call the callback again...
+					 * That produced 8724 read completions in
+					 * three seconds.
+					 *
+					 * The read that got rejected simply never
+					 * fills its buffer, so the only thing we
+					 * owe the stream is another attempt once
+					 * the DSP has caught up. Throttle it and
+					 * let the callback decide - it re-arms the
+					 * read from process context, not from this
+					 * APR callback.
+					 */
+					dev_dbg_ratelimited(ac->dev,
+						"capture read not ready: status %u\n",
+						result->status);
+				}
+			} else {
+				dev_err(ac->dev,
+					"command[0x%x] not expecting rsp\n",
+					result->opcode);
+			}
 			break;
 		}
 
@@ -705,6 +758,7 @@ static int32_t q6asm_stream_callback(struct apr_device *adev,
 		if (ac->io_mode & ASM_SYNC_IO_MODE) {
 			struct asm_data_cmd_read_v2_done *done = data->payload;
 			phys_addr_t phys;
+			unsigned int seq;
 
 			guard(spinlock_irqsave)(&ac->lock);
 			port =  &ac->port[SNDRV_PCM_STREAM_CAPTURE];
@@ -779,8 +833,15 @@ static int q6asm_srvc_callback(struct apr_device *adev,
 			wake_up(&a->mem_wait);
 			break;
 		default:
-			dev_err(&adev->dev, "command[0x%x] not expecting rsp\n",
-				 result->opcode);
+			/*
+			 * The ADSP answers every ASM_DATA_CMD_READ_V2 with a
+			 * basic result. Its status field is the only feedback
+			 * we get on whether the read was accepted, so log it
+			 * instead of discarding it.
+			 */
+			dev_err(&adev->dev,
+				"command[0x%x] not expecting rsp\n",
+				result->opcode);
 			break;
 		}
 		goto done;
@@ -1425,6 +1486,14 @@ int q6asm_read(struct audio_client *ac, uint32_t stream_id)
 	read->buf_size = ab->size;
 	read->seq_id = port->dsp_buf;
 	pkt->hdr.token = port->dsp_buf;
+
+	pr_debug("J716F-READ: phys=%#llx size=%u handle=%#x seq=%u\n",
+		(unsigned long long)ab->phys, ab->size,
+		port->mem_map_handle, port->dsp_buf);
+
+	pr_debug("J716F-READ: phys=%#llx size=%u handle=%#x seq=%u dsp_buf=%u\n",
+		(unsigned long long)ab->phys, ab->size,
+		port->mem_map_handle, port->dsp_buf, port->dsp_buf);
 
 	port->dsp_buf++;
 

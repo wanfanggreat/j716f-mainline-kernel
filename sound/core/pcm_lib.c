@@ -2021,9 +2021,6 @@ static int wait_for_avail(struct snd_pcm_substream *substream,
 			continue;
 		}
 		if (!tout) {
-			pcm_dbg(substream->pcm,
-				"%s timeout (DMA or IRQ trouble?)\n",
-				is_playback ? "playback write" : "capture read");
 			err = -EIO;
 			break;
 		}

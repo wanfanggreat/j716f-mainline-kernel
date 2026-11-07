@@ -1,0 +1,16 @@
+name: phase-m10-build1
+date: 2026-11-08T00:44:52+08:00
+source: /home/gaoming/linux-port-template/sources/linux-7.3.1
+source_version: 7.3.1
+source_commit: tarball
+out: /home/gaoming/linux-port-template/out/linux-7.3.1-phasei
+config_sha256: a50f73517e8e5bacfe46c2b56b8b041611916d04443b0d78dd531c65b8c07be1
+clang: Android (14863223, +pgo, +bolt, +lto, +mlgo, based on r584948b) clang version 22.0.1 (https://android.googlesource.com/toolchain/llvm-project 2d65e4108033380e6fe8e08b1f1826cd2bfb0c99)
+targets: Image dtbs modules
+jobs: 20
+duration_s: 17
+exit_code: 0
+log: tools/../logs/build/phase-m10-build1-20261108-004430.log
+artifacts:
+  e6d57ce75e871ee67879b7a7ebb21409eaf6390700c254eb903acc2d275e4f5a  /home/gaoming/linux-port-template/out/linux-7.3.1-phasei/arch/arm64/boot/Image
+  2574796dea2c8267245458ebd33cd6ca021b3bc335ec50c504917393268cd3ce  /home/gaoming/linux-port-template/out/linux-7.3.1-phasei/arch/arm64/boot/dts/qcom/sm8250-lenovo-j716f.dtb

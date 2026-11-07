@@ -657,6 +657,13 @@ static const struct of_device_id qcom_pdm_domains[] __maybe_unused = {
 	{ .compatible = "qcom,sm7225", .data = sm6350_domains, },
 	{ .compatible = "qcom,sm7325", .data = sc7280_domains, },
 	{ .compatible = "qcom,sm8150", .data = sm8150_domains, },
+	/*
+	 * Lenovo TB-J716F: the ABL rewrites the runtime root compatible to
+	 * "lenovo,j716f" only, dropping the "qcom,sm8250" fallback.  Without
+	 * this entry qcom_pdm_start() fails with -ENODEV and the ADSP audio
+	 * protection domain is never registered.
+	 */
+	{ .compatible = "lenovo,j716f", .data = sm8250_domains, },
 	{ .compatible = "qcom,sm8250", .data = sm8250_domains, },
 	{ .compatible = "qcom,sm8350", .data = sm8350_domains, },
 	{ .compatible = "qcom,sm8450", .data = sm8350_domains, },

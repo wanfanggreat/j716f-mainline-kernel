@@ -24,13 +24,33 @@
 
 #define DRV_NAME	"q6asm-fe-dai"
 
+/*
+ * Lenovo J716F (SM8250-AC / kona ADSP): the ADSP answers
+ * ASM_CMD_SHARED_MEM_MAP_REGIONS with ADSP_EFAILED for any buffer address
+ * outside the LPASS audio SMMU window.  The vendor kernel maps its audio
+ * buffers from 0x1000_0000-0x1FFF_FFFF (qcom,iommu-dma-addr-pool on its
+ * msm-audio-ion node); with the upstream 32-bit DMA mask iommu-dma hands out
+ * an IOVA near the top of the 32-bit space and the DSP rejects it.
+ * q6asm_dai_pcm_new() therefore limits the audio DMA mask to 29 bits, which
+ * puts the IOVA at 0x1FFF_xxxx inside that window; with that in place the
+ * upstream address layout (dma_addr | sid << 32) is what the kona ADSP
+ * accepts for both directions (confirmed on hardware 2026-11-07).
+ */
+
 #define PLAYBACK_MIN_NUM_PERIODS    2
 #define PLAYBACK_MAX_NUM_PERIODS   8
 #define PLAYBACK_MAX_PERIOD_SIZE    65536
 #define PLAYBACK_MIN_PERIOD_SIZE    128
 #define CAPTURE_MIN_NUM_PERIODS     2
 #define CAPTURE_MAX_NUM_PERIODS     8
-#define CAPTURE_MAX_PERIOD_SIZE     4096
+/*
+ * Lenovo J716F: the capture period size has to be able to hold what the DSP
+ * delivers per ASM_DATA_CMD_READ. With the upstream 4096-byte limit ALSA
+ * could not carve the 24000-byte DSP periods, ended up with a single-period
+ * buffer and never advanced hw_ptr, so arecord failed with -EIO even though
+ * the DSP was returning data. Match the playback limit.
+ */
+#define CAPTURE_MAX_PERIOD_SIZE     PLAYBACK_MAX_PERIOD_SIZE
 #define CAPTURE_MIN_PERIOD_SIZE     320
 #define SID_MASK_DEFAULT	0xF
 
@@ -71,6 +91,13 @@ struct q6asm_dai_rtd {
 	uint32_t stream_id;
 	uint16_t session_id;
 	enum stream_state state;
+	bool capture_started;
+	bool reads_pending;
+	/* How many READ_V2 commands are currently outstanding at the ADSP */
+	unsigned int reads_inflight;
+	unsigned long run_jiffies;
+	/* True while the audio buffer is mapped into the ADSP address space */
+	bool mapped;
 	uint32_t initial_samples_drop;
 	uint32_t trailing_samples_drop;
 	bool notify_on_drain;
@@ -181,24 +208,124 @@ static void event_handler(uint32_t opcode, uint32_t token,
 {
 	struct q6asm_dai_rtd *prtd = priv;
 	struct snd_pcm_substream *substream = prtd->substream;
+	unsigned int i;
+
+	if (!substream)
+		return;
 
 	switch (opcode) {
 	case ASM_CLIENT_EVENT_CMD_RUN_DONE:
+		/*
+		 * Lenovo J716F: capture reads may only be posted once the ADSP
+		 * reports the session running. They are queued here, one per
+		 * period, and topped up from DATA_READ_DONE. Playback is driven
+		 * from q6asm_dai_ack().
+		 */
+		if (substream->stream == SNDRV_PCM_STREAM_CAPTURE &&
+		    prtd->reads_pending) {
+			prtd->reads_pending = false;
+			for (i = 0; i < prtd->periods; i++) {
+				if (q6asm_read(prtd->audio_client,
+					       prtd->stream_id) == 0)
+					prtd->reads_inflight++;
+			}
+		}
 		break;
 	case ASM_CLIENT_EVENT_CMD_EOS_DONE:
+		prtd->state = Q6ASM_STREAM_STOPPED;
 		break;
 	case ASM_CLIENT_EVENT_DATA_WRITE_DONE:
 		snd_pcm_period_elapsed(substream);
 		break;
 	case ASM_CLIENT_EVENT_DATA_READ_DONE:
 		snd_pcm_period_elapsed(substream);
-		if (prtd->state == Q6ASM_STREAM_RUNNING)
-			q6asm_read(prtd->audio_client, prtd->stream_id);
+		/*
+		 * One read just completed, so one slot in the ADSP queue freed
+		 * up. Keep the queue topped back up to prtd->periods instead of
+		 * issuing exactly one read: the ADSP drains several periods back
+		 * to back and a queue that only ever holds one outstanding read
+		 * runs dry between completions, which ends capture in -EIO.
+		 */
+		if (prtd->reads_inflight)
+			prtd->reads_inflight--;
+		while (prtd->reads_inflight < prtd->periods) {
+			if (q6asm_read(prtd->audio_client,
+				       prtd->stream_id) != 0)
+				break;
+			prtd->reads_inflight++;
+		}
 
 		break;
 	default:
 		break;
 	}
+}
+
+/*
+ * Lenovo J716F: map the period ring into the ADSP.
+ *
+ * The address keeps the upstream layout (IOVA | sid << 32); the 29-bit DMA
+ * mask set in q6asm_dai_pcm_new() keeps the IOVA inside the LPASS audio
+ * window 0x1000_0000-0x1FFF_FFFF, which is what the kona ADSP requires.
+ *
+ * The ADSP still rejects that first attempt now and then (early boot, when
+ * PipeWire opens the card before the audio protection domain is fully up:
+ * "DSP returned error[1]" and then every retry of the same address fails).
+ * A mapping without the SID in the upper 32 bits is a different key for the
+ * firmware and is accepted, so fall back to it once before giving up; that
+ * is the difference between the desktop getting sound and PipeWire
+ * retrying every five seconds forever.
+ *
+ * q6asm_map_memory_regions() returns a positive value on success (see
+ * q6asm_apr_send_session_pkt()), so "not negative" is the success test.  It
+ * also returns 0 early when the port already has a mapping, which is success
+ * as well.
+ */
+static int q6asm_dai_map_regions(struct device *dev,
+				 struct snd_pcm_substream *substream,
+				 struct q6asm_dai_rtd *prtd, u64 sid_bits)
+{
+	dma_addr_t dma_addr = substream->dma_buffer.addr;
+	phys_addr_t phys;
+	size_t period_sz;
+	int ret, attempt;
+
+	if (!prtd->periods) {
+		dev_err(dev, "J716F: no periods for the DMA map\n");
+		return -EINVAL;
+	}
+	period_sz = prtd->pcm_size / prtd->periods;
+
+	for (attempt = 0; attempt < 2; attempt++) {
+		/* 0: upstream layout, 1: plain IOVA (no SID in the msw) */
+		if (attempt == 0)
+			phys = dma_addr | sid_bits;
+		else
+			phys = (phys_addr_t)lower_32_bits(dma_addr);
+
+		ret = q6asm_map_memory_regions(substream->stream,
+					       prtd->audio_client, phys,
+					       period_sz, prtd->periods);
+		if (ret >= 0) {
+			prtd->phys = phys;
+			prtd->mapped = true;
+			dev_info(dev,
+				 "J716F: map dir=%d mode=%d phys=%#llx dma=%#llx period=%zu periods=%u accepted\n",
+				 substream->stream, attempt,
+				 (unsigned long long)phys,
+				 (unsigned long long)dma_addr, period_sz,
+				 prtd->periods);
+			return 0;
+		}
+
+		dev_err(dev,
+			"J716F: map dir=%d mode=%d phys=%#llx dma=%#llx period=%zu periods=%u failed (%d)\n",
+			substream->stream, attempt, (unsigned long long)phys,
+			(unsigned long long)dma_addr, period_sz,
+			prtd->periods, ret);
+	}
+
+	return -ENOMEM;
 }
 
 static int q6asm_dai_prepare(struct snd_soc_component *component,
@@ -209,7 +336,7 @@ static int q6asm_dai_prepare(struct snd_soc_component *component,
 	struct q6asm_dai_rtd *prtd = runtime->private_data;
 	struct q6asm_dai_data *pdata;
 	struct device *dev = component->dev;
-	int ret, i;
+	int ret;
 
 	pdata = snd_soc_component_get_drvdata(component);
 	if (!pdata)
@@ -221,20 +348,41 @@ static int q6asm_dai_prepare(struct snd_soc_component *component,
 		return -EINVAL;
 	}
 
-	prtd->pcm_count = snd_pcm_lib_period_bytes(substream);
+	/*
+	 * Lenovo J716F: keep pcm_count consistent with the period size that is
+	 * handed to the DSP in q6asm_map_memory_regions() below
+	 * (pcm_size / periods). snd_pcm_lib_period_bytes() can differ from
+	 * that, which made the driver ask the DSP for a different amount of
+	 * data per period than the mapping described.
+	 */
+	prtd->pcm_count = prtd->periods ?
+		(prtd->pcm_size / prtd->periods) :
+		snd_pcm_lib_period_bytes(substream);
+	prtd->queue_ptr = 0;
+	prtd->reads_inflight = 0;
+	prtd->reads_pending = false;
+	prtd->capture_started = false;
 	/* rate and channels are sent to audio driver */
-	if (prtd->state == Q6ASM_STREAM_RUNNING) {
-		/* clear the previous setup if any  */
+	if (prtd->state) {
+		/*
+		 * Clear the previous setup if any.  Unmap before CMD_CLOSE:
+		 * CMD_CLOSE invalidates the ADSP-side memory map handle, and a
+		 * later UNMAP then fails with "invalid mem handle" and leaves
+		 * the session unusable.  The vendor driver frees the buffer
+		 * before releasing the client for the same reason.
+		 */
+		if (prtd->mapped) {
+			ret = q6asm_unmap_memory_regions(substream->stream,
+							 prtd->audio_client);
+			if (ret < 0)
+				dev_warn(dev, "J716F: unmap before close failed %d\n",
+					 ret);
+			prtd->mapped = false;
+		}
+
 		ret = q6asm_cmd(prtd->audio_client, prtd->stream_id, CMD_CLOSE);
 		if (ret < 0) {
 			dev_err(dev, "Failed to close q6asm stream %d\n", prtd->stream_id);
-			return ret;
-		}
-
-		ret = q6asm_unmap_memory_regions(substream->stream, prtd->audio_client);
-		if (ret < 0) {
-			dev_err(dev, "Failed to unmap memory regions for q6asm stream %d\n",
-				prtd->stream_id);
 			return ret;
 		}
 
@@ -243,10 +391,8 @@ static int q6asm_dai_prepare(struct snd_soc_component *component,
 		prtd->state = Q6ASM_STREAM_STOPPED;
 	}
 
-	ret = q6asm_map_memory_regions(substream->stream, prtd->audio_client,
-				       prtd->phys,
-				       (prtd->pcm_size / prtd->periods),
-				       prtd->periods);
+	ret = q6asm_dai_map_regions(dev, substream, prtd,
+				    pdata->sid < 0 ? 0 : ((u64)pdata->sid << 32));
 
 	if (ret < 0) {
 		dev_err(dev, "Audio Start: Buffer Allocation failed rc = %d\n",
@@ -289,22 +435,84 @@ static int q6asm_dai_prepare(struct snd_soc_component *component,
 							   runtime->channels,
 							   prtd->bits_per_sample);
 
-		/* Queue the buffers */
-		for (i = 0; i < runtime->periods; i++)
-			q6asm_read(prtd->audio_client, prtd->stream_id);
+		/*
+		 * Lenovo J716F: mark the stream RUNNING *before* queueing the
+		 * capture buffers. The DSP can start returning
+		 * ASM_CLIENT_EVENT_DATA_READ_DONE as soon as the first read is
+		 * posted, and the handler only re-queues a buffer while
+		 * prtd->state == Q6ASM_STREAM_RUNNING. With the state set after
+		 * the loop the queue drained after exactly runtime->periods
+		 * buffers and the stream stalled with EIO.
+		 */
+		WRITE_ONCE(prtd->state, Q6ASM_STREAM_RUNNING);
+
+		prtd->run_jiffies = jiffies;
+
+		/*
+		 * Lenovo J716F: run the capture stream BEFORE posting the read
+		 * requests. With the reads posted first the DSP only flushed
+		 * them after ALSA had already given up and stopped the stream -
+		 * DATA_READ_DONE always landed a few ms after the read timeout,
+		 * so capture failed with -EIO and delivered no samples.
+		 */
+		/*
+		 * DIAGNOSTIC (2026-10-19): use the synchronous variant.
+		 *
+		 * With run_nowait() the RUN command is fire-and-forget, so a
+		 * failure is invisible; ADSP then keeps answering every READ
+		 * with ADSP_ENOTREADY (status 10) and capture yields zeros.
+		 * run() waits for the response and surfaces the real status.
+		 */
+		/*
+		 * Lenovo J716F: do NOT post the READ_V2 commands here. The
+		 * ADSP answers each of them with ADSP_ENOTREADY (status 10,
+		 * "operation is not ready to be processed") until the session
+		 * RUN has completed, and a rejected read never fills its
+		 * buffer - which is exactly why capture delivered nothing but
+		 * zeros. The reads are queued from the CMD_RUN_DONE handler
+		 * instead, i.e. only once the DSP reports the stream running.
+		 *
+		 * reads_pending has to be armed BEFORE the run command, not
+		 * after: q6asm_run() is the synchronous variant, so it waits
+		 * for the very CMD_RUN_DONE response that consumes this flag.
+		 * Setting it afterwards left it false at handler time, so no
+		 * READ was ever queued and hw_ptr stayed at 0.
+		 */
+		prtd->reads_pending = true;
+
+		ret = q6asm_run(prtd->audio_client, prtd->stream_id, 0, 0, 0);
+		if (ret) {
+			dev_err(dev, "capture run failed %d\n", ret);
+			prtd->reads_pending = false;
+			prtd->state = Q6ASM_STREAM_STOPPED;
+			goto open_err;
+		}
+		prtd->capture_started = true;
 
 	}
-	if (ret < 0)
+	if (ret < 0) {
 		dev_info(dev, "%s: CMD Format block failed\n", __func__);
-	else
+		prtd->state = Q6ASM_STREAM_STOPPED;
+	} else {
+		/*
+		 * Lenovo J716F: q6asm_dai_ack() only queues playback periods
+		 * while the stream is RUNNING, so the state has to be set for
+		 * playback too. The capture path already set it before posting
+		 * the reads; this is idempotent there.
+		 */
 		prtd->state = Q6ASM_STREAM_RUNNING;
+	}
 
 	return ret;
 
 routing_err:
 	q6asm_cmd(prtd->audio_client, prtd->stream_id,  CMD_CLOSE);
 open_err:
-	q6asm_unmap_memory_regions(substream->stream, prtd->audio_client);
+	if (prtd->mapped) {
+		q6asm_unmap_memory_regions(substream->stream,
+					   prtd->audio_client);
+		prtd->mapped = false;
+	}
 
 	return ret;
 }
@@ -343,10 +551,22 @@ static int q6asm_dai_trigger(struct snd_soc_component *component,
 	case SNDRV_PCM_TRIGGER_START:
 	case SNDRV_PCM_TRIGGER_RESUME:
 	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
+		/*
+		 * Lenovo J716F: the capture stream is already running - it is
+		 * started synchronously in prepare() so that a RUN failure is
+		 * visible. Do not send a second RUN for it: the ADSP answers
+		 * that with ADSP_EALREADY.
+		 */
+		if (substream->stream == SNDRV_PCM_STREAM_CAPTURE &&
+		    prtd->capture_started) {
+			WRITE_ONCE(prtd->state, Q6ASM_STREAM_RUNNING);
+			break;
+		}
 		ret = q6asm_run_nowait(prtd->audio_client, prtd->stream_id,
 				       0, 0, 0);
 		break;
 	case SNDRV_PCM_TRIGGER_STOP:
+		prtd->capture_started = false;
 		ret = q6asm_cmd_nowait(prtd->audio_client, prtd->stream_id,
 				       CMD_EOS);
 		break;
@@ -401,6 +621,18 @@ static int q6asm_dai_open(struct snd_soc_component *component,
 	/* DSP expects stream id from 1 */
 	prtd->stream_id = 1;
 
+	/*
+	 * Lenovo J716F: the ADSP needs ~230ms (for a 2-period buffer) before
+	 * it raises the first ASM_CLIENT_EVENT_DATA_READ_DONE, while ALSA's
+	 * default capture read wait is only buffer_size * 1100 / rate -
+	 * ~220ms for the same buffer. The first read therefore timed out a
+	 * few milliseconds before the data arrived and userspace got -EIO.
+	 * Give capture a floor that comfortably covers the DSP start-up
+	 * latency; playback keeps the default.
+	 */
+	if (substream->stream == SNDRV_PCM_STREAM_CAPTURE)
+		substream->wait_time = 10000;  /* DIAG: 10s to catch slow DSP */
+
 	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
 		runtime->hw = q6asm_dai_hardware_playback;
 	else if (substream->stream == SNDRV_PCM_STREAM_CAPTURE)
@@ -446,10 +678,11 @@ static int q6asm_dai_open(struct snd_soc_component *component,
 		runtime->dma_bytes = q6asm_dai_hardware_capture.buffer_bytes_max;
 	}
 
-	if (pdata->sid < 0)
+	if (pdata->sid < 0) {
 		prtd->phys = substream->dma_buffer.addr;
-	else
+	} else {
 		prtd->phys = substream->dma_buffer.addr | (pdata->sid << 32);
+	}
 
 	return 0;
 }
@@ -462,12 +695,23 @@ static int q6asm_dai_close(struct snd_soc_component *component,
 	struct q6asm_dai_rtd *prtd = runtime->private_data;
 
 	if (prtd->audio_client) {
-		if (prtd->state == Q6ASM_STREAM_RUNNING) {
-			q6asm_cmd(prtd->audio_client, prtd->stream_id,
-				  CMD_CLOSE);
+		/*
+		 * Lenovo J716F: always release the ADSP session. Gating this on
+		 * prtd->state leaked the session whenever a prepare() failed
+		 * after the stream had been opened: the ADSP only tolerates a
+		 * limited number of open sessions and answered the next
+		 * OPEN_WRITE/OPEN_READ with ADSP_EALREADY (0x9).
+		 *
+		 * Unmap first, then close: CMD_CLOSE invalidates the ADSP-side
+		 * memory map handle, so an UNMAP afterwards fails and leaves the
+		 * bookkeeping inconsistent.
+		 */
+		if (prtd->mapped) {
 			q6asm_unmap_memory_regions(substream->stream,
-					   prtd->audio_client);
+						   prtd->audio_client);
+			prtd->mapped = false;
 		}
+		q6asm_cmd(prtd->audio_client, prtd->stream_id, CMD_CLOSE);
 		q6asm_audio_client_free(prtd->audio_client);
 		prtd->audio_client = NULL;
 	}
@@ -1193,6 +1437,18 @@ static int q6asm_dai_pcm_new(struct snd_soc_component *component,
 {
 	struct snd_pcm *pcm = rtd->pcm;
 	size_t size = q6asm_dai_hardware_playback.buffer_bytes_max;
+
+	/*
+	 * Lenovo J716F: the vendor kernel maps audio buffers from the LPASS
+	 * audio SMMU window 0x1000_0000-0x1FFF_FFFF (qcom,iommu-dma-addr-pool
+	 * on its msm-audio-ion node). Keep the IOVA in the same window so the
+	 * address handed to the ADSP is inside the range its firmware was
+	 * built for. A 29-bit mask makes iommu-dma allocate top-down at
+	 * 0x1FFF_xxxx, i.e. inside that window.
+	 */
+	if (dma_set_mask_and_coherent(component->dev, DMA_BIT_MASK(29)))
+		dev_warn(component->dev,
+			 "J716F: could not limit the audio DMA mask to 29 bits\n");
 
 	return snd_pcm_set_fixed_buffer_all(pcm, SNDRV_DMA_TYPE_DEV,
 					    component->dev, size);

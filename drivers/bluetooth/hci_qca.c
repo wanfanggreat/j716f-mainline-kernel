@@ -229,6 +229,7 @@ struct qca_serdev {
 	u32 oper_speed;
 	bool bdaddr_property_broken;
 	bool support_hfp_hw_offload;
+	bool no_ibs_sleep;
 	const char *firmware_name[2];
 };
 
@@ -637,6 +638,16 @@ static int qca_open(struct hci_uart *hu)
 
 		if (qcadev->oper_speed)
 			hu->oper_speed = qcadev->oper_speed;
+
+		/*
+		 * Lenovo J716F: the QCA6390 does not survive the in-band
+		 * sleep / system-suspend sequence on this board.  When the
+		 * DT asks for it, keep the BT core awake (a 24 h idle
+		 * timer) and skip the SLEEP_IND in qca_suspend(), so the
+		 * controller still answers HCI commands after s2idle.
+		 */
+		if (qcadev->no_ibs_sleep)
+			qca->tx_idle_delay = 24 * 60 * 60 * 1000;
 	}
 
 	timer_setup(&qca->wake_retrans_timer, hci_ibs_wake_retrans_timeout, 0);
@@ -2059,6 +2070,17 @@ out:
 
 		if (retries < MAX_INIT_RETRIES) {
 			bt_dev_warn(hdev, "Retry BT power ON:%d", retries);
+			/*
+			 * Lenovo J716F: the pwrseq turns BT_EN off and then
+			 * qca_power_on turns it on again in the next
+			 * iteration.  Without a delay the pin is low for
+			 * only microseconds; the QCA6390 then never answers
+			 * the next 0xfc00 version command (seen when
+			 * bluetoothd is restarted, where the first power
+			 * cycle is not done by the bootloader).  Hold the
+			 * BT domain off long enough to actually reset it.
+			 */
+			msleep(200);
 			if (hu->serdev) {
 				serdev_device_close(hu->serdev);
 				ret = serdev_device_open(hu->serdev);
@@ -2419,6 +2441,8 @@ static int qca_serdev_probe(struct serdev_device *serdev)
 
 	qcadev->bdaddr_property_broken = device_property_read_bool(&serdev->dev,
 			"qcom,local-bd-address-broken");
+	qcadev->no_ibs_sleep = device_property_read_bool(&serdev->dev,
+			"qcom,no-ibs-sleep");
 
 	if (data)
 		qcadev->btsoc_type = data->soc_type;
@@ -2660,6 +2684,16 @@ static int __maybe_unused qca_suspend(struct device *dev)
 	int ret = 0;
 	u8 cmd;
 	unsigned long wait_timeout = 0;
+
+	/*
+	 * Lenovo J716F: this board's QCA6390 does not recover from the
+	 * in-band sleep sequence when the UART is suspended (the HCI core
+	 * then times out reading the QCA version, three retries, and the
+	 * controller stays DOWN until reboot).  Keep the BT core powered
+	 * across system sleep instead; the cost is idle power in s2idle.
+	 */
+	if (qcadev->no_ibs_sleep)
+		return 0;
 
 	set_bit(QCA_SUSPENDING, &qca->flags);
 

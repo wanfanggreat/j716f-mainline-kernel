@@ -909,6 +909,27 @@ static int cs35l41_set_pdata(struct cs35l41_private *cs35l41)
 	if (ret)
 		return ret;
 
+	/*
+	 * Lenovo J716F: the boost converter target voltage lives in
+	 * BSTCVRT_VCTRL1 and is left at its reset value of 0 by the upstream
+	 * driver. With a target of zero the amplifier is enabled and the DAPM
+	 * path powers up, but the speaker output stays silent because the
+	 * boost never generates a rail. The vendor driver programs it from a
+	 * "cirrus,boost-ctl-millivolt" property using
+	 *     vctl = ((millivolt - 2550) / 100) + 1
+	 * (2550 mV is the converter's floor; the vendor range check accepts
+	 * 2550..11000 mV) and so does this driver when the property is present.
+	 */
+	if (hw_cfg->bst_vctl_mv >= 2550 && hw_cfg->bst_vctl_mv <= 11000) {
+		unsigned int vctl = ((hw_cfg->bst_vctl_mv - 2550) / 100) + 1;
+
+		ret = regmap_update_bits(cs35l41->regmap,
+					 CS35L41_BSTCVRT_VCTRL1,
+					 CS35L41_BST_VCTL_MASK, vctl);
+		if (ret)
+			return ret;
+	}
+
 	/* Optional */
 	if (hw_cfg->dout_hiz <= CS35L41_ASP_DOUT_HIZ_MASK && hw_cfg->dout_hiz >= 0)
 		regmap_update_bits(cs35l41->regmap, CS35L41_SP_HIZ_CTRL, CS35L41_ASP_DOUT_HIZ_MASK,
@@ -1049,6 +1070,12 @@ static int cs35l41_handle_pdata(struct device *dev, struct cs35l41_hw_cfg *hw_cf
 		hw_cfg->bst_cap = val;
 	else
 		hw_cfg->bst_cap = -1;
+
+	ret = device_property_read_u32(dev, "cirrus,boost-ctl-millivolt", &val);
+	if (ret >= 0)
+		hw_cfg->bst_vctl_mv = val;
+	else
+		hw_cfg->bst_vctl_mv = -1;
 
 	ret = device_property_read_u32(dev, "cirrus,asp-sdout-hiz", &val);
 	if (ret >= 0)

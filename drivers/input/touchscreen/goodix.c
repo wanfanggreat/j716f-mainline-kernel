@@ -33,7 +33,6 @@
 #define GOODIX_INT_TRIGGER		1
 #define GOODIX_CONTACT_SIZE		8
 #define GOODIX_MAX_CONTACT_SIZE		9
-#define GOODIX_MAX_CONTACTS		10
 
 #define GOODIX_CONFIG_MIN_LENGTH	186
 #define GOODIX_CONFIG_911_LENGTH	186
@@ -43,6 +42,13 @@
 #define GOODIX_BUFFER_STATUS_READY	BIT(7)
 #define GOODIX_HAVE_KEY			BIT(4)
 #define GOODIX_BUFFER_STATUS_TIMEOUT	20
+#define GOODIX_GT738X_HEADER_SIZE	2
+#define GOODIX_GT738X_CONTACT_SIZE	8
+#define GOODIX_GT738X_PEN_SIZE		12
+#define GOODIX_GT738X_PEN_FLAG		BIT(5)
+#define GOODIX_GT738X_TOUCH_EVENT	BIT(7)
+#define GOODIX_GT738X_INITIAL_READ	\
+	(GOODIX_GT738X_HEADER_SIZE + GOODIX_GT738X_PEN_SIZE + 2)
 
 #define RESOLUTION_LOC			1
 #define MAX_CONTACTS_LOC		5
@@ -275,6 +281,30 @@ static int goodix_ts_read_input_report(struct goodix_ts_data *ts, u8 *data)
 		if (error)
 			return error;
 
+		if (ts->gt738x_debug) {
+			pr_debug("J716F-TS: 0x814E[0]=%02x [1]=%02x [2]=%02x [3]=%02x\n",
+				data[0], data[1], data[2], data[3]);
+		}
+
+		/*
+		 * Lenovo J716F: the GT738x firmware on this board reports the
+		 * contact count in the low nibble but does not set the
+		 * "buffer status ready" bit (BIT(7)) that mainline waits for.
+		 * Reading 0x814E by hand while a finger is on the panel gives
+		 * a steady stream of
+		 *
+		 *   0x00, 0x00, 0x07, 0x07, 0x00, ...
+		 *
+		 * i.e. touch_num = 7 with bit 7 clear, so the original check
+		 * never accepted a report, goodix_process_events() returned
+		 * early every time, and evtest saw no events at all even
+		 * though the interrupt line was firing hundreds of times per
+		 * second and the coordinates in 0x8140 were valid.
+		 *
+		 * Accept the low nibble on its own as long as it is within
+		 * range: a count of 0 still means "no contact", so the
+		 * release path keeps working.
+		 */
 		if (data[0] & GOODIX_BUFFER_STATUS_READY) {
 			touch_num = data[0] & 0x0f;
 			if (touch_num > ts->max_touch_num)
@@ -401,7 +431,8 @@ static void goodix_ts_report_pen_up(struct goodix_ts_data *ts)
 	input_sync(ts->input_pen);
 }
 
-static void goodix_ts_report_touch_8b(struct goodix_ts_data *ts, u8 *coor_data)
+static void goodix_ts_report_touch_8b(struct goodix_ts_data *ts, u8 *coor_data,
+				     bool gt738x)
 {
 	int id = coor_data[0] & 0x0F;
 	int input_x = get_unaligned_le16(&coor_data[1]);
@@ -409,6 +440,10 @@ static void goodix_ts_report_touch_8b(struct goodix_ts_data *ts, u8 *coor_data)
 	int input_w = get_unaligned_le16(&coor_data[5]);
 
 	input_mt_slot(ts->input_dev, id);
+	if (gt738x && !ts->gt738x_j716f_mode && !input_w) {
+		input_mt_report_slot_state(ts->input_dev, MT_TOOL_FINGER, false);
+		return;
+	}
 	input_mt_report_slot_state(ts->input_dev, MT_TOOL_FINGER, true);
 	touchscreen_report_pos(ts->input_dev, &ts->prop,
 			       input_x, input_y, true);
@@ -465,15 +500,242 @@ static void goodix_ts_report_key(struct goodix_ts_data *ts, u8 *data)
  * Called when the IRQ is triggered. Read the current device state, and push
  * the input events to the user space.
  */
+/*
+ * The Goodix GT738x report protocol is distinct from GT9xx. The public
+ * Goodix GT738x driver reads the event header and contact records at 0x824E:
+ * one event byte, one count/flags byte, 8 bytes per finger, then an 8-bit
+ * checksum. The first 16 bytes are read up front to cover the optional pen
+ * record; additional finger records are fetched only when needed.
+ *
+ * Convert those records to the GT9xx-shaped buffer consumed by this driver's
+ * existing input reporter. Returns the finger count, or a negative errno.
+ */
+static int goodix_gt738x_read_report(struct goodix_ts_data *ts, u8 *point_data)
+{
+	static unsigned int j716f_trace_frames;
+	u8 buf[GOODIX_GT738X_INITIAL_READ +
+	       GOODIX_GT738X_CONTACT_SIZE * (GOODIX_MAX_CONTACTS - 1)] = {};
+	u8 checksum = 0;
+	bool present[GOODIX_MAX_CONTACTS] = {};
+	int report_len, touch_num, finger_num, i, j, slot;
+	int header_size = ts->gt738x_j716f_mode ? 1 : GOODIX_GT738X_HEADER_SIZE;
+	int error;
+
+	/*
+	 * Read the standard GT738x initial block first. It contains the complete
+	 * one-finger report, while reading the maximum 88-byte buffer on J716F's
+	 * 100 kHz bus occupies almost an entire ~10 ms report interval and may
+	 * cause the controller's live report window to be overwritten mid-read.
+	 * Fetch additional records below only when the header says there are
+	 * multiple contacts.
+	 */
+	error = goodix_i2c_read(ts->client, GOODIX_GT738X_COOR_ADDR,
+				buf, GOODIX_GT738X_INITIAL_READ);
+	if (error)
+		return error;
+
+	if (!(buf[0] & GOODIX_GT738X_TOUCH_EVENT)) {
+		/*
+		 * The bit-7 clear state means there is no complete new report;
+		 * it is not a zero-contact frame. Returning 0 would make
+		 * goodix_process_events() sync an empty MT frame and release the
+		 * current contact. J716F has shown brief tracking-ID breaks during
+		 * a continuous press, so preserve the slot on these not-ready IRQs.
+		 * A ready frame with count 0 (0x80) still reports a real release.
+		 */
+		if (ts->gt738x_j716f_mode) {
+			if (ts->gt738x_debug)
+				dev_dbg_ratelimited(&ts->client->dev,
+					"J716F report not ready, ignore: %*ph\n",
+					GOODIX_GT738X_INITIAL_READ, buf);
+			return -EAGAIN;
+		}
+		return 0;
+	}
+
+	/*
+	 * The public GT738x protocol uses byte 1 for the contact count. J716F
+	 * instead starts its first finger record there (trace ID, X LE, Y LE,
+	 * width LE, reserved). Byte 0 contains ready and the contact count.
+	 */
+	if (ts->gt738x_j716f_mode)
+		touch_num = buf[0] & 0x0f;
+	else
+		touch_num = buf[1] & 0x0f;
+	if (touch_num > GOODIX_MAX_CONTACTS) {
+		dev_warn_ratelimited(&ts->client->dev,
+				     "invalid GT738x touch count %d, header %*ph\n",
+				     touch_num, GOODIX_GT738X_INITIAL_READ, buf);
+		return -EPROTO;
+	}
+	/*
+	 * A ready zero-contact report releases all slots; individual width-zero
+	 * records below release their slots as well. Log the initial packet so
+	 * tracking-ID breaks can be matched to controller releases instead of
+	 * inferred only from the resulting input events.
+	 */
+	if (ts->gt738x_j716f_mode && ts->gt738x_debug && !touch_num)
+		dev_dbg_ratelimited(&ts->client->dev,
+				     "J716F ready zero-contact report: %*ph\n",
+				     GOODIX_GT738X_INITIAL_READ, buf);
+
+	/* J716F has one status byte, followed by LE finger records and footer. */
+	report_len = header_size +
+		     GOODIX_GT738X_CONTACT_SIZE + 2;
+	if (touch_num > 1)
+		report_len += GOODIX_GT738X_CONTACT_SIZE * (touch_num - 1);
+	if (report_len > GOODIX_GT738X_INITIAL_READ) {
+		error = goodix_i2c_read(ts->client,
+					GOODIX_GT738X_COOR_ADDR +
+						GOODIX_GT738X_INITIAL_READ,
+					&buf[GOODIX_GT738X_INITIAL_READ],
+					report_len - GOODIX_GT738X_INITIAL_READ);
+		if (error)
+			return error;
+	}
+	if (touch_num)
+		for (i = 0; i < report_len - !ts->gt738x_j716f_mode; i++)
+			checksum += buf[i];
+	/*
+	 * Optional J716F diagnostics: trace complete one-contact packets
+	 * before they are converted to input events. The old two-byte-header/BE
+	 * interpretation mixed adjacent fields and caused 256-unit jumps. Tracing
+	 * requires both the debug-reports DT property and dynamic debug for this
+	 * callsite, so normal input does not continuously fill the kernel log.
+	 */
+	if (ts->gt738x_j716f_mode && ts->gt738x_debug && touch_num == 1) {
+		u8 *record = &buf[header_size];
+		u16 x = get_unaligned_le16(&record[1]);
+		u16 y = get_unaligned_le16(&record[3]);
+		u16 width = get_unaligned_le16(&record[5]);
+
+		dev_dbg(&ts->client->dev,
+			 "J716F frame %u: sum=%02x id=%02x x=%u y=%u w=%u data=%*ph\n",
+			 ++j716f_trace_frames, checksum, record[0], x, y, width,
+			 report_len, buf);
+	}
+	/* J716F finger frames include the status byte in their checksum. */
+	if (checksum) {
+		dev_warn_ratelimited(&ts->client->dev,
+				     "GT738x checksum error %02x, count %d\n",
+				     checksum, touch_num);
+		return -EBADMSG;
+	}
+
+	/* Count only active finger records; width-zero records release slots. */
+	finger_num = 0;
+
+	if (!ts->gt738x_trace_ids_initialized) {
+		memset(ts->gt738x_trace_ids, 0xff,
+		       sizeof(ts->gt738x_trace_ids));
+		ts->gt738x_trace_ids_initialized = true;
+	}
+	/*
+	 * The J716F record starts at byte 1. Its first byte is stable during a
+	 * contact; byte 2 is X low, not a changing trace ID. Map the full byte
+	 * to Linux slots, with 0xffff reserved for unused slots so ID 0xff is
+	 * also representable. Width zero is the controller's release record.
+	 */
+	for (i = 0; i < touch_num; i++) {
+		u8 *record = &buf[header_size +
+				   GOODIX_GT738X_CONTACT_SIZE * i];
+		u16 trace_id = record[0];
+
+		if (ts->gt738x_j716f_mode && !get_unaligned_le16(&record[5]))
+			continue;
+		if (++finger_num > ts->max_touch_num)
+			return -EPROTO;
+		for (j = 0; j < i; j++) {
+			u8 *previous = &buf[header_size +
+					   GOODIX_GT738X_CONTACT_SIZE * j];
+
+			if (ts->gt738x_j716f_mode &&
+			    !get_unaligned_le16(&previous[5]))
+				continue;
+			if (previous[0] == trace_id)
+				return -EPROTO;
+		}
+
+		for (slot = 0; slot < ts->max_touch_num; slot++)
+			if (ts->gt738x_trace_ids[slot] == trace_id)
+				present[slot] = true;
+	}
+	ts->gt738x_released_slots = 0;
+	for (slot = 0; slot < ts->max_touch_num; slot++)
+		if (!present[slot]) {
+			if (ts->gt738x_trace_ids[slot] != 0xffff)
+				ts->gt738x_released_slots |= BIT(slot);
+			ts->gt738x_trace_ids[slot] = 0xffff;
+		}
+
+	memset(point_data, 0, 2 + GOODIX_MAX_CONTACT_SIZE * GOODIX_MAX_CONTACTS);
+	finger_num = 0;
+	for (i = 0; i < touch_num; i++) {
+		u8 *record = &buf[header_size +
+				   GOODIX_GT738X_CONTACT_SIZE * i];
+		u8 *dest = &point_data[1 + GOODIX_CONTACT_SIZE * finger_num];
+		u16 trace_id = record[0];
+
+		if (ts->gt738x_j716f_mode && !get_unaligned_le16(&record[5]))
+			continue;
+
+		for (slot = 0; slot < ts->max_touch_num; slot++)
+			if (ts->gt738x_trace_ids[slot] == trace_id)
+				break;
+		if (slot == ts->max_touch_num) {
+			for (slot = 0; slot < ts->max_touch_num; slot++)
+				if (ts->gt738x_trace_ids[slot] == 0xffff)
+					break;
+			if (slot == ts->max_touch_num) {
+				dev_warn_ratelimited(&ts->client->dev,
+						     "no GT738x slot for trace ID %u\n",
+						     trace_id);
+				return -EPROTO;
+			}
+			ts->gt738x_trace_ids[slot] = trace_id;
+		}
+		dest[0] = slot;
+		if (ts->gt738x_j716f_mode) {
+			memcpy(&dest[1], &record[1], 6);
+		} else {
+			put_unaligned_le16(get_unaligned_be16(&record[1]), &dest[1]);
+			put_unaligned_le16(get_unaligned_be16(&record[3]), &dest[3]);
+			put_unaligned_le16(get_unaligned_be16(&record[5]), &dest[5]);
+		}
+		finger_num++;
+	}
+	point_data[0] = finger_num;
+	return finger_num;
+}
+
 static void goodix_process_events(struct goodix_ts_data *ts)
 {
 	u8  point_data[2 + GOODIX_MAX_CONTACT_SIZE * GOODIX_MAX_CONTACTS];
 	int touch_num;
 	int i;
 
-	touch_num = goodix_ts_read_input_report(ts, point_data);
-	if (touch_num < 0)
+	memset(point_data, 0, sizeof(point_data));
+	if (ts->gt738x_mode)
+		touch_num = goodix_gt738x_read_report(ts, point_data);
+	else
+		touch_num = goodix_ts_read_input_report(ts, point_data);
+	if (touch_num < 0) {
+		if (ts->gt738x_mode && touch_num != -EBADMSG &&
+		    touch_num != -EPROTO && touch_num != -EAGAIN)
+			dev_warn_ratelimited(&ts->client->dev,
+					     "GT738x report read failed: %d\n",
+					     touch_num);
 		return;
+	}
+
+	/* A reused slot must get a new Linux tracking ID in this same frame. */
+	if (ts->gt738x_mode)
+		for (i = 0; i < ts->max_touch_num; i++)
+			if (ts->gt738x_released_slots & BIT(i)) {
+				input_mt_slot(ts->input_dev, i);
+				input_mt_report_slot_state(ts->input_dev,
+							   MT_TOOL_FINGER, false);
+			}
 
 	/* The pen being down is always reported as a single touch */
 	if (touch_num == 1 && (point_data[1] & 0x80)) {
@@ -484,7 +746,10 @@ static void goodix_process_events(struct goodix_ts_data *ts)
 		goodix_ts_report_pen_up(ts);
 	}
 
-	goodix_ts_report_key(ts, point_data);
+	if (ts->gt738x_mode)
+		goodix_ts_release_keys(ts);
+	else
+		goodix_ts_report_key(ts, point_data);
 
 	for (i = 0; i < touch_num; i++)
 		if (ts->contact_size == 9)
@@ -492,7 +757,8 @@ static void goodix_process_events(struct goodix_ts_data *ts)
 				&point_data[1 + ts->contact_size * i]);
 		else
 			goodix_ts_report_touch_8b(ts,
-				&point_data[1 + ts->contact_size * i]);
+				&point_data[1 + ts->contact_size * i],
+				ts->gt738x_mode);
 
 sync:
 	input_mt_sync_frame(ts->input_dev);
@@ -516,9 +782,17 @@ static void goodix_ts_work_i2c_poll(struct input_dev *input)
 static irqreturn_t goodix_ts_irq_handler(int irq, void *dev_id)
 {
 	struct goodix_ts_data *ts = dev_id;
+	u8 clear_report[2] = {};
 
 	goodix_process_events(ts);
-	goodix_i2c_write_u8(ts->client, GOODIX_READ_COOR_ADDR, 0);
+	/* J716F's single status byte is followed immediately by the trace ID. */
+	if (ts->gt738x_j716f_mode)
+		goodix_i2c_write_u8(ts->client, GOODIX_GT738X_COOR_ADDR, 0);
+	else if (ts->gt738x_mode)
+		goodix_i2c_write(ts->client, GOODIX_GT738X_COOR_ADDR,
+				 clear_report, sizeof(clear_report));
+	else
+		goodix_i2c_write_u8(ts->client, GOODIX_READ_COOR_ADDR, 0);
 
 	return IRQ_HANDLED;
 }
@@ -978,6 +1252,13 @@ static int goodix_get_gpio_config(struct goodix_ts_data *ts)
 	if (IS_ERR(ts->vddio))
 		return dev_err_probe(dev, PTR_ERR(ts->vddio), "Failed to get VDDIO regulator\n");
 
+	/* optional third rail (vendor avdd = VDD core 1.8V on J716F) */
+	ts->vdd = devm_regulator_get_optional(dev, "avdd");
+	if (PTR_ERR(ts->vdd) == -ENODEV)
+		ts->vdd = NULL;
+	else if (IS_ERR(ts->vdd))
+		return PTR_ERR(ts->vdd);
+
 retry_get_irq_gpio:
 	/* Get the interrupt GPIO pin number */
 	gpiod = devm_gpiod_get_optional(dev, GOODIX_GPIO_INT_NAME, GPIOD_IN);
@@ -1304,6 +1585,8 @@ static void goodix_disable_regulators(void *arg)
 
 	regulator_disable(ts->vddio);
 	regulator_disable(ts->avdd28);
+	if (!IS_ERR_OR_NULL(ts->vdd))
+		regulator_disable(ts->vdd);
 }
 
 static int goodix_ts_probe(struct i2c_client *client)
@@ -1350,6 +1633,13 @@ static int goodix_ts_probe(struct i2c_client *client)
 		return error;
 	}
 
+	/* optional third rail; Lenovo J716F GT7385P needs VDD 1.8V (LDOC1) */
+	if (!IS_ERR_OR_NULL(ts->vdd)) {
+		error = regulator_enable(ts->vdd);
+		if (error)
+			return error;
+	}
+
 	error = devm_add_action_or_reset(&client->dev,
 					 goodix_disable_regulators, ts);
 	if (error)
@@ -1384,6 +1674,38 @@ reset:
 		return error;
 
 	ts->chip = goodix_get_chip_data(ts->id);
+
+	/*
+	 * Lenovo TB-J716F (GT7385P): this part keeps its configuration at
+	 * 0x8050 - the GT1x layout - not at 0x8047 (GT9x).
+	 *
+	 * Verified by reading the chip back: 0x8050 returns
+	 *
+	 *   99 02 65 01 cf 0a 00 0a 40 06 af 09 0e 06 75 90
+	 *
+	 * which is byte-for-byte the start of the per-panel blob inside the
+	 * vendor's goodix_cfg_group.bin. With the default gt9x_chip_data the
+	 * driver wrote the same blob nine bytes too high, so the chip kept
+	 * its own copy and the "config sent successfully" message was
+	 * misleading.
+	 *
+	 * The chip id reported by this part is not in goodix_chip_ids[],
+	 * so goodix_get_chip_data() falls back to gt9x_chip_data; override
+	 * it here. GT738x reports are read from its 0x824E event block using the
+	 * protocol documented in Goodix's public GT738x Linux driver.
+	 */
+	if (of_device_is_compatible(client->dev.of_node, "goodix,gt738x") ||
+	    of_device_is_compatible(client->dev.of_node, "goodix,gt7385p")) {
+		ts->gt738x_mode = true;
+		ts->gt738x_j716f_mode = of_machine_is_compatible("lenovo,j716f");
+		ts->gt738x_debug = of_property_read_bool(client->dev.of_node,
+							 "goodix,debug-reports");
+		ts->chip = &gt1x_chip_data;
+		dev_info(&client->dev,
+			 "GT738x config at 0x%04x, reports at 0x%04x%s\n",
+			 ts->chip->config_addr, GOODIX_GT738X_COOR_ADDR,
+			 ts->gt738x_j716f_mode ? " (J716F report format)" : "");
+	}
 
 	if (ts->load_cfg_from_disk) {
 		/* update device config */
@@ -1556,6 +1878,15 @@ static const struct of_device_id goodix_of_match[] = {
 	{ .compatible = "goodix,gt928" },
 	{ .compatible = "goodix,gt9286" },
 	{ .compatible = "goodix,gt967" },
+	/*
+	 * Lenovo TB-J716F (Xiaoxin Pad Pro 2021): GT7385P. The vendor kernel
+	 * drives this part with its own goodix_ts "GTP" driver, whose debug
+	 * strings ("[GTP-ERR] I2c read failed,dev:%02x,reg:%04x") show 16-bit
+	 * register addresses - i.e. the GT9xx protocol this driver speaks, not
+	 * the Goodix Berlin protocol (32-bit addresses) that
+	 * goodix_berlin_i2c.c implements. Recovered from the stock boot.img.
+	 */
+	{ .compatible = "goodix,gt738x" },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, goodix_of_match);

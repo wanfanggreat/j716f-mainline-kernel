@@ -504,6 +504,33 @@ static int dsi_pll_7nm_vco_prepare(struct clk_hw *hw)
 	writel(BIT(0), pll_7nm->phy->base + REG_DSI_7nm_PHY_CMN_PLL_CNTRL);
 
 	/*
+	 * Mirror the master's post-dividers onto the bonded slave.
+	 *
+	 * CLK_CFG0 holds bit_clk_div (bits 0-3) and pix_clk_div (bits 4-7).
+	 * It is written in exactly one place -- dsi_pll_cmn_clk_cfg0_write() --
+	 * which is only reachable from dsi_7nm_pll_restore_state(), and that
+	 * requires phy->state_saved, which save_pll_state() only sets for the
+	 * master PHY (dsi_mgr_bridge_post_disable()). On a fresh enable the
+	 * slave therefore keeps its reset dividers, so copy just the divider
+	 * fields across from the master.
+	 */
+	if (pll_7nm->slave) {
+		const u32 div_mask =
+			DSI_7nm_PHY_CMN_CLK_CFG0_DIV_CTRL_3_0__MASK |
+			DSI_7nm_PHY_CMN_CLK_CFG0_DIV_CTRL_7_4__MASK;
+		void __iomem *mbase = pll_7nm->phy->base;
+		void __iomem *sbase = pll_7nm->slave->phy->base;
+		u32 m = readl(mbase + REG_DSI_7nm_PHY_CMN_CLK_CFG0);
+		u32 s = readl(sbase + REG_DSI_7nm_PHY_CMN_CLK_CFG0);
+
+		if ((m & div_mask) != (s & div_mask)) {
+			writel((s & ~div_mask) | (m & div_mask),
+			       sbase + REG_DSI_7nm_PHY_CMN_CLK_CFG0);
+			wmb();
+		}
+	}
+
+	/*
 	 * ensure all PLL configurations are written prior to checking
 	 * for PLL lock.
 	 */
@@ -878,13 +905,33 @@ static int dsi_pll_7nm_init(struct msm_dsi_phy *phy)
 	pll_7nm->phy = phy;
 	phy->pll_data = pll_7nm;
 
+	phy->vco_hw = &pll_7nm->clk_hw;
+
+	/*
+	 * Program a valid default VCO configuration before the clock provider
+	 * is registered.
+	 *
+	 * The clock core reparents the dispcc DSI gate clocks to this provider
+	 * as soon as it appears, and their CLK_SET_RATE_UNGATE path prepares
+	 * the PLL.  If the PLL registers still hold their reset values the
+	 * prepare cannot lock (status 0) and the divider recalculation warns
+	 * about a zero divisor.
+	 *
+	 * Doing this through clk_set_rate() is wrong: that propagates the rate
+	 * change down into the dispcc children while their own divider
+	 * registers are still zero, which is exactly what produced the
+	 * zero-divisor warnings and the failed PLL lock in the first place.
+	 * Program the PLL registers directly instead; the DSI host still
+	 * reprograms the real panel rate later.
+	 */
+	dsi_pll_7nm_vco_set_rate(&pll_7nm->clk_hw, phy->cfg->min_pll_rate,
+				 VCO_REF_CLK_RATE);
+
 	ret = pll_7nm_register(pll_7nm, phy->provided_clocks->hws);
 	if (ret) {
 		DRM_DEV_ERROR(&pdev->dev, "failed to register PLL: %d\n", ret);
 		return ret;
 	}
-
-	phy->vco_hw = &pll_7nm->clk_hw;
 
 	/* TODO: Remove this when we have proper display handover support */
 	msm_dsi_phy_pll_save_state(phy);

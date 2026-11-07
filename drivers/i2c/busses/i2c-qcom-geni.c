@@ -1091,7 +1091,15 @@ static int geni_i2c_init(struct geni_i2c_dev *gi2c)
 		goto err;
 	}
 
-	if (gi2c->dev_data->no_dma_support) {
+	if (of_property_read_bool(gi2c->se.dev->of_node, "qcom,force-fifo")) {
+		/*
+		 * J716F touch bus: the GPI DMA path times out for every
+		 * transfer; force the FIFO/PIO path.  This is a temporary
+		 * workaround for the GT738x touch controller.
+		 */
+		fifo_disable = false;
+		gi2c->no_dma = true;
+	} else if (gi2c->dev_data->no_dma_support) {
 		fifo_disable = false;
 		gi2c->no_dma = true;
 	} else {

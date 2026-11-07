@@ -75,6 +75,7 @@ struct f_ncm {
 	struct sk_buff			*skb_tx_data;
 	struct sk_buff			*skb_tx_ndp;
 	u16				ndp_dgram_count;
+	bool				tx_immediate;
 	struct hrtimer			task_timer;
 };
 
@@ -105,6 +106,19 @@ static inline struct f_ncm *func_to_ncm(struct usb_function *f)
 
 /* Delay for the transmit to wait before sending an unfilled NTB frame. */
 #define TX_TIMEOUT_NSECS	300000
+
+/*
+ * Lenovo J716F: netconsole needs the frame to leave the gadget in the same
+ * call that netpoll makes.  The normal NCM path buffers it into an NTB and
+ * waits for a soft hrtimer, which only runs after interrupts are enabled
+ * again and never runs during a panic.  Flushing one datagram per NTB costs
+ * a few more USB transfers but makes netpoll/netconsole work and keeps the
+ * console usable in panic context.
+ */
+static bool tx_immediate = true;
+module_param(tx_immediate, bool, 0644);
+MODULE_PARM_DESC(tx_immediate,
+		 "Send each Ethernet frame immediately instead of aggregating");
 
 /*
  * Although max mtu as dictated by u_ether is 15412 bytes, setting
@@ -1115,6 +1129,20 @@ static struct sk_buff *ncm_wrap_ntb(struct gether *port,
 		dev_consume_skb_any(skb);
 		skb = NULL;
 
+		/*
+		 * In immediate mode the NTB is packaged and returned right
+		 * away, so skb_tx_data is NULL at the top of the next call
+		 * and the "NTB full" branch above cannot have produced skb2.
+		 * This is what makes netconsole (netpoll) work: the caller
+		 * queues the returned NTB synchronously instead of waiting
+		 * for the soft hrtimer.
+		 */
+		if (ncm->tx_immediate) {
+			skb2 = package_for_tx(ncm);
+			if (!skb2)
+				goto err;
+		}
+
 	} else if (ncm->skb_tx_data) {
 		/* If we get here ncm_wrap_ntb() was called with NULL skb,
 		 * because eth_start_xmit() was called with NULL skb by
@@ -1785,6 +1813,7 @@ static struct usb_function *ncm_alloc(struct usb_function_instance *fi)
 
 	spin_lock_init(&ncm->lock);
 	ncm_reset_values(ncm);
+	ncm->tx_immediate = tx_immediate;
 	ncm->port.ioport = netdev_priv(opts->net);
 	mutex_unlock(&opts->lock);
 	ncm->port.is_fixed = true;

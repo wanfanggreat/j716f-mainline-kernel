@@ -83,6 +83,15 @@
 #define QUEUE_SIZE		16
 #define WRITE_BUF_SIZE		8192		/* TX only */
 #define GS_CONSOLE_BUF_SIZE	8192
+/*
+ * Lenovo J716F: panic() disables IRQs before it prints, so the UDC
+ * completion handler never runs and a single request carries only the
+ * first line of the oops.  Keep a pool of requests whose buffers are
+ * filled and queued from the console write path; the controller walks
+ * the TRB ring without needing a completion interrupt.
+ */
+#define GS_PANIC_REQ_COUNT	40
+#define GS_PANIC_FLUSH_SIZE	6144
 
 /* Prevents race conditions while accessing gser->ioport */
 static DEFINE_SPINLOCK(serial_port_lock);
@@ -95,6 +104,12 @@ struct gs_console {
 	struct usb_request	*req;
 	struct kfifo		buf;
 	size_t			missed;
+	bool			panic_started;
+	bool			panic_first;
+	unsigned int		panic_req_next;
+	unsigned int		panic_req_count;
+	struct usb_request	*panic_req[GS_PANIC_REQ_COUNT];
+	char			*panic_buf[GS_PANIC_REQ_COUNT];
 };
 
 /*
@@ -964,7 +979,7 @@ static void __gs_console_push(struct gs_console *cons)
 		return;	/* busy */
 
 	ep = cons->console.data;
-	size = kfifo_out(&cons->buf, req->buf, ep->maxpacket);
+	size = kfifo_out(&cons->buf, req->buf, GS_CONSOLE_BUF_SIZE);
 	if (!size)
 		return;
 
@@ -996,6 +1011,71 @@ static void gs_console_work(struct work_struct *work)
 	spin_unlock_irq(&cons->lock);
 }
 
+/*
+ * Lenovo J716F: panic() calls local_irq_disable() before it prints the oops,
+ * so the UDC completion handler never runs and the single console request is
+ * never recycled.  The controller can still walk several TRBs that are
+ * already in the ring, so fill the preallocated pool one request at a time
+ * and queue each one directly.  The caller holds cons->lock with IRQs off.
+ */
+static void gs_console_panic_flush(struct gs_console *cons)
+{
+	struct usb_ep *ep = cons->console.data;
+	struct usb_request *req;
+	size_t size;
+	int ret;
+
+	while (cons->panic_req_next < cons->panic_req_count) {
+		req = cons->panic_req[cons->panic_req_next];
+		if (!req || !ep)
+			return;
+
+		size = kfifo_out(&cons->buf, req->buf, GS_CONSOLE_BUF_SIZE);
+		if (!size)
+			return;
+
+		req->length = size;
+		cons->panic_req_next++;
+
+		spin_unlock(&cons->lock);
+		ret = usb_ep_queue(ep, req, GFP_ATOMIC);
+		spin_lock(&cons->lock);
+		if (ret) {
+			req->length = 0;
+			cons->panic_req_next = cons->panic_req_count;
+			return;
+		}
+
+		if (size < GS_CONSOLE_BUF_SIZE)
+			return;
+	}
+}
+
+static bool gs_console_has(const char *buf, unsigned int count,
+			   const char *needle, unsigned int nlen)
+{
+	unsigned int i;
+
+	if (count < nlen)
+		return false;
+
+	for (i = 0; i <= count - nlen; i++)
+		if (!memcmp(buf + i, needle, nlen))
+			return true;
+
+	return false;
+}
+
+/*
+ * panic() prints this after the panic_print replay and then waits
+ * panic_timeout seconds; flushing here gets the tail out before the reboot.
+ */
+static bool gs_console_panic_end(const char *buf, unsigned int count)
+{
+	return gs_console_has(buf, count, "Rebooting in", 12) ||
+	       gs_console_has(buf, count, "end Kernel panic", 16);
+}
+
 static void gs_console_write(struct console *co,
 			     const char *buf, unsigned count)
 {
@@ -1005,9 +1085,49 @@ static void gs_console_write(struct console *co,
 
 	spin_lock_irqsave(&cons->lock, flags);
 
+	/*
+	 * Lenovo J716F: the 8 KiB fifo normally holds recent normal logs.
+	 * If a panic starts, drop them once so the first request that is
+	 * queued directly carries the panic header, not old messages.
+	 */
+	if (oops_in_progress) {
+		if (!cons->panic_started) {
+			kfifo_reset(&cons->buf);
+			cons->panic_started = true;
+			cons->panic_first = true;
+		}
+
+		if (kfifo_avail(&cons->buf) < count)
+			gs_console_panic_flush(cons);
+
+		n = kfifo_in(&cons->buf, buf, count);
+		if (n < count)
+			cons->missed += count - n;
+
+		/*
+		 * Send the first record immediately (the panic header), then
+		 * coalesce the backtraces into ~7 KiB requests so the 40
+		 * preallocated requests cover far more than the 128 KiB
+		 * printk ring buffer.  The end marker flushes the tail.
+		 */
+		if (cons->panic_first ||
+		    kfifo_len(&cons->buf) >= GS_PANIC_FLUSH_SIZE ||
+		    gs_console_panic_end(buf, count)) {
+			gs_console_panic_flush(cons);
+			cons->panic_first = false;
+		}
+
+		spin_unlock_irqrestore(&cons->lock, flags);
+		return;
+	}
+
 	n = kfifo_in(&cons->buf, buf, count);
 	if (n < count)
 		cons->missed += count - n;
+
+	if (cons->panic_started &&
+	    cons->req && !cons->req->length && kfifo_is_empty(&cons->buf))
+		cons->panic_started = false;
 
 	if (cons->req && !cons->req->length)
 		schedule_work(&cons->work);
@@ -1026,12 +1146,13 @@ static int gs_console_connect(struct gs_port *port)
 	struct gs_console *cons = port->console;
 	struct usb_request *req;
 	struct usb_ep *ep;
+	unsigned int i;
 
 	if (!cons)
 		return 0;
 
 	ep = port->port_usb->in;
-	req = gs_alloc_req(ep, ep->maxpacket, GFP_ATOMIC);
+	req = gs_alloc_req(ep, GS_CONSOLE_BUF_SIZE, GFP_ATOMIC);
 	if (!req)
 		return -ENOMEM;
 	req->complete = gs_console_complete_out;
@@ -1041,7 +1162,30 @@ static int gs_console_connect(struct gs_port *port)
 	spin_lock(&cons->lock);
 	cons->req = req;
 	cons->console.data = ep;
+
+	cons->panic_req_next = 0;
+	cons->panic_req_count = 0;
+	cons->panic_first = false;
+	cons->panic_started = false;
+	for (i = 0; i < GS_PANIC_REQ_COUNT; i++) {
+		if (!cons->panic_buf[i])
+			break;
+		req = usb_ep_alloc_request(ep, GFP_ATOMIC);
+		if (!req)
+			break;
+		req->buf = cons->panic_buf[i];
+		req->length = 0;
+		req->complete = NULL;
+		req->context = cons;
+		cons->panic_req[i] = req;
+		cons->panic_req_count++;
+	}
 	spin_unlock(&cons->lock);
+
+	if (cons->panic_req_count < GS_PANIC_REQ_COUNT)
+		pr_warn("ttyGS%d: only %u/%u panic requests available\n",
+			port->port_num, cons->panic_req_count,
+			GS_PANIC_REQ_COUNT);
 
 	pr_debug("ttyGS%d: console connected!\n", port->port_num);
 
@@ -1054,7 +1198,9 @@ static void gs_console_disconnect(struct gs_port *port)
 {
 	struct gs_console *cons = port->console;
 	struct usb_request *req;
+	struct usb_request *pool[GS_PANIC_REQ_COUNT];
 	struct usb_ep *ep;
+	unsigned int i, count = 0;
 
 	if (!cons)
 		return;
@@ -1064,19 +1210,33 @@ static void gs_console_disconnect(struct gs_port *port)
 	req = cons->req;
 	ep = cons->console.data;
 	cons->req = NULL;
+	cons->console.data = NULL;
+	for (i = 0; i < cons->panic_req_count; i++) {
+		if (!cons->panic_req[i])
+			continue;
+		pool[count++] = cons->panic_req[i];
+		cons->panic_req[i] = NULL;
+	}
+	cons->panic_req_count = 0;
+	cons->panic_req_next = 0;
 
 	spin_unlock(&cons->lock);
 
-	if (!req)
-		return;
+	if (req) {
+		usb_ep_dequeue(ep, req);
+		gs_free_req(ep, req);
+	}
 
-	usb_ep_dequeue(ep, req);
-	gs_free_req(ep, req);
+	for (i = 0; i < count; i++) {
+		usb_ep_dequeue(ep, pool[i]);
+		usb_ep_free_request(ep, pool[i]);
+	}
 }
 
 static int gs_console_init(struct gs_port *port)
 {
 	struct gs_console *cons;
+	unsigned int i;
 	int err;
 
 	if (port->console)
@@ -1102,6 +1262,19 @@ static int gs_console_init(struct gs_port *port)
 		return err;
 	}
 
+	/*
+	 * Allocate the panic request buffers here, where sleeping is allowed;
+	 * the usb_request wrappers are bound to the endpoint at connect time.
+	 */
+	for (i = 0; i < GS_PANIC_REQ_COUNT; i++) {
+		cons->panic_buf[i] = kmalloc(GS_CONSOLE_BUF_SIZE, GFP_KERNEL);
+		if (!cons->panic_buf[i]) {
+			pr_warn("ttyGS%d: only %u/%u panic buffers allocated\n",
+				port->port_num, i, GS_PANIC_REQ_COUNT);
+			break;
+		}
+	}
+
 	port->console = cons;
 	register_console(&cons->console);
 
@@ -1116,6 +1289,7 @@ static int gs_console_init(struct gs_port *port)
 static void gs_console_exit(struct gs_port *port)
 {
 	struct gs_console *cons = port->console;
+	unsigned int i;
 
 	if (!cons)
 		return;
@@ -1129,6 +1303,10 @@ static void gs_console_exit(struct gs_port *port)
 
 	cancel_work_sync(&cons->work);
 	kfifo_free(&cons->buf);
+	for (i = 0; i < GS_PANIC_REQ_COUNT; i++) {
+		kfree(cons->panic_buf[i]);
+		cons->panic_buf[i] = NULL;
+	}
 	kfree(cons);
 	port->console = NULL;
 }

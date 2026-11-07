@@ -184,6 +184,9 @@ struct rpmh_vreg {
  *				LDO, VS, based on the regulator HW type.
  * @supply_name:		Parent supply regulator name
  * @hw_data:			Configuration data for this PMIC regulator type
+ * @resource_name:		Optional explicit RPMh resource name.  The generic
+ *				LDO/SMPS name formats cannot express PM8150A's
+ *				"ldocN" resources.
  */
 struct rpmh_vreg_init_data {
 	const char			*name;
@@ -191,6 +194,7 @@ struct rpmh_vreg_init_data {
 	int				index;
 	const char			*supply_name;
 	const struct rpmh_vreg_hw_data	*hw_data;
+	const char			*resource_name;
 };
 
 /**
@@ -517,7 +521,10 @@ static int rpmh_regulator_init_vreg(struct rpmh_vreg *vreg, struct device *dev,
 		return -EINVAL;
 	}
 
-	if (strnlen(pmic_id, PMIC_ID_LEN) > 1 && strnstr(pmic_id, "_E", PMIC_ID_LEN)) {
+	if (rpmh_data->resource_name) {
+		scnprintf(rpmh_resource_name, sizeof(rpmh_resource_name),
+			  "%s", rpmh_data->resource_name);
+	} else if (strnlen(pmic_id, PMIC_ID_LEN) > 1 && strnstr(pmic_id, "_E", PMIC_ID_LEN)) {
 		rsc_name = vreg_rsc_name_lookup[rpmh_data->vreg_hw_type].rsc_name_fmt;
 		scnprintf(rpmh_resource_name, sizeof(rpmh_resource_name),
 			  rsc_name, rpmh_data->index, pmic_id);
@@ -1171,6 +1178,16 @@ static const struct rpmh_vreg_hw_data pmic5_ftsmps530 = {
 	.supply_name	= _supply_name, \
 }
 
+#define RPMH_VREG_NAMED(_name, _vreg_hw_type, _index, _hw_data, _supply_name, _rsc) \
+{ \
+	.name		= _name, \
+	.vreg_hw_type	= _vreg_hw_type, \
+	.index		= _index, \
+	.hw_data	= _hw_data, \
+	.supply_name	= _supply_name, \
+	.resource_name	= _rsc, \
+}
+
 static const struct rpmh_vreg_init_data pm8998_vreg_data[] = {
 	RPMH_VREG("smps1",  SMPS, 1,  &pmic4_ftsmps426, "vdd-s1"),
 	RPMH_VREG("smps2",  SMPS, 2,  &pmic4_ftsmps426, "vdd-s2"),
@@ -1304,6 +1321,28 @@ static const struct rpmh_vreg_init_data pm8150l_vreg_data[] = {
 	RPMH_VREG("ldo10",  LDO,  10, &pmic5_pldo,      "vdd-l9-l10"),
 	RPMH_VREG("ldo11",  LDO,  11, &pmic5_pldo,      "vdd-l7-l11"),
 	RPMH_VREG("bob",    BOB,  1, &pmic5_bob,       "vdd-bob"),
+	{}
+};
+
+/*
+ * PM8150A LDOs are exposed as "ldocN" RPMh resources.  The generic LDO name
+ * format ("ldo%s%d") cannot express these, so use explicit resource names.
+ * The J716F touch controller's 1.8 V core rail is ldoc1 and the fingerprint
+ * sensor uses ldoc10.
+ */
+static const struct rpmh_vreg_init_data pm8150a_ldoc_vreg_data[] = {
+	RPMH_VREG_NAMED("ldoc1",  LDO,  1, &pmic5_pldo, "vdd-l1-l2",      "ldoc1"),
+	RPMH_VREG_NAMED("ldoc2",  LDO,  2, &pmic5_pldo, "vdd-l1-l2",      "ldoc2"),
+	RPMH_VREG_NAMED("ldoc3",  LDO,  3, &pmic5_pldo, "vdd-l3",         "ldoc3"),
+	RPMH_VREG_NAMED("ldoc4",  LDO,  4, &pmic5_pldo, "vdd-l4-l5-l6",   "ldoc4"),
+	RPMH_VREG_NAMED("ldoc5",  LDO,  5, &pmic5_pldo, "vdd-l4-l5-l6",   "ldoc5"),
+	RPMH_VREG_NAMED("ldoc6",  LDO,  6, &pmic5_pldo, "vdd-l4-l5-l6",   "ldoc6"),
+	RPMH_VREG_NAMED("ldoc7",  LDO,  7, &pmic5_pldo, "vdd-l7",         "ldoc7"),
+	RPMH_VREG_NAMED("ldoc8",  LDO,  8, &pmic5_pldo, "vdd-l8",         "ldoc8"),
+	RPMH_VREG_NAMED("ldoc9",  LDO,  9, &pmic5_pldo, "vdd-l9-l10",     "ldoc9"),
+	RPMH_VREG_NAMED("ldoc10", LDO, 10, &pmic5_pldo, "vdd-l9-l10",     "ldoc10"),
+	RPMH_VREG_NAMED("ldoc11", LDO, 11, &pmic5_pldo, "vdd-l11",        "ldoc11"),
+	RPMH_VREG_NAMED("ldoc12", LDO, 12, &pmic5_pldo, "vdd-l12",        "ldoc12"),
 	{}
 };
 
@@ -1992,6 +2031,10 @@ static const struct of_device_id __maybe_unused rpmh_regulator_match_table[] = {
 	{
 		.compatible = "qcom,pm8150l-rpmh-regulators",
 		.data = pm8150l_vreg_data,
+	},
+	{
+		.compatible = "qcom,pm8150a-ldoc-rpmh-regulators",
+		.data = pm8150a_ldoc_vreg_data,
 	},
 	{
 		.compatible = "qcom,pm8350-rpmh-regulators",

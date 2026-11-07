@@ -1211,8 +1211,30 @@ static irqreturn_t qcom_geni_serial_isr(int isr, void *dev)
 	struct tty_port *tport = &uport->state->port;
 	struct qcom_geni_serial_port *port = to_dev_port(uport);
 
-	if (uport->suspended)
-		return IRQ_NONE;
+	/*
+	 * Lenovo J716F: uart_suspend_port() sets uport->suspended before it
+	 * calls stop_tx()/stop_rx(), so a level-triggered status bit can
+	 * still assert in that window.  Returning IRQ_NONE for it lets
+	 * note_interrupt() disable the IRQ for good: after one real s2idle
+	 * the Bluetooth UART (998000.serial, IRQ 163) stayed masked and the
+	 * QCA6390 was unreachable until reboot.  Acknowledge and clear the
+	 * status here instead.  Once the port is runtime-suspended the IRQ
+	 * is masked by qcom_geni_serial_shutdown(), so this never touches
+	 * registers of a powered-off block.
+	 */
+	if (uport->suspended) {
+		if (!pm_runtime_status_suspended(uport->dev)) {
+			writel(readl(uport->membase + SE_GENI_S_IRQ_STATUS),
+			       uport->membase + SE_GENI_S_IRQ_CLEAR);
+			writel(readl(uport->membase + SE_GENI_M_IRQ_STATUS),
+			       uport->membase + SE_GENI_M_IRQ_CLEAR);
+			writel(readl(uport->membase + SE_DMA_RX_IRQ_STAT),
+			       uport->membase + SE_DMA_RX_IRQ_CLR);
+			writel(readl(uport->membase + SE_DMA_TX_IRQ_STAT),
+			       uport->membase + SE_DMA_TX_IRQ_CLR);
+		}
+		return IRQ_HANDLED;
+	}
 
 	uart_port_lock(uport);
 

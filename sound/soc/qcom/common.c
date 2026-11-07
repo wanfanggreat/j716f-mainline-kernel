@@ -297,9 +297,22 @@ int qcom_snd_parse_of(struct snd_soc_card *card)
 			}
 
 			if (platform) {
-				/* DPCM backend */
-				link->no_pcm = 1;
-				link->ignore_pmdown_time = 1;
+				/*
+				 * Lenovo J716F: a DPCM backend shares the
+				 * frontend's runtime but is not that runtime's
+				 * trigger_master, so snd_pcm_do_start() skips it
+				 * and runtime->state never reaches RUNNING.
+				 * snd_pcm_period_elapsed() then refuses to
+				 * advance hw_ptr and capture fails with -EIO
+				 * although the DSP is delivering data. Links
+				 * that carry their own PCM device can opt out
+				 * of DPCM while still listing a platform (the
+				 * q6routing component that programs ADM).
+				 */
+				if (!of_property_read_bool(np, "qcom,no-dpcm-backend")) {
+					link->no_pcm = 1;
+					link->ignore_pmdown_time = 1;
+				}
 			}
 		} else {
 			/* DPCM frontend */

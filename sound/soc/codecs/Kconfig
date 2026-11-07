@@ -1274,6 +1274,10 @@ config SND_SOC_ES7134
 config SND_SOC_ES7241
 	tristate "Everest Semi ES7241 CODEC"
 
+config SND_SOC_ES7210
+	tristate "Everest Semi ES7210 ADC"
+	depends on I2C
+
 config SND_SOC_ES83XX_DSM_COMMON
 	depends on ACPI
 	tristate

@@ -51,11 +51,15 @@
 #define GOODIX_GT9X_REG_CONFIG_DATA		0x8047
 #define GOODIX_REG_ID				0x8140
 #define GOODIX_READ_COOR_ADDR			0x814E
+
+/* GT738x uses its own event report layout, based at 0x824E. */
+#define GOODIX_GT738X_COOR_ADDR			0x824E
 #define GOODIX_REG_BAK_REF			0x99D0
 
 #define GOODIX_ID_MAX_LEN			4
 #define GOODIX_CONFIG_MAX_LENGTH		240
 #define GOODIX_MAX_KEYS				7
+#define GOODIX_MAX_CONTACTS			10
 
 enum goodix_irq_pin_access_method {
 	IRQ_PIN_ACCESS_NONE,
@@ -84,6 +88,7 @@ struct goodix_ts_data {
 	unsigned int int_trigger_type;
 	struct regulator *avdd28;
 	struct regulator *vddio;
+	struct regulator *vdd;
 	struct gpio_desc *gpiod_int;
 	struct gpio_desc *gpiod_rst;
 	int gpio_count;
@@ -98,6 +103,14 @@ struct goodix_ts_data {
 	unsigned long irq_flags;
 	enum goodix_irq_pin_access_method irq_pin_access_method;
 	unsigned int contact_size;
+	/* GT738x reports touch events from its vendor-defined 0x824E block. */
+	bool gt738x_mode;
+	/* J716F firmware puts the active-contact count in status byte 0. */
+	bool gt738x_j716f_mode;
+	bool gt738x_debug;
+	bool gt738x_trace_ids_initialized;
+	u16 gt738x_trace_ids[GOODIX_MAX_CONTACTS];
+	u16 gt738x_released_slots;
 	u8 config[GOODIX_CONFIG_MAX_LENGTH];
 	unsigned short keymap[GOODIX_MAX_KEYS];
 	u8 main_clk[GOODIX_MAIN_CLK_LEN];
