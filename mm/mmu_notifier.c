@@ -11,6 +11,7 @@
 #include <linux/mmu_notifier.h>
 #include <linux/export.h>
 #include <linux/mm.h>
+#include <soc/qcom/j716f-diag.h>
 #include <linux/err.h>
 #include <linux/interval_tree.h>
 #include <linux/srcu.h>
@@ -378,11 +379,13 @@ void __mmu_notifier_release(struct mm_struct *mm)
 	struct mmu_notifier_subscriptions *subscriptions =
 		mm->notifier_subscriptions;
 
+	j716f_bc(J716F_BC_MM_NOTIFIER_RELEASE_ENTER, (unsigned long)mm);
 	if (subscriptions->has_itree)
 		mn_itree_release(subscriptions, mm);
 
 	if (!hlist_empty(&subscriptions->list))
 		mn_hlist_release(subscriptions, mm);
+	j716f_bc(J716F_BC_MM_NOTIFIER_RELEASE_EXIT, (unsigned long)mm);
 }
 
 /*

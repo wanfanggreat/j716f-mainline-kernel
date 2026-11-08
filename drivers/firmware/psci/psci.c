@@ -20,6 +20,8 @@
 #include <linux/slab.h>
 #include <linux/suspend.h>
 
+#include <soc/qcom/j716f-diag.h>
+
 #include <uapi/linux/psci.h>
 
 #include <asm/cpuidle.h>
@@ -502,6 +504,7 @@ int psci_cpu_suspend_enter(u32 state)
 {
 	int ret;
 
+	j716f_bc(J716F_BC_PSCI_SUSPEND_ENTER, state);
 	if (!psci_power_state_loses_context(state)) {
 		struct arm_cpuidle_irq_context context;
 
@@ -523,6 +526,7 @@ int psci_cpu_suspend_enter(u32 state)
 			ct_cpuidle_exit();
 	}
 
+	j716f_bc(J716F_BC_PSCI_SUSPEND_EXIT, (unsigned long)ret);
 	return ret;
 }
 #endif

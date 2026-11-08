@@ -8,6 +8,8 @@
 #define __RPM_INTERNAL_H__
 
 #include <linux/bitmap.h>
+#include <linux/completion.h>
+#include <linux/refcount.h>
 #include <linux/wait.h>
 #include <soc/qcom/tcs.h>
 
@@ -59,14 +61,16 @@ struct tcs_group {
  * @cmd: the payload that will be part of the @msg
  * @completion: triggered when request is done
  * @dev: the device making the request
- * @needs_free: check to free dynamically allocated request object
+ * @refcnt: references to a request handed to rpmh_rsc_send_data(); one is
+ * owned by the controller and dropped by rpmh_tx_done(), another one is
+ * owned by a blocking caller waiting on @completion
  */
 struct rpmh_request {
 	struct tcs_request msg;
 	struct tcs_cmd cmd[MAX_RPMH_PAYLOAD];
-	struct completion *completion;
+	struct completion completion;
 	const struct device *dev;
-	bool needs_free;
+	refcount_t refcnt;
 };
 
 /**
@@ -123,6 +127,7 @@ struct rsc_drv {
 	void __iomem *tcs_base;
 	int id;
 	int num_tcs;
+	int irq;
 	struct notifier_block rsc_pm;
 	struct notifier_block genpd_nb;
 	atomic_t cpus_in_pm;
@@ -134,6 +139,9 @@ struct rsc_drv {
 	struct device *dev;
 	struct rsc_ver ver;
 	u32 *regs;
+#ifdef CONFIG_QCOM_J716F_DIAG
+	struct list_head node;
+#endif
 };
 
 int rpmh_rsc_send_data(struct rsc_drv *drv, const struct tcs_request *msg);
@@ -141,6 +149,10 @@ int rpmh_rsc_write_ctrl_data(struct rsc_drv *drv,
 			     const struct tcs_request *msg);
 void rpmh_rsc_invalidate(struct rsc_drv *drv);
 void rpmh_rsc_write_next_wakeup(struct rsc_drv *drv);
+void rpmh_rsc_debug(struct rsc_drv *drv, struct completion *compl);
+#ifdef CONFIG_QCOM_J716F_DIAG
+void rpmh_rsc_panic_dump(void);
+#endif
 
 void rpmh_tx_done(const struct tcs_request *msg);
 int rpmh_flush(struct rpmh_ctrlr *ctrlr);

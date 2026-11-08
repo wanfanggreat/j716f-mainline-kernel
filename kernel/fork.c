@@ -44,6 +44,7 @@
 #include <linux/mmu_notifier.h>
 #include <linux/fs.h>
 #include <linux/mm.h>
+#include <soc/qcom/j716f-diag.h>
 #include <linux/mm_inline.h>
 #include <linux/memblock.h>
 #include <linux/nsproxy.h>
@@ -726,6 +727,7 @@ void __mmdrop(struct mm_struct *mm)
 	BUG_ON(mm == &init_mm);
 	WARN_ON_ONCE(mm == current->mm);
 
+	j716f_bc(J716F_BC_MM_MMDROP_ENTER, (unsigned long)mm);
 	/* Ensure no CPUs are using this as their lazy tlb mm */
 	cleanup_lazy_tlbs(mm);
 
@@ -741,6 +743,7 @@ void __mmdrop(struct mm_struct *mm)
 	percpu_counter_destroy_many(mm->rss_stat, NR_MM_COUNTERS);
 
 	free_mm(mm);
+	j716f_bc(J716F_BC_MM_MMDROP_EXIT, (unsigned long)mm);
 }
 EXPORT_SYMBOL_GPL(__mmdrop);
 
@@ -1186,6 +1189,7 @@ static inline void __mmput(struct mm_struct *mm)
 {
 	VM_BUG_ON(atomic_read(&mm->mm_users));
 
+	j716f_bc(J716F_BC_MM_MMPUT_ENTER, (unsigned long)mm);
 	uprobe_clear_state(mm);
 	exit_aio(mm);
 	ksm_exit(mm);
@@ -1203,6 +1207,7 @@ static inline void __mmput(struct mm_struct *mm)
 	lru_gen_del_mm(mm);
 	futex_hash_free(mm);
 	mmdrop(mm);
+	j716f_bc(J716F_BC_MM_MMPUT_EXIT, (unsigned long)mm);
 }
 
 /*
@@ -2032,6 +2037,7 @@ __latent_entropy struct task_struct *copy_process(
 	const u64 clone_flags = args->flags;
 	struct nsproxy *nsp = current->nsproxy;
 
+	j716f_bc(J716F_BC_FORK_COPY_ENTER, clone_flags);
 	/*
 	 * Don't allow sharing the root directory with processes in a different
 	 * namespace
@@ -2592,6 +2598,7 @@ __latent_entropy struct task_struct *copy_process(
 
 	copy_oom_score_adj(clone_flags, p);
 
+	j716f_bc(J716F_BC_FORK_COPY_EXIT, (unsigned long)p);
 	return p;
 
 bad_fork_core_free:
@@ -2812,7 +2819,9 @@ pid_t kernel_clone(struct kernel_clone_args *args)
 		task_unlock(p);
 	}
 
+	j716f_bc(J716F_BC_FORK_WAKE_ENTER, (unsigned long)p);
 	wake_up_new_task(p);
+	j716f_bc(J716F_BC_FORK_WAKE_EXIT, (unsigned long)p);
 
 	/* forking complete and child started to run, tell ptracer */
 	if (unlikely(trace))

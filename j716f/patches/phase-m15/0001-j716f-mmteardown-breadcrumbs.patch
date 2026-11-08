@@ -1,0 +1,679 @@
+--- a/drivers/soc/qcom/j716f-diag.c	2026-11-08 13:18:17.360324146 +0800
++++ b/drivers/soc/qcom/j716f-diag.c	2026-11-08 13:07:15.628820143 +0800
+@@ -24,9 +24,11 @@
+ #include <linux/init.h>
+ #include <linux/ktime.h>
+ #include <linux/math64.h>
++#include <linux/nmi.h>
+ #include <linux/kernel.h>
+ #include <linux/panic_notifier.h>
+ #include <linux/percpu.h>
++#include <linux/suspend.h>
+ #include <linux/preempt.h>
+ #include <linux/printk.h>
+ #include <linux/proc_fs.h>
+@@ -56,6 +58,8 @@
+ struct j716f_bc_cpu {
+ 	u32 seq;
+ 	u32 alert_stage;
++	u32 bt_stage;
++	u32 pad;
+ 	u64 heartbeat;
+ 	struct j716f_bc_rec ring[J716F_BC_RING];
+ };
+@@ -73,6 +77,47 @@
+ 
+ static const u64 j716f_alert_ms[] = { 2000, 5000, 10000, 20000, 40000, 80000 };
+ 
++/*
++ * At bt_stage (5 s) ask the wedged CPU for a pseudo-NMI backtrace while the
++ * rest of the system is still healthy and the console is free; at panic_stage
++ * (10 s) panic ourselves instead of waiting for the RCU stall detector, so
++ * the breadcrumb/GICR/RSC dump is produced before anything else goes wrong.
++ */
++static unsigned int bt_stage = 2;
++module_param(bt_stage, uint, 0644);
++MODULE_PARM_DESC(bt_stage, "J716F: stale-heartbeat stage that requests an NMI backtrace (0=off)");
++
++static unsigned int panic_stage = 3;
++module_param(panic_stage, uint, 0644);
++MODULE_PARM_DESC(panic_stage, "J716F: stale-heartbeat stage that panics (0=off)");
++
++static unsigned int snap_print = 1;
++module_param(snap_print, uint, 0644);
++MODULE_PARM_DESC(snap_print, "J716F: print one SNAP line per second (0=off)");
++
++/* Ages are computed across CPUs, so clamp the clock skew. */
++static u64 j716f_age(u64 now, u64 then)
++{
++	return then > now ? 0 : now - then;
++}
++
++struct j716f_bt_req {
++	struct work_struct work;
++	int cpu;
++};
++static DEFINE_PER_CPU(struct j716f_bt_req, j716f_bt_reqs);
++
++/* Ignore stale hearts for a while after a system resume: hrtimers freeze. */
++static u64 j716f_snap_guard;
++
++static void j716f_bt_work_fn(struct work_struct *w)
++{
++	struct j716f_bt_req *req = container_of(w, struct j716f_bt_req, work);
++
++	pr_info("J716F SNAP: requesting NMI backtrace of cpu%d\n", req->cpu);
++	trigger_single_cpu_backtrace(req->cpu);
++}
++
+ static const char *const j716f_bc_names[J716F_BC_MAX] = {
+ 	[J716F_BC_NONE]			= "none",
+ 
+@@ -142,6 +187,50 @@
+ 
+ 	[J716F_BC_TLB_FLUSH_ENTER]	= "tlb_flush_enter",
+ 	[J716F_BC_TLB_FLUSH_EXIT]	= "tlb_flush_exit",
++
++	[J716F_BC_MM_DUP_ENTER]		= "dup_mmap_enter",
++	[J716F_BC_MM_DUP_POST_FLUSH]	= "dup_mmap_post_flush",
++	[J716F_BC_MM_DUP_UNLOCK_ENTER]	= "dup_mmap_unlock_enter",
++	[J716F_BC_MM_DUP_UNLOCK_EXIT]	= "dup_mmap_unlock_exit",
++	[J716F_BC_MM_DUP_EXIT]		= "dup_mmap_exit",
++	[J716F_BC_MM_EXIT_ENTER]	= "exit_mmap_enter",
++	[J716F_BC_MM_EXIT_EXIT]		= "exit_mmap_exit",
++	[J716F_BC_MM_UNMAP_REGION_ENTER] = "unmap_region_enter",
++	[J716F_BC_MM_UNMAP_REGION_EXIT]	 = "unmap_region_exit",
++	[J716F_BC_MM_UNMAP_VMAS_ENTER]	= "unmap_vmas_enter",
++	[J716F_BC_MM_UNMAP_VMAS_EXIT]	= "unmap_vmas_exit",
++	[J716F_BC_MM_FREE_PGTABLES_ENTER] = "free_pgtables_enter",
++	[J716F_BC_MM_FREE_PGTABLES_EXIT]  = "free_pgtables_exit",
++	[J716F_BC_MM_FREE_PGD_RANGE_ENTER] = "free_pgd_range_enter",
++	[J716F_BC_MM_FREE_PGD_RANGE_EXIT]  = "free_pgd_range_exit",
++	[J716F_BC_MM_TLB_FINISH_ENTER]	= "tlb_finish_mmu_enter",
++	[J716F_BC_MM_TLB_FINISH_EXIT]	= "tlb_finish_mmu_exit",
++	[J716F_BC_MM_TLB_FLUSH_MU_ENTER] = "tlb_flush_mmu_enter",
++	[J716F_BC_MM_TLB_FLUSH_MU_EXIT]	= "tlb_flush_mmu_exit",
++	[J716F_BC_MM_TLB_PAGES_ENTER]	= "tlb_batch_pages_enter",
++	[J716F_BC_MM_TLB_PAGES_EXIT]	= "tlb_batch_pages_exit",
++	[J716F_BC_MM_TLB_TABLE_ENTER]	= "tlb_table_flush_enter",
++	[J716F_BC_MM_TLB_TABLE_EXIT]	= "tlb_table_flush_exit",
++	[J716F_BC_MM_TLB_SYNC_ENTER]	= "tlb_table_sync_enter",
++	[J716F_BC_MM_TLB_SYNC_EXIT]	= "tlb_table_sync_exit",
++	[J716F_BC_MM_NOTIFIER_RELEASE_ENTER] = "mmu_notifier_release_enter",
++	[J716F_BC_MM_NOTIFIER_RELEASE_EXIT]  = "mmu_notifier_release_exit",
++	[J716F_BC_MM_MMPUT_ENTER]	= "mmput_enter",
++	[J716F_BC_MM_MMPUT_EXIT]	= "mmput_exit",
++	[J716F_BC_MM_MMDROP_ENTER]	= "mmdrop_enter",
++	[J716F_BC_MM_MMDROP_EXIT]	= "mmdrop_exit",
++	[J716F_BC_MM_EXEC_MMAP_ENTER]	= "exec_mmap_enter",
++	[J716F_BC_MM_EXEC_MMAP_EXIT]	= "exec_mmap_exit",
++	[J716F_BC_FORK_COPY_ENTER]	= "copy_process_enter",
++	[J716F_BC_FORK_COPY_EXIT]	= "copy_process_exit",
++	[J716F_BC_FORK_WAKE_ENTER]	= "wake_new_task_enter",
++	[J716F_BC_FORK_WAKE_EXIT]	= "wake_new_task_exit",
++	[J716F_BC_PAGE_FREE_LIST_ENTER]	= "free_unref_list_enter",
++	[J716F_BC_PAGE_FREE_LIST_EXIT]	= "free_unref_list_exit",
++	[J716F_BC_PAGE_FREE_PCP_ENTER]	= "free_pcppages_enter",
++	[J716F_BC_PAGE_FREE_PCP_EXIT]	= "free_pcppages_exit",
++	[J716F_BC_TLB_BATCHED_ENTER]	= "tlb_batched_enter",
++	[J716F_BC_TLB_BATCHED_EXIT]	= "tlb_batched_exit",
+ };
+ 
+ static const char *j716f_bc_name(u32 site)
+@@ -210,7 +299,7 @@
+ 		pr_info("J716F BC cpu%d seq=%u site=%s arg=0x%lx fl=%s pid=%u comm=%s age=%llums%s\n",
+ 			cpu, s, j716f_bc_name(r->site), r->arg, fl,
+ 			r->pid, r->comm,
+-			ts ? (now - ts) / 1000000ULL : 0,
++			ts ? j716f_age(now, ts) / NSEC_PER_MSEC : 0,
+ 			i == 0 ? " (current)" : "");
+ 	}
+ }
+@@ -273,16 +362,16 @@
+ 					 " cpu%d=nostart", cpu);
+ 			continue;
+ 		}
+-		if (now - beat > J716F_STALE_NS)
++		if (j716f_age(now, beat) > J716F_STALE_NS)
+ 			len += scnprintf(buf + len, sizeof(buf) - len,
+ 					 " cpu%d=STALE:%llums:%s", cpu,
+-					 (now - beat) / NSEC_PER_MSEC,
++					 j716f_age(now, beat) / NSEC_PER_MSEC,
+ 					 j716f_bc_name(r.site));
+ 		else
+ 			len += scnprintf(buf + len, sizeof(buf) - len,
+ 					 " cpu%d=%s/%llums", cpu,
+ 					 j716f_bc_name(r.site),
+-					 r.ts ? (now - r.ts) / NSEC_PER_MSEC : 0);
++					 r.ts ? j716f_age(now, r.ts) / NSEC_PER_MSEC : 0);
+ 	}
+ 	pr_info("%s\n", buf);
+ }
+@@ -291,6 +380,9 @@
+ {
+ 	int cpu;
+ 
++	if (now < READ_ONCE(j716f_snap_guard))
++		return;
++
+ 	for_each_online_cpu(cpu) {
+ 		struct j716f_bc_cpu *c = per_cpu_ptr(&j716f_bc_data, cpu);
+ 		struct j716f_bc_rec r;
+@@ -302,13 +394,14 @@
+ 		if (!beat)
+ 			continue;
+ 
+-		age = now - beat;
++		age = j716f_age(now, beat);
+ 		for (i = 0; i < ARRAY_SIZE(j716f_alert_ms); i++)
+ 			if (age >= j716f_alert_ms[i] * NSEC_PER_MSEC)
+ 				stage = i + 1;
+ 
+ 		if (!stage) {
+ 			WRITE_ONCE(c->alert_stage, 0);
++			WRITE_ONCE(c->bt_stage, 0);
+ 			continue;
+ 		}
+ 		if (stage <= READ_ONCE(c->alert_stage))
+@@ -326,7 +419,7 @@
+ 				div_u64(now, NSEC_PER_SEC), cpu,
+ 				age / NSEC_PER_MSEC, stage,
+ 				j716f_bc_name(r.site), r.arg,
+-				r.ts ? (now - r.ts) / NSEC_PER_MSEC : 0,
++				r.ts ? j716f_age(now, r.ts) / NSEC_PER_MSEC : 0,
+ 				(flags & J716F_BC_F_IRQOFF) ? 'I' : '-',
+ 				(flags & J716F_BC_F_HARDIRQ) ? 'H' : '-',
+ 				(flags & J716F_BC_F_NMI) ? 'N' : '-',
+@@ -343,12 +436,22 @@
+ 		pr_info("J716F SNAP-ALERT t=%llus cpu%d stale=%llums stage=%u site=%s arg=0x%lx site_age=%llums fl=%c%c%c pid=%u comm=%s\n",
+ 			div_u64(now, NSEC_PER_SEC), cpu, age / NSEC_PER_MSEC, stage,
+ 			j716f_bc_name(r.site), r.arg,
+-			r.ts ? (now - r.ts) / NSEC_PER_MSEC : 0,
++			r.ts ? j716f_age(now, r.ts) / NSEC_PER_MSEC : 0,
+ 			(flags & J716F_BC_F_IRQOFF) ? 'I' : '-',
+ 			(flags & J716F_BC_F_HARDIRQ) ? 'H' : '-',
+ 			(flags & J716F_BC_F_NMI) ? 'N' : '-',
+ 			r.pid, r.comm);
+ #endif
++		if (bt_stage && stage >= bt_stage &&
++		    READ_ONCE(c->bt_stage) < stage) {
++			WRITE_ONCE(c->bt_stage, stage);
++			schedule_work(&per_cpu(j716f_bt_reqs, cpu).work);
++		}
++
++		if (panic_stage && stage >= panic_stage)
++			panic("j716f: cpu%d heartbeat stopped for %llums (last site %s, comm %s)",
++			      cpu, age / NSEC_PER_MSEC,
++			      j716f_bc_name(r.site), r.comm);
+ 	}
+ }
+ 
+@@ -364,7 +467,8 @@
+ 
+ 	/* One printer per second, rotating so a stuck CPU cannot blind us. */
+ 	if (online && (unsigned int)(tick % online) == (unsigned int)cpu) {
+-		j716f_snap_print(now);
++		if (snap_print)
++			j716f_snap_print(now);
+ 		j716f_snap_alert(now);
+ 	}
+ 
+@@ -399,6 +503,32 @@
+ 	return 0;
+ }
+ 
++static int j716f_snap_pm_notify(struct notifier_block *nb,
++				unsigned long mode, void *data)
++{
++	int cpu;
++	u64 now;
++
++	if (mode != PM_POST_SUSPEND)
++		return NOTIFY_DONE;
++
++	now = local_clock();
++	WRITE_ONCE(j716f_snap_guard, now + 10ULL * NSEC_PER_SEC);
++	for_each_online_cpu(cpu) {
++		struct j716f_bc_cpu *c = per_cpu_ptr(&j716f_bc_data, cpu);
++
++		WRITE_ONCE(c->heartbeat, now);
++		WRITE_ONCE(c->alert_stage, 0);
++		WRITE_ONCE(c->bt_stage, 0);
++	}
++	return NOTIFY_DONE;
++}
++
++static struct notifier_block j716f_snap_pm_nb = {
++	.notifier_call = j716f_snap_pm_notify,
++	.priority = 0,
++};
++
+ #if IS_ENABLED(CONFIG_QCOM_RPMH)
+ extern void rpmh_rsc_panic_dump(void);
+ #endif
+@@ -477,14 +607,14 @@
+ 			continue;
+ 		seq_printf(m, "cpu%d seq=%u beat=%llums%s site=%s arg=0x%lx fl=%c%c%c pid=%u comm=%s age=%llums\n",
+ 			   cpu, seq,
+-			   beat ? (now - beat) / NSEC_PER_MSEC : 0,
+-			   (!beat || now - beat > J716F_STALE_NS) ? " STALE" : "",
++			   beat ? j716f_age(now, beat) / NSEC_PER_MSEC : 0,
++			   (!beat || j716f_age(now, beat) > J716F_STALE_NS) ? " STALE" : "",
+ 			   j716f_bc_name(r.site), r.arg,
+ 			   (r.flags & J716F_BC_F_IRQOFF) ? 'I' : '-',
+ 			   (r.flags & J716F_BC_F_HARDIRQ) ? 'H' : '-',
+ 			   (r.flags & J716F_BC_F_NMI) ? 'N' : '-',
+ 			   r.pid, r.comm,
+-			   r.ts ? (now - r.ts) / NSEC_PER_MSEC : 0);
++			   r.ts ? j716f_age(now, r.ts) / NSEC_PER_MSEC : 0);
+ 	}
+ 	return 0;
+ }
+@@ -536,8 +666,15 @@
+ 	 * is wedged, and the last breadcrumb names the site.  The printer is
+ 	 * elected per second so a single stuck CPU cannot blind the stream.
+ 	 */
+-	for_each_online_cpu(cpu)
++	for_each_online_cpu(cpu) {
++		struct j716f_bt_req *req = per_cpu_ptr(&j716f_bt_reqs, cpu);
++
++		req->cpu = cpu;
++		INIT_WORK(&req->work, j716f_bt_work_fn);
+ 		smp_call_function_single(cpu, j716f_snap_start_cpu, NULL, 1);
++	}
++
++	register_pm_notifier(&j716f_snap_pm_nb);
+ 
+ 	ret = cpuhp_setup_state_nocalls(CPUHP_AP_ONLINE_DYN,
+ 					"soc/qcom/j716f-diag:online",
+--- a/include/soc/qcom/j716f-diag.h	2026-11-08 12:21:35.484706183 +0800
++++ b/include/soc/qcom/j716f-diag.h	2026-11-08 13:06:08.828467783 +0800
+@@ -96,6 +96,51 @@
+ 	J716F_BC_TLB_FLUSH_ENTER,
+ 	J716F_BC_TLB_FLUSH_EXIT,
+ 
++	/* mm teardown, fork/exec and page freeing (M15) */
++	J716F_BC_MM_DUP_ENTER,
++	J716F_BC_MM_DUP_POST_FLUSH,
++	J716F_BC_MM_DUP_UNLOCK_ENTER,
++	J716F_BC_MM_DUP_UNLOCK_EXIT,
++	J716F_BC_MM_DUP_EXIT,
++	J716F_BC_MM_EXIT_ENTER,
++	J716F_BC_MM_EXIT_EXIT,
++	J716F_BC_MM_UNMAP_REGION_ENTER,
++	J716F_BC_MM_UNMAP_REGION_EXIT,
++	J716F_BC_MM_UNMAP_VMAS_ENTER,
++	J716F_BC_MM_UNMAP_VMAS_EXIT,
++	J716F_BC_MM_FREE_PGTABLES_ENTER,
++	J716F_BC_MM_FREE_PGTABLES_EXIT,
++	J716F_BC_MM_FREE_PGD_RANGE_ENTER,
++	J716F_BC_MM_FREE_PGD_RANGE_EXIT,
++	J716F_BC_MM_TLB_FINISH_ENTER,
++	J716F_BC_MM_TLB_FINISH_EXIT,
++	J716F_BC_MM_TLB_FLUSH_MU_ENTER,
++	J716F_BC_MM_TLB_FLUSH_MU_EXIT,
++	J716F_BC_MM_TLB_PAGES_ENTER,
++	J716F_BC_MM_TLB_PAGES_EXIT,
++	J716F_BC_MM_TLB_TABLE_ENTER,
++	J716F_BC_MM_TLB_TABLE_EXIT,
++	J716F_BC_MM_TLB_SYNC_ENTER,
++	J716F_BC_MM_TLB_SYNC_EXIT,
++	J716F_BC_MM_NOTIFIER_RELEASE_ENTER,
++	J716F_BC_MM_NOTIFIER_RELEASE_EXIT,
++	J716F_BC_MM_MMPUT_ENTER,
++	J716F_BC_MM_MMPUT_EXIT,
++	J716F_BC_MM_MMDROP_ENTER,
++	J716F_BC_MM_MMDROP_EXIT,
++	J716F_BC_MM_EXEC_MMAP_ENTER,
++	J716F_BC_MM_EXEC_MMAP_EXIT,
++	J716F_BC_FORK_COPY_ENTER,
++	J716F_BC_FORK_COPY_EXIT,
++	J716F_BC_FORK_WAKE_ENTER,
++	J716F_BC_FORK_WAKE_EXIT,
++	J716F_BC_PAGE_FREE_LIST_ENTER,
++	J716F_BC_PAGE_FREE_LIST_EXIT,
++	J716F_BC_PAGE_FREE_PCP_ENTER,
++	J716F_BC_PAGE_FREE_PCP_EXIT,
++	J716F_BC_TLB_BATCHED_ENTER,
++	J716F_BC_TLB_BATCHED_EXIT,
++
+ 	J716F_BC_MAX,
+ };
+ 
+--- a/mm/memory.c	2026-11-08 07:35:48.000000000 +0800
++++ b/mm/memory.c	2026-11-08 13:06:03.008437255 +0800
+@@ -41,6 +41,7 @@
+ 
+ #include <linux/kernel_stat.h>
+ #include <linux/mm.h>
++#include <soc/qcom/j716f-diag.h>
+ #include <linux/mm_inline.h>
+ #include <linux/sched/mm.h>
+ #include <linux/sched/numa_balancing.h>
+@@ -302,6 +303,7 @@
+ 	pgd_t *pgd;
+ 	unsigned long next;
+ 
++	j716f_bc(J716F_BC_MM_FREE_PGD_RANGE_ENTER, addr);
+ 	/*
+ 	 * The next few lines have given us lots of grief...
+ 	 *
+@@ -384,6 +386,7 @@
+ 	 */
+ 	WARN_ON_ONCE(unmap->vma_end - 1 > unmap->pg_end - 1);
+ 
++	j716f_bc(J716F_BC_MM_FREE_PGTABLES_ENTER, (unsigned long)vma->vm_mm);
+ 	tlb_free_vmas(tlb);
+ 
+ 	do {
+@@ -420,6 +423,7 @@
+ 			       next ? next->vm_start : unmap->pg_end);
+ 		vma = next;
+ 	} while (vma);
++	j716f_bc(J716F_BC_MM_FREE_PGTABLES_EXIT, (unsigned long)unmap->first->vm_mm);
+ }
+ 
+ void pmd_install(struct mm_struct *mm, pmd_t *pmd, pgtable_t *pte)
+@@ -2298,6 +2302,7 @@
+ 	};
+ 
+ 	vma = unmap->first;
++	j716f_bc(J716F_BC_MM_UNMAP_VMAS_ENTER, (unsigned long)vma->vm_mm);
+ 	mmu_notifier_range_init(&range, MMU_NOTIFY_UNMAP, 0, vma->vm_mm,
+ 				unmap->vma_start, unmap->vma_end);
+ 	mmu_notifier_invalidate_range_start(&range);
+@@ -2311,6 +2316,7 @@
+ 		vma = mas_find(unmap->mas, unmap->tree_end - 1);
+ 	} while (vma);
+ 	mmu_notifier_invalidate_range_end(&range);
++	j716f_bc(J716F_BC_MM_UNMAP_VMAS_EXIT, (unsigned long)unmap->first->vm_mm);
+ }
+ 
+ /**
+--- a/mm/mmap.c	2026-11-08 07:35:48.000000000 +0800
++++ b/mm/mmap.c	2026-11-08 13:06:03.008437255 +0800
+@@ -13,6 +13,7 @@
+ #include <linux/slab.h>
+ #include <linux/backing-dev.h>
+ #include <linux/mm.h>
++#include <soc/qcom/j716f-diag.h>
+ #include <linux/mm_inline.h>
+ #include <linux/shm.h>
+ #include <linux/mman.h>
+@@ -1293,6 +1294,7 @@
+ 	VMA_ITERATOR(vmi, mm, 0);
+ 	struct unmap_desc unmap;
+ 
++	j716f_bc(J716F_BC_MM_EXIT_ENTER, (unsigned long)mm);
+ 	/* mm's last user has gone, and its about to be pulled down */
+ 	mmu_notifier_release(mm);
+ 
+@@ -1339,6 +1341,7 @@
+ 	trace_exit_mmap(mm);
+ 	mmap_write_unlock(mm);
+ 	vm_unacct_memory(nr_accounted);
++	j716f_bc(J716F_BC_MM_EXIT_EXIT, (unsigned long)mm);
+ }
+ 
+ /*
+@@ -1713,6 +1716,7 @@
+ 	LIST_HEAD(uf);
+ 	VMA_ITERATOR(vmi, mm, 0);
+ 
++	j716f_bc(J716F_BC_MM_DUP_ENTER, (unsigned long)oldmm);
+ 	if (mmap_write_lock_killable(oldmm))
+ 		return -EINTR;
+ 	flush_cache_dup_mm(oldmm);
+@@ -1882,7 +1886,11 @@
+ out:
+ 	mmap_write_unlock(mm);
+ 	flush_tlb_mm(oldmm);
++	j716f_bc(J716F_BC_MM_DUP_POST_FLUSH, (unsigned long)oldmm);
++	j716f_bc(J716F_BC_MM_DUP_UNLOCK_ENTER, (unsigned long)oldmm);
+ 	mmap_write_unlock(oldmm);
++	j716f_bc(J716F_BC_MM_DUP_UNLOCK_EXIT, (unsigned long)oldmm);
++	j716f_bc(J716F_BC_MM_DUP_EXIT, (unsigned long)oldmm);
+ 	if (!retval)
+ 		dup_userfaultfd_complete(&uf);
+ 	else
+--- a/mm/mmu_gather.c	2026-11-08 07:35:48.000000000 +0800
++++ b/mm/mmu_gather.c	2026-11-08 13:06:31.108584579 +0800
+@@ -4,6 +4,7 @@
+ #include <linux/kernel.h>
+ #include <linux/mmdebug.h>
+ #include <linux/mm_types.h>
++#include <soc/qcom/j716f-diag.h>
+ #include <linux/mm_inline.h>
+ #include <linux/pagemap.h>
+ #include <linux/rcupdate.h>
+@@ -147,9 +148,11 @@
+ {
+ 	struct mmu_gather_batch *batch;
+ 
++	j716f_bc(J716F_BC_MM_TLB_PAGES_ENTER, (unsigned long)tlb->mm);
+ 	for (batch = &tlb->local; batch && batch->nr; batch = batch->next)
+ 		__tlb_batch_free_encoded_pages(batch);
+ 	tlb->active = &tlb->local;
++	j716f_bc(J716F_BC_MM_TLB_PAGES_EXIT, (unsigned long)tlb->mm);
+ }
+ 
+ static void tlb_batch_list_free(struct mmu_gather *tlb)
+@@ -283,7 +286,9 @@
+ 	 * It is however sufficient for software page-table walkers that rely on
+ 	 * IRQ disabling.
+ 	 */
++	j716f_bc(J716F_BC_MM_TLB_SYNC_ENTER, 0);
+ 	smp_call_function(tlb_remove_table_smp_sync, NULL, 1);
++	j716f_bc(J716F_BC_MM_TLB_SYNC_EXIT, 0);
+ }
+ 
+ static void tlb_remove_table_rcu(struct rcu_head *head)
+@@ -372,11 +377,13 @@
+ {
+ 	struct mmu_table_batch **batch = &tlb->batch;
+ 
++	j716f_bc(J716F_BC_MM_TLB_TABLE_ENTER, (unsigned long)tlb->mm);
+ 	if (*batch) {
+ 		tlb_table_invalidate(tlb);
+ 		tlb_remove_table_free(*batch);
+ 		*batch = NULL;
+ 	}
++	j716f_bc(J716F_BC_MM_TLB_TABLE_EXIT, (unsigned long)tlb->mm);
+ }
+ 
+ void tlb_remove_table(struct mmu_gather *tlb, void *table)
+@@ -420,8 +427,10 @@
+ 
+ void tlb_flush_mmu(struct mmu_gather *tlb)
+ {
++	j716f_bc(J716F_BC_MM_TLB_FLUSH_MU_ENTER, (unsigned long)tlb->mm);
+ 	tlb_flush_mmu_tlbonly(tlb);
+ 	tlb_flush_mmu_free(tlb);
++	j716f_bc(J716F_BC_MM_TLB_FLUSH_MU_EXIT, (unsigned long)tlb->mm);
+ }
+ 
+ static void __tlb_gather_mmu(struct mmu_gather *tlb, struct mm_struct *mm,
+@@ -520,6 +529,7 @@
+ 	 */
+ 	VM_WARN_ON_ONCE(tlb->fully_unshared_tables);
+ 
++	j716f_bc(J716F_BC_MM_TLB_FINISH_ENTER, (unsigned long)tlb->mm);
+ 	/*
+ 	 * If there are parallel threads are doing PTE changes on same range
+ 	 * under non-exclusive lock (e.g., mmap_lock read-side) but defer TLB
+@@ -552,4 +562,5 @@
+ 	tlb_batch_list_free(tlb);
+ #endif
+ 	dec_tlb_flush_pending(tlb->mm);
++	j716f_bc(J716F_BC_MM_TLB_FINISH_EXIT, (unsigned long)tlb->mm);
+ }
+--- a/mm/mmu_notifier.c	2026-11-08 07:35:48.000000000 +0800
++++ b/mm/mmu_notifier.c	2026-11-08 13:06:31.112584600 +0800
+@@ -11,6 +11,7 @@
+ #include <linux/mmu_notifier.h>
+ #include <linux/export.h>
+ #include <linux/mm.h>
++#include <soc/qcom/j716f-diag.h>
+ #include <linux/err.h>
+ #include <linux/interval_tree.h>
+ #include <linux/srcu.h>
+@@ -378,11 +379,13 @@
+ 	struct mmu_notifier_subscriptions *subscriptions =
+ 		mm->notifier_subscriptions;
+ 
++	j716f_bc(J716F_BC_MM_NOTIFIER_RELEASE_ENTER, (unsigned long)mm);
+ 	if (subscriptions->has_itree)
+ 		mn_itree_release(subscriptions, mm);
+ 
+ 	if (!hlist_empty(&subscriptions->list))
+ 		mn_hlist_release(subscriptions, mm);
++	j716f_bc(J716F_BC_MM_NOTIFIER_RELEASE_EXIT, (unsigned long)mm);
+ }
+ 
+ /*
+--- a/mm/rmap.c	2026-11-08 07:35:48.000000000 +0800
++++ b/mm/rmap.c	2026-11-08 13:06:31.116584621 +0800
+@@ -53,6 +53,7 @@
+  */
+ 
+ #include <linux/mm.h>
++#include <soc/qcom/j716f-diag.h>
+ #include <linux/sched/mm.h>
+ #include <linux/sched/task.h>
+ #include <linux/pagemap.h>
+@@ -817,6 +818,7 @@
+ 	int pending = batch & TLB_FLUSH_BATCH_PENDING_MASK;
+ 	int flushed = batch >> TLB_FLUSH_BATCH_FLUSHED_SHIFT;
+ 
++	j716f_bc(J716F_BC_TLB_BATCHED_ENTER, (unsigned long)mm);
+ 	if (pending != flushed) {
+ 		flush_tlb_mm(mm);
+ 		/*
+@@ -826,6 +828,7 @@
+ 		atomic_cmpxchg(&mm->tlb_flush_batched, batch,
+ 			       pending | (pending << TLB_FLUSH_BATCH_FLUSHED_SHIFT));
+ 	}
++	j716f_bc(J716F_BC_TLB_BATCHED_EXIT, (unsigned long)mm);
+ }
+ #else
+ static void set_tlb_ubc_flush_pending(struct mm_struct *mm, pte_t pteval,
+--- a/mm/vma.c	2026-11-08 07:35:48.000000000 +0800
++++ b/mm/vma.c	2026-11-08 13:06:03.008437255 +0800
+@@ -10,6 +10,7 @@
+  */
+ #include "vma_internal.h"
+ #include "vma.h"
++#include <soc/qcom/j716f-diag.h>
+ 
+ struct mmap_state {
+ 	struct mm_struct *mm;
+@@ -527,12 +528,14 @@
+ 	struct mm_struct *mm = unmap->first->vm_mm;
+ 	struct mmu_gather tlb;
+ 
++	j716f_bc(J716F_BC_MM_UNMAP_REGION_ENTER, (unsigned long)mm);
+ 	tlb_gather_mmu(&tlb, mm);
+ 	update_hiwater_rss(mm);
+ 	unmap_vmas(&tlb, unmap);
+ 	mas_set(unmap->mas, unmap->tree_reset);
+ 	free_pgtables(&tlb, unmap);
+ 	tlb_finish_mmu(&tlb);
++	j716f_bc(J716F_BC_MM_UNMAP_REGION_EXIT, (unsigned long)mm);
+ }
+ 
+ /*
+--- a/kernel/fork.c	2026-11-08 07:35:48.000000000 +0800
++++ b/kernel/fork.c	2026-11-08 13:06:31.112584600 +0800
+@@ -44,6 +44,7 @@
+ #include <linux/mmu_notifier.h>
+ #include <linux/fs.h>
+ #include <linux/mm.h>
++#include <soc/qcom/j716f-diag.h>
+ #include <linux/mm_inline.h>
+ #include <linux/memblock.h>
+ #include <linux/nsproxy.h>
+@@ -726,6 +727,7 @@
+ 	BUG_ON(mm == &init_mm);
+ 	WARN_ON_ONCE(mm == current->mm);
+ 
++	j716f_bc(J716F_BC_MM_MMDROP_ENTER, (unsigned long)mm);
+ 	/* Ensure no CPUs are using this as their lazy tlb mm */
+ 	cleanup_lazy_tlbs(mm);
+ 
+@@ -741,6 +743,7 @@
+ 	percpu_counter_destroy_many(mm->rss_stat, NR_MM_COUNTERS);
+ 
+ 	free_mm(mm);
++	j716f_bc(J716F_BC_MM_MMDROP_EXIT, (unsigned long)mm);
+ }
+ EXPORT_SYMBOL_GPL(__mmdrop);
+ 
+@@ -1186,6 +1189,7 @@
+ {
+ 	VM_BUG_ON(atomic_read(&mm->mm_users));
+ 
++	j716f_bc(J716F_BC_MM_MMPUT_ENTER, (unsigned long)mm);
+ 	uprobe_clear_state(mm);
+ 	exit_aio(mm);
+ 	ksm_exit(mm);
+@@ -1203,6 +1207,7 @@
+ 	lru_gen_del_mm(mm);
+ 	futex_hash_free(mm);
+ 	mmdrop(mm);
++	j716f_bc(J716F_BC_MM_MMPUT_EXIT, (unsigned long)mm);
+ }
+ 
+ /*
+@@ -2032,6 +2037,7 @@
+ 	const u64 clone_flags = args->flags;
+ 	struct nsproxy *nsp = current->nsproxy;
+ 
++	j716f_bc(J716F_BC_FORK_COPY_ENTER, clone_flags);
+ 	/*
+ 	 * Don't allow sharing the root directory with processes in a different
+ 	 * namespace
+@@ -2592,6 +2598,7 @@
+ 
+ 	copy_oom_score_adj(clone_flags, p);
+ 
++	j716f_bc(J716F_BC_FORK_COPY_EXIT, (unsigned long)p);
+ 	return p;
+ 
+ bad_fork_core_free:
+@@ -2812,7 +2819,9 @@
+ 		task_unlock(p);
+ 	}
+ 
++	j716f_bc(J716F_BC_FORK_WAKE_ENTER, (unsigned long)p);
+ 	wake_up_new_task(p);
++	j716f_bc(J716F_BC_FORK_WAKE_EXIT, (unsigned long)p);
+ 
+ 	/* forking complete and child started to run, tell ptracer */
+ 	if (unlikely(trace))
+--- a/fs/exec.c	2026-11-08 07:35:48.000000000 +0800
++++ b/fs/exec.c	2026-11-08 13:06:31.112584600 +0800
+@@ -28,6 +28,7 @@
+ #include <linux/file.h>
+ #include <linux/fdtable.h>
+ #include <linux/mm.h>
++#include <soc/qcom/j716f-diag.h>
+ #include <linux/stat.h>
+ #include <linux/fcntl.h>
+ #include <linux/futex.h>
+@@ -848,6 +849,8 @@
+ 	struct mm_struct *old_mm, *active_mm;
+ 	int ret;
+ 
++	j716f_bc(J716F_BC_MM_EXEC_MMAP_ENTER, (unsigned long)mm);
++
+ 	exec_state = alloc_task_exec_state(bprm->user_ns);
+ 	if (!exec_state)
+ 		return -ENOMEM;
+@@ -909,6 +912,7 @@
+ 		mmdrop_lazy_tlb(active_mm);
+ 	}
+ 	futex_exec_done(tsk);
++	j716f_bc(J716F_BC_MM_EXEC_MMAP_EXIT, (unsigned long)mm);
+ 	return 0;
+ }
+ 

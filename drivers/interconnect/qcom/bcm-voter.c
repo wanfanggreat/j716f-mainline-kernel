@@ -10,6 +10,7 @@
 #include <linux/of.h>
 #include <linux/platform_device.h>
 
+#include <soc/qcom/j716f-diag.h>
 #include <soc/qcom/rpmh.h>
 #include <soc/qcom/tcs.h>
 
@@ -284,6 +285,7 @@ int qcom_icc_bcm_voter_commit(struct bcm_voter *voter)
 	if (!voter)
 		return 0;
 
+	j716f_bc(J716F_BC_ICC_COMMIT_ENTER, 0);
 	mutex_lock(&voter->lock);
 	list_for_each_entry(bcm, &voter->commit_list, list) {
 		if (bcm->enable_mask)
@@ -310,8 +312,10 @@ int qcom_icc_bcm_voter_commit(struct bcm_voter *voter)
 	if (!commit_idx[0])
 		goto out;
 
+	j716f_bc(J716F_BC_ICC_COMMIT_INVAL, cmds[0].addr);
 	rpmh_invalidate(voter->dev);
 
+	j716f_bc(J716F_BC_ICC_COMMIT_BATCH, cmds[0].addr);
 	ret = rpmh_write_batch(voter->dev, RPMH_ACTIVE_ONLY_STATE,
 			       cmds, commit_idx);
 	if (ret) {
@@ -359,6 +363,7 @@ int qcom_icc_bcm_voter_commit(struct bcm_voter *voter)
 	}
 
 out:
+	j716f_bc(J716F_BC_ICC_COMMIT_EXIT, (unsigned long)ret);
 	list_for_each_entry_safe(bcm, bcm_tmp, &voter->commit_list, list)
 		list_del_init(&bcm->list);
 

@@ -966,6 +966,16 @@ static void gs_console_complete_out(struct usb_ep *ep, struct usb_request *req)
 	}
 }
 
+/*
+ * Lenovo J716F: the panic pool requests are queued directly with IRQs off and
+ * are never recycled.  The UDC core calls req->complete unconditionally when
+ * it gives a request back (7.3.1's usb_gadget_giveback_request()), so NULL
+ * here is a NULL function pointer oops in the panic path.  Provide a no-op.
+ */
+static void gs_console_panic_complete(struct usb_ep *ep, struct usb_request *req)
+{
+}
+
 static void __gs_console_push(struct gs_console *cons)
 {
 	struct usb_request *req = cons->req;
@@ -1181,7 +1191,7 @@ static int gs_console_connect(struct gs_port *port)
 			break;
 		req->buf = cons->panic_buf[i];
 		req->length = 0;
-		req->complete = NULL;
+		req->complete = gs_console_panic_complete;
 		req->context = cons;
 		cons->panic_req[i] = req;
 		cons->panic_req_count++;

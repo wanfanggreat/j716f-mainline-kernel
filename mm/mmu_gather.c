@@ -4,6 +4,7 @@
 #include <linux/kernel.h>
 #include <linux/mmdebug.h>
 #include <linux/mm_types.h>
+#include <soc/qcom/j716f-diag.h>
 #include <linux/mm_inline.h>
 #include <linux/pagemap.h>
 #include <linux/rcupdate.h>
@@ -147,9 +148,11 @@ static void tlb_batch_pages_flush(struct mmu_gather *tlb)
 {
 	struct mmu_gather_batch *batch;
 
+	j716f_bc(J716F_BC_MM_TLB_PAGES_ENTER, (unsigned long)tlb->mm);
 	for (batch = &tlb->local; batch && batch->nr; batch = batch->next)
 		__tlb_batch_free_encoded_pages(batch);
 	tlb->active = &tlb->local;
+	j716f_bc(J716F_BC_MM_TLB_PAGES_EXIT, (unsigned long)tlb->mm);
 }
 
 static void tlb_batch_list_free(struct mmu_gather *tlb)
@@ -283,7 +286,9 @@ void tlb_remove_table_sync_one(void)
 	 * It is however sufficient for software page-table walkers that rely on
 	 * IRQ disabling.
 	 */
+	j716f_bc(J716F_BC_MM_TLB_SYNC_ENTER, 0);
 	smp_call_function(tlb_remove_table_smp_sync, NULL, 1);
+	j716f_bc(J716F_BC_MM_TLB_SYNC_EXIT, 0);
 }
 
 static void tlb_remove_table_rcu(struct rcu_head *head)
@@ -372,11 +377,13 @@ static void tlb_table_flush(struct mmu_gather *tlb)
 {
 	struct mmu_table_batch **batch = &tlb->batch;
 
+	j716f_bc(J716F_BC_MM_TLB_TABLE_ENTER, (unsigned long)tlb->mm);
 	if (*batch) {
 		tlb_table_invalidate(tlb);
 		tlb_remove_table_free(*batch);
 		*batch = NULL;
 	}
+	j716f_bc(J716F_BC_MM_TLB_TABLE_EXIT, (unsigned long)tlb->mm);
 }
 
 void tlb_remove_table(struct mmu_gather *tlb, void *table)
@@ -420,8 +427,10 @@ static void tlb_flush_mmu_free(struct mmu_gather *tlb)
 
 void tlb_flush_mmu(struct mmu_gather *tlb)
 {
+	j716f_bc(J716F_BC_MM_TLB_FLUSH_MU_ENTER, (unsigned long)tlb->mm);
 	tlb_flush_mmu_tlbonly(tlb);
 	tlb_flush_mmu_free(tlb);
+	j716f_bc(J716F_BC_MM_TLB_FLUSH_MU_EXIT, (unsigned long)tlb->mm);
 }
 
 static void __tlb_gather_mmu(struct mmu_gather *tlb, struct mm_struct *mm,
@@ -520,6 +529,7 @@ void tlb_finish_mmu(struct mmu_gather *tlb)
 	 */
 	VM_WARN_ON_ONCE(tlb->fully_unshared_tables);
 
+	j716f_bc(J716F_BC_MM_TLB_FINISH_ENTER, (unsigned long)tlb->mm);
 	/*
 	 * If there are parallel threads are doing PTE changes on same range
 	 * under non-exclusive lock (e.g., mmap_lock read-side) but defer TLB
@@ -552,4 +562,5 @@ void tlb_finish_mmu(struct mmu_gather *tlb)
 	tlb_batch_list_free(tlb);
 #endif
 	dec_tlb_flush_pending(tlb->mm);
+	j716f_bc(J716F_BC_MM_TLB_FINISH_EXIT, (unsigned long)tlb->mm);
 }

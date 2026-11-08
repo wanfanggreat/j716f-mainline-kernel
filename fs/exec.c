@@ -28,6 +28,7 @@
 #include <linux/file.h>
 #include <linux/fdtable.h>
 #include <linux/mm.h>
+#include <soc/qcom/j716f-diag.h>
 #include <linux/stat.h>
 #include <linux/fcntl.h>
 #include <linux/futex.h>
@@ -848,6 +849,8 @@ static int exec_mmap(struct linux_binprm *bprm)
 	struct mm_struct *old_mm, *active_mm;
 	int ret;
 
+	j716f_bc(J716F_BC_MM_EXEC_MMAP_ENTER, (unsigned long)mm);
+
 	exec_state = alloc_task_exec_state(bprm->user_ns);
 	if (!exec_state)
 		return -ENOMEM;
@@ -909,6 +912,7 @@ static int exec_mmap(struct linux_binprm *bprm)
 		mmdrop_lazy_tlb(active_mm);
 	}
 	futex_exec_done(tsk);
+	j716f_bc(J716F_BC_MM_EXEC_MMAP_EXIT, (unsigned long)mm);
 	return 0;
 }
 

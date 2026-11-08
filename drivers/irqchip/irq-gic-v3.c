@@ -1971,6 +1971,56 @@ static void gic_enable_nmi_support(void)
 		gic_chip.flags |= IRQCHIP_SUPPORTS_NMI;
 }
 
+#ifdef CONFIG_QCOM_J716F_DIAG
+int gicv3_j716f_redist_state(int cpu, u32 *waker, u32 *pending, u32 *active);
+void gicv3_j716f_dump_redist(int cpu);
+
+/*
+ * Diagnostic only: read the redistributor state of @cpu from any CPU.
+ * A processor whose redistributor has ChildrenAsleep set cannot receive
+ * interrupts at all, which explains a CPU that takes neither timer IRQs
+ * nor pseudo-NMIs.  Return 0 on success, -ENODEV if the frame is not mapped.
+ */
+int gicv3_j716f_redist_state(int cpu, u32 *waker, u32 *pending, u32 *active)
+{
+	void __iomem *rd_base, *sgi_base;
+
+	if (!gic_data.rdists.rdist)
+		return -ENODEV;
+
+	rd_base = per_cpu_ptr(gic_data.rdists.rdist, cpu)->rd_base;
+	if (!rd_base)
+		return -ENODEV;
+
+	sgi_base = rd_base + SZ_64K;
+	*waker = readl_relaxed(rd_base + GICR_WAKER);
+	*pending = readl_relaxed(sgi_base + GICR_ISPENDR0);
+	*active = readl_relaxed(sgi_base + GICR_ISACTIVER0);
+	return 0;
+}
+
+void gicv3_j716f_dump_redist(int cpu)
+{
+	void __iomem *rd_base;
+	u32 waker, pending, active, enabled, ctlr;
+
+	if (gicv3_j716f_redist_state(cpu, &waker, &pending, &active)) {
+		pr_info("J716F GICR cpu%d: no redistributor mapped\n", cpu);
+		return;
+	}
+
+	rd_base = per_cpu_ptr(gic_data.rdists.rdist, cpu)->rd_base;
+	ctlr = readl_relaxed(rd_base + GICR_CTLR);
+	enabled = readl_relaxed(rd_base + SZ_64K + GICR_ISENABLER0);
+
+	pr_info("J716F GICR cpu%d: waker=%08x%s%s ctlr=%08x pending=%08x active=%08x enabled=%08x\n",
+		cpu, waker,
+		(waker & GICR_WAKER_ProcessorSleep) ? " sleep" : "",
+		(waker & GICR_WAKER_ChildrenAsleep) ? " asleep" : "",
+		ctlr, pending, active, enabled);
+}
+#endif
+
 static int __init gic_init_bases(phys_addr_t dist_phys_base,
 				 void __iomem *dist_base,
 				 struct redist_region *rdist_regs,

@@ -327,3 +327,17 @@ config QCOM_UBWC_CONFIG
 	  (UBWC) engines across various IP blocks, which need to be initialized
 	  with coherent configuration data. This module functions as a single
 	  source of truth for that information.
+
+config QCOM_J716F_DIAG
+	bool "J716F (TB-J716F) freeze breadcrumbs and panic state dump"
+	depends on ARCH_QCOM
+	help
+	  Diagnostic scaffolding for the Lenovo Xiaoxin Pad Pro 2021
+	  (TB-J716F, SM8250) mainline port.  Records a small per-CPU
+	  breadcrumb before every blocking hardware access on the RPMh,
+	  interconnect, cpufreq, SCM, SPMI, GPU and DPU paths and dumps
+	  them together with the GIC redistributor and RPMh TCS state from
+	  the panic notifier.  The J716F freeze stops a CPU in normal
+	  kernel context without taking timer interrupts or pseudo-NMIs,
+	  so the last breadcrumb is the only way to find the stalled
+	  access.  Say N on anything but the TB-J716F port.

@@ -41,6 +41,7 @@
 
 #include <linux/kernel_stat.h>
 #include <linux/mm.h>
+#include <soc/qcom/j716f-diag.h>
 #include <linux/mm_inline.h>
 #include <linux/sched/mm.h>
 #include <linux/sched/numa_balancing.h>
@@ -302,6 +303,7 @@ void free_pgd_range(struct mmu_gather *tlb,
 	pgd_t *pgd;
 	unsigned long next;
 
+	j716f_bc(J716F_BC_MM_FREE_PGD_RANGE_ENTER, addr);
 	/*
 	 * The next few lines have given us lots of grief...
 	 *
@@ -384,6 +386,7 @@ void free_pgtables(struct mmu_gather *tlb, struct unmap_desc *unmap)
 	 */
 	WARN_ON_ONCE(unmap->vma_end - 1 > unmap->pg_end - 1);
 
+	j716f_bc(J716F_BC_MM_FREE_PGTABLES_ENTER, (unsigned long)vma->vm_mm);
 	tlb_free_vmas(tlb);
 
 	do {
@@ -420,6 +423,7 @@ void free_pgtables(struct mmu_gather *tlb, struct unmap_desc *unmap)
 			       next ? next->vm_start : unmap->pg_end);
 		vma = next;
 	} while (vma);
+	j716f_bc(J716F_BC_MM_FREE_PGTABLES_EXIT, (unsigned long)unmap->first->vm_mm);
 }
 
 void pmd_install(struct mm_struct *mm, pmd_t *pmd, pgtable_t *pte)
@@ -2298,6 +2302,7 @@ void unmap_vmas(struct mmu_gather *tlb, struct unmap_desc *unmap)
 	};
 
 	vma = unmap->first;
+	j716f_bc(J716F_BC_MM_UNMAP_VMAS_ENTER, (unsigned long)vma->vm_mm);
 	mmu_notifier_range_init(&range, MMU_NOTIFY_UNMAP, 0, vma->vm_mm,
 				unmap->vma_start, unmap->vma_end);
 	mmu_notifier_invalidate_range_start(&range);
@@ -2311,6 +2316,7 @@ void unmap_vmas(struct mmu_gather *tlb, struct unmap_desc *unmap)
 		vma = mas_find(unmap->mas, unmap->tree_end - 1);
 	} while (vma);
 	mmu_notifier_invalidate_range_end(&range);
+	j716f_bc(J716F_BC_MM_UNMAP_VMAS_EXIT, (unsigned long)unmap->first->vm_mm);
 }
 
 /**

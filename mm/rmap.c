@@ -53,6 +53,7 @@
  */
 
 #include <linux/mm.h>
+#include <soc/qcom/j716f-diag.h>
 #include <linux/sched/mm.h>
 #include <linux/sched/task.h>
 #include <linux/pagemap.h>
@@ -817,6 +818,7 @@ void flush_tlb_batched_pending(struct mm_struct *mm)
 	int pending = batch & TLB_FLUSH_BATCH_PENDING_MASK;
 	int flushed = batch >> TLB_FLUSH_BATCH_FLUSHED_SHIFT;
 
+	j716f_bc(J716F_BC_TLB_BATCHED_ENTER, (unsigned long)mm);
 	if (pending != flushed) {
 		flush_tlb_mm(mm);
 		/*
@@ -826,6 +828,7 @@ void flush_tlb_batched_pending(struct mm_struct *mm)
 		atomic_cmpxchg(&mm->tlb_flush_batched, batch,
 			       pending | (pending << TLB_FLUSH_BATCH_FLUSHED_SHIFT));
 	}
+	j716f_bc(J716F_BC_TLB_BATCHED_EXIT, (unsigned long)mm);
 }
 #else
 static void set_tlb_ubc_flush_pending(struct mm_struct *mm, pte_t pteval,

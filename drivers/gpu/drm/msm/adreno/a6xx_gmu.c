@@ -10,6 +10,7 @@
 #include <linux/pm_domain.h>
 #include <linux/pm_opp.h>
 #include <soc/qcom/cmd-db.h>
+#include <soc/qcom/j716f-diag.h>
 #include <soc/qcom/tcs.h>
 #include <drm/drm_gem.h>
 
@@ -1318,6 +1319,7 @@ int a6xx_gmu_resume(struct a6xx_gpu *a6xx_gpu)
 
 	gmu->hung = false;
 
+	j716f_bc(J716F_BC_GPU_RESUME_ENTER, 0);
 	dev_info(gmu->dev, "J716F GMU: resume enter\n");
 
 	/* Turn on the resources */
@@ -1394,6 +1396,7 @@ int a6xx_gmu_resume(struct a6xx_gpu *a6xx_gpu)
 
 	dev_info(gmu->dev, "J716F GMU: resume done\n");
 
+	j716f_bc(J716F_BC_GPU_RESUME_EXIT, 0);
 	return 0;
 
 disable_irq:
@@ -1505,6 +1508,7 @@ int a6xx_gmu_stop(struct a6xx_gpu *a6xx_gpu)
 	if (!pm_runtime_active(gmu->dev))
 		return 0;
 
+	j716f_bc(J716F_BC_GPU_STOP_ENTER, 0);
 	/*
 	 * Force the GMU off if we detected a hang, otherwise try to shut it
 	 * down gracefully
@@ -1528,6 +1532,7 @@ int a6xx_gmu_stop(struct a6xx_gpu *a6xx_gpu)
 
 	pm_runtime_put_sync(gmu->dev);
 
+	j716f_bc(J716F_BC_GPU_STOP_EXIT, 0);
 	return 0;
 }
 

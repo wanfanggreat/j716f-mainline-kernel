@@ -10,6 +10,7 @@
  */
 #include "vma_internal.h"
 #include "vma.h"
+#include <soc/qcom/j716f-diag.h>
 
 struct mmap_state {
 	struct mm_struct *mm;
@@ -527,12 +528,14 @@ void unmap_region(struct unmap_desc *unmap)
 	struct mm_struct *mm = unmap->first->vm_mm;
 	struct mmu_gather tlb;
 
+	j716f_bc(J716F_BC_MM_UNMAP_REGION_ENTER, (unsigned long)mm);
 	tlb_gather_mmu(&tlb, mm);
 	update_hiwater_rss(mm);
 	unmap_vmas(&tlb, unmap);
 	mas_set(unmap->mas, unmap->tree_reset);
 	free_pgtables(&tlb, unmap);
 	tlb_finish_mmu(&tlb);
+	j716f_bc(J716F_BC_MM_UNMAP_REGION_EXIT, (unsigned long)mm);
 }
 
 /*

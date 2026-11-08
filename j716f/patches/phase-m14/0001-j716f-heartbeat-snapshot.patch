@@ -1,0 +1,362 @@
+--- a/drivers/irqchip/irq-gic-v3.c	2026-11-08 12:21:35.484706183 +0800
++++ b/drivers/irqchip/irq-gic-v3.c	2026-11-08 12:15:17.057293152 +0800
+@@ -1972,34 +1972,46 @@
+ }
+ 
+ #ifdef CONFIG_QCOM_J716F_DIAG
++int gicv3_j716f_redist_state(int cpu, u32 *waker, u32 *pending, u32 *active);
+ void gicv3_j716f_dump_redist(int cpu);
+ 
+ /*
+- * Diagnostic only: dump the redistributor state of @cpu from another CPU.
++ * Diagnostic only: read the redistributor state of @cpu from any CPU.
+  * A processor whose redistributor has ChildrenAsleep set cannot receive
+  * interrupts at all, which explains a CPU that takes neither timer IRQs
+- * nor pseudo-NMIs.  Called from the J716F panic notifier.
++ * nor pseudo-NMIs.  Return 0 on success, -ENODEV if the frame is not mapped.
+  */
+-void gicv3_j716f_dump_redist(int cpu)
++int gicv3_j716f_redist_state(int cpu, u32 *waker, u32 *pending, u32 *active)
+ {
+ 	void __iomem *rd_base, *sgi_base;
+-	u32 waker, ctlr, pending, active, enabled;
+ 
+ 	if (!gic_data.rdists.rdist)
+-		return;
++		return -ENODEV;
+ 
+ 	rd_base = per_cpu_ptr(gic_data.rdists.rdist, cpu)->rd_base;
+-	if (!rd_base) {
++	if (!rd_base)
++		return -ENODEV;
++
++	sgi_base = rd_base + SZ_64K;
++	*waker = readl_relaxed(rd_base + GICR_WAKER);
++	*pending = readl_relaxed(sgi_base + GICR_ISPENDR0);
++	*active = readl_relaxed(sgi_base + GICR_ISACTIVER0);
++	return 0;
++}
++
++void gicv3_j716f_dump_redist(int cpu)
++{
++	void __iomem *rd_base;
++	u32 waker, pending, active, enabled, ctlr;
++
++	if (gicv3_j716f_redist_state(cpu, &waker, &pending, &active)) {
+ 		pr_info("J716F GICR cpu%d: no redistributor mapped\n", cpu);
+ 		return;
+ 	}
+ 
+-	sgi_base = rd_base + SZ_64K;
+-	waker = readl_relaxed(rd_base + GICR_WAKER);
++	rd_base = per_cpu_ptr(gic_data.rdists.rdist, cpu)->rd_base;
+ 	ctlr = readl_relaxed(rd_base + GICR_CTLR);
+-	pending = readl_relaxed(sgi_base + GICR_ISPENDR0);
+-	active = readl_relaxed(sgi_base + GICR_ISACTIVER0);
+-	enabled = readl_relaxed(sgi_base + GICR_ISENABLER0);
++	enabled = readl_relaxed(rd_base + SZ_64K + GICR_ISENABLER0);
+ 
+ 	pr_info("J716F GICR cpu%d: waker=%08x%s%s ctlr=%08x pending=%08x active=%08x enabled=%08x\n",
+ 		cpu, waker,
+--- a/drivers/soc/qcom/j716f-diag.c	2026-11-08 12:21:35.484706183 +0800
++++ b/drivers/soc/qcom/j716f-diag.c	2026-11-08 12:17:42.894597277 +0800
+@@ -17,9 +17,13 @@
+ #include <linux/compiler.h>
+ #include <linux/console.h>
+ #include <linux/context_tracking_state.h>
++#include <linux/cpuhotplug.h>
+ #include <linux/export.h>
+ #include <linux/hardirq.h>
++#include <linux/hrtimer.h>
+ #include <linux/init.h>
++#include <linux/ktime.h>
++#include <linux/math64.h>
+ #include <linux/kernel.h>
+ #include <linux/panic_notifier.h>
+ #include <linux/percpu.h>
+@@ -51,10 +55,23 @@
+ 
+ struct j716f_bc_cpu {
+ 	u32 seq;
++	u32 alert_stage;
++	u64 heartbeat;
+ 	struct j716f_bc_rec ring[J716F_BC_RING];
+ };
+ 
+ static DEFINE_PER_CPU(struct j716f_bc_cpu, j716f_bc_data);
++static DEFINE_PER_CPU(struct hrtimer, j716f_snap_timer);
++
++/*
++ * A CPU whose snapshot hrtimer has not run for this long is not merely
++ * idle: its interrupts are off, it is inside EL3, or the core is stuck on
++ * a bus access.  That is exactly the freeze signature.
++ */
++#define J716F_STALE_NS		(2ULL * NSEC_PER_SEC)
++#define J716F_SNAP_PERIOD_NS	NSEC_PER_SEC
++
++static const u64 j716f_alert_ms[] = { 2000, 5000, 10000, 20000, 40000, 80000 };
+ 
+ static const char *const j716f_bc_names[J716F_BC_MAX] = {
+ 	[J716F_BC_NONE]			= "none",
+@@ -210,8 +227,178 @@
+ }
+ 
+ #if IS_ENABLED(CONFIG_ARM_GIC_V3)
++extern int gicv3_j716f_redist_state(int cpu, u32 *waker, u32 *pending, u32 *active);
+ extern void gicv3_j716f_dump_redist(int cpu);
+ #endif
++
++/* Read the newest record of @cpu without insisting on a stable snapshot. */
++static void j716f_bc_last(int cpu, struct j716f_bc_rec *out, u32 *seq_out)
++{
++	struct j716f_bc_cpu *c = per_cpu_ptr(&j716f_bc_data, cpu);
++	u32 seq = READ_ONCE(c->seq);
++	struct j716f_bc_rec *r;
++
++	if (!seq) {
++		memset(out, 0, sizeof(*out));
++		*seq_out = 0;
++		return;
++	}
++	r = &c->ring[(seq - 1) & (J716F_BC_RING - 1)];
++	out->site = READ_ONCE(r->site);
++	out->arg = READ_ONCE(r->arg);
++	out->flags = READ_ONCE(r->flags);
++	out->pid = READ_ONCE(r->pid);
++	memcpy(out->comm, r->comm, sizeof(out->comm));
++	out->comm[sizeof(out->comm) - 1] = '\0';
++	out->ts = smp_load_acquire(&r->ts);
++	*seq_out = seq - 1;
++}
++
++static void j716f_snap_print(u64 now)
++{
++	char buf[512];
++	int len = 0, cpu;
++
++	len += scnprintf(buf + len, sizeof(buf) - len, "J716F SNAP t=%llus",
++			 div_u64(now, NSEC_PER_SEC));
++
++	for_each_online_cpu(cpu) {
++		struct j716f_bc_rec r;
++		u32 seq;
++		u64 beat = READ_ONCE(per_cpu(j716f_bc_data, cpu).heartbeat);
++
++		j716f_bc_last(cpu, &r, &seq);
++		if (!beat) {
++			len += scnprintf(buf + len, sizeof(buf) - len,
++					 " cpu%d=nostart", cpu);
++			continue;
++		}
++		if (now - beat > J716F_STALE_NS)
++			len += scnprintf(buf + len, sizeof(buf) - len,
++					 " cpu%d=STALE:%llums:%s", cpu,
++					 (now - beat) / NSEC_PER_MSEC,
++					 j716f_bc_name(r.site));
++		else
++			len += scnprintf(buf + len, sizeof(buf) - len,
++					 " cpu%d=%s/%llums", cpu,
++					 j716f_bc_name(r.site),
++					 r.ts ? (now - r.ts) / NSEC_PER_MSEC : 0);
++	}
++	pr_info("%s\n", buf);
++}
++
++static void j716f_snap_alert(u64 now)
++{
++	int cpu;
++
++	for_each_online_cpu(cpu) {
++		struct j716f_bc_cpu *c = per_cpu_ptr(&j716f_bc_data, cpu);
++		struct j716f_bc_rec r;
++		u32 seq, flags, stage = 0;
++		u64 beat = READ_ONCE(c->heartbeat);
++		u64 age;
++		int i;
++
++		if (!beat)
++			continue;
++
++		age = now - beat;
++		for (i = 0; i < ARRAY_SIZE(j716f_alert_ms); i++)
++			if (age >= j716f_alert_ms[i] * NSEC_PER_MSEC)
++				stage = i + 1;
++
++		if (!stage) {
++			WRITE_ONCE(c->alert_stage, 0);
++			continue;
++		}
++		if (stage <= READ_ONCE(c->alert_stage))
++			continue;
++		WRITE_ONCE(c->alert_stage, stage);
++
++		j716f_bc_last(cpu, &r, &seq);
++		flags = r.flags;
++#if IS_ENABLED(CONFIG_ARM_GIC_V3)
++		{
++			u32 waker = 0, pending = 0, active = 0;
++			int ret = gicv3_j716f_redist_state(cpu, &waker, &pending, &active);
++
++			pr_info("J716F SNAP-ALERT t=%llus cpu%d stale=%llums stage=%u site=%s arg=0x%lx site_age=%llums fl=%c%c%c pid=%u comm=%s ct=%ld/%#lx gicr=%s waker=%08x pending=%08x active=%08x\n",
++				div_u64(now, NSEC_PER_SEC), cpu,
++				age / NSEC_PER_MSEC, stage,
++				j716f_bc_name(r.site), r.arg,
++				r.ts ? (now - r.ts) / NSEC_PER_MSEC : 0,
++				(flags & J716F_BC_F_IRQOFF) ? 'I' : '-',
++				(flags & J716F_BC_F_HARDIRQ) ? 'H' : '-',
++				(flags & J716F_BC_F_NMI) ? 'N' : '-',
++				r.pid, r.comm,
++#if IS_ENABLED(CONFIG_CONTEXT_TRACKING_IDLE)
++				ct_nesting_cpu(cpu),
++				(unsigned long)ct_nmi_nesting_cpu(cpu),
++#else
++				0L, 0UL,
++#endif
++				ret ? "nomap" : "ok", waker, pending, active);
++		}
++#else
++		pr_info("J716F SNAP-ALERT t=%llus cpu%d stale=%llums stage=%u site=%s arg=0x%lx site_age=%llums fl=%c%c%c pid=%u comm=%s\n",
++			div_u64(now, NSEC_PER_SEC), cpu, age / NSEC_PER_MSEC, stage,
++			j716f_bc_name(r.site), r.arg,
++			r.ts ? (now - r.ts) / NSEC_PER_MSEC : 0,
++			(flags & J716F_BC_F_IRQOFF) ? 'I' : '-',
++			(flags & J716F_BC_F_HARDIRQ) ? 'H' : '-',
++			(flags & J716F_BC_F_NMI) ? 'N' : '-',
++			r.pid, r.comm);
++#endif
++	}
++}
++
++static enum hrtimer_restart j716f_snap_fn(struct hrtimer *h)
++{
++	u64 now = local_clock();
++	int cpu = raw_smp_processor_id();
++	unsigned int online = num_online_cpus();
++	u64 tick = div_u64(now, NSEC_PER_SEC);
++	struct j716f_bc_cpu *c = this_cpu_ptr(&j716f_bc_data);
++
++	WRITE_ONCE(c->heartbeat, now);
++
++	/* One printer per second, rotating so a stuck CPU cannot blind us. */
++	if (online && (unsigned int)(tick % online) == (unsigned int)cpu) {
++		j716f_snap_print(now);
++		j716f_snap_alert(now);
++	}
++
++	hrtimer_forward_now(h, ns_to_ktime(J716F_SNAP_PERIOD_NS));
++	return HRTIMER_RESTART;
++}
++
++static void j716f_snap_start_cpu(void *unused)
++{
++	int cpu = raw_smp_processor_id();
++	struct hrtimer *h = per_cpu_ptr(&j716f_snap_timer, cpu);
++
++	hrtimer_setup(h, j716f_snap_fn, CLOCK_MONOTONIC,
++		      HRTIMER_MODE_REL_PINNED_HARD);
++	WRITE_ONCE(per_cpu(j716f_bc_data, cpu).heartbeat, local_clock());
++	hrtimer_start(h, ns_to_ktime(J716F_SNAP_PERIOD_NS),
++		      HRTIMER_MODE_REL_PINNED_HARD);
++}
++
++static int j716f_snap_cpu_online(unsigned int cpu)
++{
++	if (cpu == raw_smp_processor_id())
++		j716f_snap_start_cpu(NULL);
++	else
++		smp_call_function_single(cpu, j716f_snap_start_cpu, NULL, 1);
++	return 0;
++}
++
++static int j716f_snap_cpu_offline(unsigned int cpu)
++{
++	hrtimer_cancel(per_cpu_ptr(&j716f_snap_timer, cpu));
++	return 0;
++}
++
+ #if IS_ENABLED(CONFIG_QCOM_RPMH)
+ extern void rpmh_rsc_panic_dump(void);
+ #endif
+@@ -230,6 +417,8 @@
+ 
+ 	pr_info("J716F DIAG dump reason=%s cpu=%d\n", reason, raw_smp_processor_id());
+ 
++	j716f_snap_print(local_clock());
++
+ 	for_each_online_cpu(cpu)
+ 		j716f_bc_dump_cpu(cpu);
+ 
+@@ -278,23 +467,24 @@
+ 	seq_printf(m, "j716f diag: %d sites, %d records/cpu\n",
+ 		   J716F_BC_MAX, J716F_BC_RING);
+ 	for_each_online_cpu(cpu) {
+-		struct j716f_bc_cpu *c = per_cpu_ptr(&j716f_bc_data, cpu);
+-		u32 seq = READ_ONCE(c->seq);
++		struct j716f_bc_rec r;
+ 		u64 now = local_clock();
+-		struct j716f_bc_rec *r;
+-		u32 s;
++		u64 beat = READ_ONCE(per_cpu(j716f_bc_data, cpu).heartbeat);
++		u32 seq;
+ 
++		j716f_bc_last(cpu, &r, &seq);
+ 		if (!seq)
+ 			continue;
+-		s = seq - 1;
+-		r = &c->ring[s & (J716F_BC_RING - 1)];
+-		seq_printf(m, "cpu%d seq=%u site=%s arg=0x%lx fl=%c%c%c pid=%u comm=%s age=%llums\n",
+-			   cpu, s, j716f_bc_name(r->site), r->arg,
+-			   (r->flags & J716F_BC_F_IRQOFF) ? 'I' : '-',
+-			   (r->flags & J716F_BC_F_HARDIRQ) ? 'H' : '-',
+-			   (r->flags & J716F_BC_F_NMI) ? 'N' : '-',
+-			   r->pid, r->comm,
+-			   r->ts ? (now - r->ts) / 1000000ULL : 0);
++		seq_printf(m, "cpu%d seq=%u beat=%llums%s site=%s arg=0x%lx fl=%c%c%c pid=%u comm=%s age=%llums\n",
++			   cpu, seq,
++			   beat ? (now - beat) / NSEC_PER_MSEC : 0,
++			   (!beat || now - beat > J716F_STALE_NS) ? " STALE" : "",
++			   j716f_bc_name(r.site), r.arg,
++			   (r.flags & J716F_BC_F_IRQOFF) ? 'I' : '-',
++			   (r.flags & J716F_BC_F_HARDIRQ) ? 'H' : '-',
++			   (r.flags & J716F_BC_F_NMI) ? 'N' : '-',
++			   r.pid, r.comm,
++			   r.ts ? (now - r.ts) / NSEC_PER_MSEC : 0);
+ 	}
+ 	return 0;
+ }
+@@ -330,6 +520,7 @@
+ static int __init j716f_diag_init(void)
+ {
+ 	struct proc_dir_entry *entry;
++	int cpu, ret;
+ 
+ 	entry = proc_create("j716f_diag", 0600, NULL, &j716f_diag_proc_ops);
+ 	if (!entry) {
+@@ -339,8 +530,25 @@
+ 
+ 	atomic_notifier_chain_register(&panic_notifier_list, &j716f_panic_nb);
+ 
+-	pr_info("breadcrumbs enabled: %d sites, %d records per CPU\n",
+-		J716F_BC_MAX, J716F_BC_RING);
++	/*
++	 * A 1 Hz pinned hard hrtimer per CPU is the liveness heartbeat: if a
++	 * CPU's timer stops, its interrupts are off / it is in EL3 / the core
++	 * is wedged, and the last breadcrumb names the site.  The printer is
++	 * elected per second so a single stuck CPU cannot blind the stream.
++	 */
++	for_each_online_cpu(cpu)
++		smp_call_function_single(cpu, j716f_snap_start_cpu, NULL, 1);
++
++	ret = cpuhp_setup_state_nocalls(CPUHP_AP_ONLINE_DYN,
++					"soc/qcom/j716f-diag:online",
++					j716f_snap_cpu_online,
++					j716f_snap_cpu_offline);
++	if (ret < 0)
++		pr_warn("could not register the CPU online callback: %d\n", ret);
++
++	pr_info("breadcrumbs enabled: %d sites, %d records per CPU, %llu ms heartbeat\n",
++		J716F_BC_MAX, J716F_BC_RING,
++		(unsigned long long)(J716F_SNAP_PERIOD_NS / NSEC_PER_MSEC));
+ 	return 0;
+ }
+ device_initcall(j716f_diag_init);

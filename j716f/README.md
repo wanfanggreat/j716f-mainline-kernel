@@ -16,7 +16,8 @@ Snapdragon 870 / SM8250-AC）主线 Linux 移植的**完整内核源码**，
 | 上游基线 tag | `upstream-7.3.1` |
 | 基线提交 | `788e48f`（chore(kernel): import Linux 7.3.1 from kernel.org tarball） |
 | M10 构建源码 tag | `j716f-m10` = `e562462a3c039afd27f3ab5e1cc584d8bc24b77a` |
-| M11/v45-diag 构建源码 tag | `j716f-m11`（本提交，含 GPU/RPMh 诊断打印） |
+| M11/v45-diag 构建源码 tag | `j716f-m11` = `0a2059ef08af2cc121ae288554044c21bbf681c1` |
+| M15/v49-diag 构建源码 tag | `j716f-m15`（本提交，含 RPMh 修复与面包屑/心跳/mm 诊断） |
 | 归档工作树 tag | `j716f-worktree-20261108` = `15a8792c970c8544d21dfa7c2529f7ca36c785ac` |
 | 归档文档 tag | `j716f-archive-20261108`（分支 `main` HEAD，含本说明修正） |
 | 许可 | GPL-2.0（见 `COPYING`） |
@@ -37,9 +38,10 @@ M10 镜像构建完成后（2026-11-08 00:59），工作树又增加了一处
 
 ## 本地改动范围
 
-相对 7.3.1 共 47 个文件：45 个修改、2 个新增
-（`sm8250-lenovo-j716f.dts`、`es7210.c`），合计
-5100 insertions / 183 deletions（以 M11 构建源码 `j716f-m11` 计）。
+相对 7.3.1 共 75 个文件：71 个修改、4 个新增
+（`sm8250-lenovo-j716f.dts`、`es7210.c`、`j716f-diag.c`、`j716f-diag.h`），
+合计 6696 insertions / 313 deletions（以 M15 构建源码 `j716f-m15` 计）。
+M11 构建源码 `j716f-m11` 为 5100 insertions / 183 deletions；
 M10 构建源码 `j716f-m10` 为 4986 insertions / 175 deletions。
 逐文件统计见
 [`CHANGES-vs-7.3.1.md`](CHANGES-vs-7.3.1.md)，按阶段拆分的补丁原文在
@@ -59,7 +61,10 @@ M10 构建源码 `j716f-m10` 为 4986 insertions / 175 deletions。
 - 设备树：`arch/arm64/boot/dts/qcom/sm8250-lenovo-j716f.dts`；
 - M11/v45 诊断：Adreno/GMU/DPU/DSI 现场打印，以及
   `msm.skip_scm_aperture`、`msm.no_gpu_rpm`、`msm.force_linear`
-  三个诊断开关（仅用于冻结定位，不是产品修复）。
+  三个诊断开关（仅用于冻结定位，不是产品修复）；
+- M12–M15 诊断：RPMh 超时请求保活与 RSC 状态 dump、每 CPU 面包屑环、
+  1 Hz 心跳快照、mm teardown 插桩与失联 NMI 回溯/panic
+  （`drivers/soc/qcom/j716f-diag.c`、`irq-gic-v3.c`、`rpmh*.c`、`mm/*`）。
 
 本仓只做资料归档，未在本轮修改任何功能逻辑。
 

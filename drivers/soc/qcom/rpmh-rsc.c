@@ -12,6 +12,7 @@
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
+#include <linux/irq.h>
 #include <linux/kernel.h>
 #include <linux/ktime.h>
 #include <linux/list.h>
@@ -25,17 +26,38 @@
 #include <linux/pm_runtime.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
+#include <linux/string_choices.h>
 #include <linux/wait.h>
 
 #include <clocksource/arm_arch_timer.h>
 #include <soc/qcom/cmd-db.h>
+#include <soc/qcom/j716f-diag.h>
 #include <soc/qcom/tcs.h>
 #include <dt-bindings/soc/qcom,rpmh-rsc.h>
 
 #include "rpmh-internal.h"
 
+#ifdef CONFIG_QCOM_J716F_DIAG
+static LIST_HEAD(rsc_drv_list);
+static bool rsc_panic_dump = true;
+module_param(rsc_panic_dump, bool, 0644);
+MODULE_PARM_DESC(rsc_panic_dump, "J716F: dump RSC/TCS state from the panic notifier");
+#endif
+
 #define CREATE_TRACE_POINTS
 #include "trace-rpmh.h"
+
+/*
+ * J716F diagnostic: the RSC completion IRQ is normally left with the default
+ * affinity.  If the target CPU enters a deep idle state, the GIC may not
+ * deliver the completion until that CPU wakes.  enable_wake=1 asks the irqchip
+ * to treat the RSC IRQ as a wakeup source, so the target CPU can be woken by
+ * the completion itself.  This is an experiment, not a product setting.
+ */
+static bool enable_wake;
+module_param_named(enable_wake, enable_wake, bool, 0644);
+MODULE_PARM_DESC(enable_wake,
+		 "J716F diagnostic: enable IRQ wake for the RSC completion IRQ");
 
 
 #define RSC_DRV_ID			0
@@ -89,6 +111,7 @@ enum {
 #define CMD_MSGID_LEN			8
 #define CMD_MSGID_RESP_REQ		BIT(8)
 #define CMD_MSGID_WRITE			BIT(16)
+#define CMD_STATUS_TRIGGERED		BIT(0)
 #define CMD_STATUS_ISSUED		BIT(8)
 #define CMD_STATUS_COMPL		BIT(16)
 
@@ -232,6 +255,7 @@ static void write_tcs_reg_sync(const struct rsc_drv *drv, int reg, int tcs_id,
 {
 	int i;
 
+	j716f_bc(J716F_BC_RSC_WRSYNC_ENTER, ((unsigned long)tcs_id << 16) | reg);
 	writel(data, tcs_reg_addr(drv, reg, tcs_id));
 
 	/*
@@ -239,10 +263,14 @@ static void write_tcs_reg_sync(const struct rsc_drv *drv, int reg, int tcs_id,
 	 * ktime for timeout since this may be called after timekeeping stops.
 	 */
 	for (i = 0; i < USEC_PER_SEC; i++) {
-		if (readl(tcs_reg_addr(drv, reg, tcs_id)) == data)
+		if (readl(tcs_reg_addr(drv, reg, tcs_id)) == data) {
+			j716f_bc(J716F_BC_RSC_WRSYNC_DONE,
+				 ((unsigned long)tcs_id << 16) | reg);
 			return;
+		}
 		udelay(1);
 	}
+	j716f_bc(J716F_BC_RSC_WRSYNC_FAIL, ((unsigned long)tcs_id << 16) | reg);
 	pr_err("%s: error writing %#x to %d:%#x\n", drv->name,
 	       data, tcs_id, reg);
 }
@@ -268,8 +296,12 @@ static void tcs_invalidate(struct rsc_drv *drv, int type)
 	if (bitmap_empty(tcs->slots, MAX_TCS_SLOTS))
 		return;
 
-	for (m = tcs->offset; m < tcs->offset + tcs->num_tcs; m++)
+	j716f_bc(J716F_BC_RSC_INVAL_ENTER, type);
+	for (m = tcs->offset; m < tcs->offset + tcs->num_tcs; m++) {
+		j716f_bc(J716F_BC_RSC_INVAL_TCS, m);
 		write_tcs_reg_sync(drv, drv->regs[RSC_DRV_CMD_ENABLE], m, 0);
+	}
+	j716f_bc(J716F_BC_RSC_INVAL_EXIT, type);
 
 	bitmap_zero(tcs->slots, MAX_TCS_SLOTS);
 }
@@ -385,6 +417,8 @@ static void __tcs_set_trigger(struct rsc_drv *drv, int tcs_id, bool trigger)
 	u32 enable;
 	u32 reg = drv->regs[RSC_DRV_CONTROL];
 
+	j716f_bc(J716F_BC_RSC_TRIGGER_ENTER, ((unsigned long)tcs_id << 1) | trigger);
+
 	/*
 	 * HW req: Clear the DRV_CONTROL and enable TCS again
 	 * While clearing ensure that the AMC mode trigger is cleared
@@ -403,6 +437,7 @@ static void __tcs_set_trigger(struct rsc_drv *drv, int tcs_id, bool trigger)
 		enable |= TCS_AMC_MODE_TRIGGER;
 		write_tcs_reg(drv, reg, tcs_id, enable);
 	}
+	j716f_bc(J716F_BC_RSC_TRIGGER_EXIT, ((unsigned long)tcs_id << 1) | trigger);
 }
 
 /**
@@ -445,9 +480,11 @@ static irqreturn_t tcs_tx_done(int irq, void *p)
 	const struct tcs_request *req;
 	u32 reg;
 
+	j716f_bc(J716F_BC_RSC_IRQ_ENTER, irq);
 	irq_status = readl_relaxed(drv->tcs_base + drv->regs[RSC_DRV_IRQ_STATUS]);
 
 	for_each_set_bit(i, &irq_status, BITS_PER_TYPE(u32)) {
+		j716f_bc(J716F_BC_RSC_IRQ_TCS, i);
 		req = get_req_from_tcs(drv, i);
 		if (WARN_ON(!req))
 			goto skip;
@@ -481,6 +518,7 @@ skip:
 		if (req)
 			rpmh_tx_done(req);
 	}
+	j716f_bc(J716F_BC_RSC_IRQ_EXIT, irq_status);
 
 	return IRQ_HANDLED;
 }
@@ -659,6 +697,8 @@ int rpmh_rsc_send_data(struct rsc_drv *drv, const struct tcs_request *msg)
 	if (IS_ERR(tcs))
 		return PTR_ERR(tcs);
 
+	j716f_bc(J716F_BC_RSC_SEND_ENTER,
+		 ((unsigned long)msg->state << 32) | msg->cmds[0].addr);
 	spin_lock_irq(&drv->lock);
 
 	/* Wait forever for a free tcs. It better be there eventually! */
@@ -666,6 +706,7 @@ int rpmh_rsc_send_data(struct rsc_drv *drv, const struct tcs_request *msg)
 			    (tcs_id = claim_tcs_for_req(drv, tcs, msg)) >= 0,
 			    drv->lock);
 
+	j716f_bc(J716F_BC_RSC_SEND_CLAIM, tcs_id);
 	tcs->req[tcs_id - tcs->offset] = msg;
 	set_bit(tcs_id, drv->tcs_in_use);
 	if (msg->state == RPMH_ACTIVE_ONLY_STATE && tcs->type != ACTIVE_TCS) {
@@ -687,11 +728,181 @@ int rpmh_rsc_send_data(struct rsc_drv *drv, const struct tcs_request *msg)
 	 * - The interrupt can't go off until we trigger w/ the last line
 	 *   of __tcs_set_trigger() below.
 	 */
+	j716f_bc(J716F_BC_RSC_SEND_BUFFER, tcs_id);
 	__tcs_buffer_write(drv, tcs_id, 0, msg);
+	j716f_bc(J716F_BC_RSC_SEND_TRIGGER, tcs_id);
 	__tcs_set_trigger(drv, tcs_id, true);
+	j716f_bc(J716F_BC_RSC_SEND_EXIT, tcs_id);
 
 	return 0;
 }
+
+static void print_tcs_info(struct rsc_drv *drv, int tcs_id,
+			   bool *aoss_irq_sts)
+{
+	const struct tcs_request *req = get_req_from_tcs(drv, tcs_id);
+	unsigned long cmds_enabled;
+	char rname[CMD_DB_ID_SIZE + 1];
+	u32 addr, data, msgid, sts, irq_sts;
+	bool in_use = test_bit(tcs_id, drv->tcs_in_use);
+	int i;
+
+	sts = read_tcs_reg(drv, drv->regs[RSC_DRV_STATUS], tcs_id);
+	cmds_enabled = read_tcs_reg(drv, drv->regs[RSC_DRV_CMD_ENABLE], tcs_id);
+	if (!cmds_enabled)
+		return;
+
+	if (!req)
+		goto print_tcs_data;
+
+	data = read_tcs_reg(drv, drv->regs[RSC_DRV_CONTROL], tcs_id);
+	irq_sts = readl_relaxed(drv->tcs_base + drv->regs[RSC_DRV_IRQ_STATUS]);
+	dev_warn(drv->dev, "Request: tcs-in-use:%s state=%d wait_for_compl=%u\n",
+		 str_yes_no(in_use), req->state, req->wait_for_compl);
+	dev_warn(drv->dev, "TCS=%d [ctrlr-sts:%s amc-mode:0x%x irq-sts:%s]\n",
+		 tcs_id, sts ? "IDLE" : "BUSY", data,
+		 (irq_sts & BIT(tcs_id)) ? "DONE" : "WAITING");
+
+	*aoss_irq_sts |= !!(irq_sts & BIT(tcs_id));
+
+print_tcs_data:
+	/* All TCSes on a given RSC have the same number of commands per TCS. */
+	for_each_set_bit(i, &cmds_enabled, drv->tcs[0].ncpt) {
+		addr = read_tcs_cmd(drv, drv->regs[RSC_DRV_CMD_ADDR], tcs_id, i);
+		data = read_tcs_cmd(drv, drv->regs[RSC_DRV_CMD_DATA], tcs_id, i);
+		msgid = read_tcs_cmd(drv, drv->regs[RSC_DRV_CMD_MSGID], tcs_id, i);
+		sts = read_tcs_cmd(drv, drv->regs[RSC_DRV_CMD_STATUS], tcs_id, i);
+		if (cmd_db_read_name(addr, rname, sizeof(rname)))
+			strscpy(rname, "unknown", sizeof(rname));
+		dev_warn(drv->dev,
+			 "\tCMD=%d [addr=0x%x(%s/%s) data=0x%x %s sts=%s%s%s]\n",
+			 i, addr, cmd_db_hw_type_str(addr), rname, data,
+			 (msgid & CMD_MSGID_RESP_REQ) ? "resp-required" :
+			 "fire-n-forget",
+			 (sts & CMD_STATUS_TRIGGERED) ? "triggered" : "-",
+			 (sts & CMD_STATUS_ISSUED) ? "+sent-to-aoss" : "",
+			 (sts & CMD_STATUS_COMPL) ? "+resp-received" : "");
+	}
+}
+
+/**
+ * rpmh_rsc_debug() - Dump debug information on a transfer timeout.
+ * @drv: The RSC controller.
+ * @compl: The completion object that timed out.
+ *
+ * Dumps the GIC pending state and completion state first (those are cheap and
+ * do not touch the possibly wedged RSC registers), then the TCS state for all
+ * in-use TCSes and which accelerators did not respond.
+ */
+void rpmh_rsc_debug(struct rsc_drv *drv, struct completion *compl)
+{
+	struct irq_data *rsc_irq_data = irq_get_irq_data(drv->irq);
+	const struct cpumask *aff = irq_get_effective_affinity_mask(drv->irq);
+	bool gic_irq_sts, aoss_irq_sts = false;
+	int i, ret, busy = 0;
+
+	if (aff)
+		dev_err(drv->dev,
+			"Timeout on RSC %s: irq=%d hwirq=%lu cpu=%d aff=%*pbl completion=%s\n",
+			drv->name, drv->irq,
+			rsc_irq_data ? rsc_irq_data->hwirq : 0,
+			raw_smp_processor_id(), cpumask_pr_args(aff),
+			completion_done(compl) ? "done" : "not done");
+	else
+		dev_err(drv->dev,
+			"Timeout on RSC %s: irq=%d hwirq=%lu cpu=%d aff=none completion=%s\n",
+			drv->name, drv->irq,
+			rsc_irq_data ? rsc_irq_data->hwirq : 0,
+			raw_smp_processor_id(),
+			completion_done(compl) ? "done" : "not done");
+
+	if (!rsc_irq_data) {
+		dev_err(drv->dev, "No IRQ data for RSC:%s\n", drv->name);
+		return;
+	}
+
+	ret = irq_get_irqchip_state(drv->irq, IRQCHIP_STATE_PENDING,
+				    &gic_irq_sts);
+	dev_warn(drv->dev, "HW IRQ %lu is %s at GIC\n", rsc_irq_data->hwirq,
+		 ret ? "UNKNOWN" : (gic_irq_sts ? "PENDING" : "NOT PENDING"));
+
+	for (i = 0; i < drv->num_tcs; i++) {
+		if (!test_bit(i, drv->tcs_in_use))
+			continue;
+		busy++;
+		print_tcs_info(drv, i, &aoss_irq_sts);
+	}
+
+	if (ret)
+		dev_err(drv->dev,
+			"Failed to read IRQ pending state (%d); cannot determine timeout cause\n",
+			ret);
+	else if ((busy && !gic_irq_sts) || !aoss_irq_sts)
+		dev_err(drv->dev,
+			"Accelerator(s) at AOSS did not respond\n");
+	else if (gic_irq_sts)
+		dev_err(drv->dev,
+			"IRQ pending at GIC but not handled within timeout\n");
+}
+
+#ifdef CONFIG_QCOM_J716F_DIAG
+/**
+ * rpmh_rsc_panic_dump - print RSC/TCS state from the panic notifier
+ *
+ * Reads the possibly wedged RSC registers, so this must be the very last
+ * thing the J716F panic dump does: the header lines are already on the
+ * console, and a hang here mirrors the original failure.
+ */
+void rpmh_rsc_panic_dump(void)
+{
+	struct rsc_drv *drv;
+	int i;
+
+	pr_info("J716F RSC dump begin (panic_dump=%d)\n", rsc_panic_dump);
+	if (!rsc_panic_dump)
+		return;
+
+	list_for_each_entry(drv, &rsc_drv_list, node) {
+		struct irq_data *irqd = irq_get_irq_data(drv->irq);
+		unsigned long in_use = 0;
+		bool gic_pend = false, gic_act = false;
+		int pret, aret;
+
+		bitmap_copy(&in_use, drv->tcs_in_use, drv->num_tcs);
+		pr_info("J716F RSC %s: irq=%d hwirq=%lu num_tcs=%d in_use=%08lx\n",
+			drv->name, drv->irq, irqd ? irqd->hwirq : 0,
+			drv->num_tcs, in_use);
+
+		pret = irq_get_irqchip_state(drv->irq, IRQCHIP_STATE_PENDING,
+					     &gic_pend);
+		aret = irq_get_irqchip_state(drv->irq, IRQCHIP_STATE_ACTIVE,
+					     &gic_act);
+		pr_info("J716F RSC %s: irq pending=%d active=%d (err %d/%d)\n",
+			drv->name, gic_pend, gic_act, pret, aret);
+
+		for_each_set_bit(i, &in_use, drv->num_tcs) {
+			const struct tcs_request *req = get_req_from_tcs(drv, i);
+			u32 ctrl, sts, en, irq_sts;
+
+			ctrl = read_tcs_reg(drv, drv->regs[RSC_DRV_CONTROL], i);
+			sts = read_tcs_reg(drv, drv->regs[RSC_DRV_STATUS], i);
+			en = read_tcs_reg(drv, drv->regs[RSC_DRV_CMD_ENABLE], i);
+			irq_sts = readl_relaxed(drv->tcs_base +
+						drv->regs[RSC_DRV_IRQ_STATUS]);
+			if (req)
+				pr_info("J716F RSC %s tcs%d: state=%d cmds=%d wait=%u addr0=0x%x data0=0x%x ctrl=%08x sts=%08x en=%08x irq_sts=%08x\n",
+					drv->name, i, req->state, req->num_cmds,
+					req->wait_for_compl, req->cmds[0].addr,
+					req->cmds[0].data, ctrl, sts, en,
+					irq_sts);
+			else
+				pr_info("J716F RSC %s tcs%d: no request ctrl=%08x sts=%08x en=%08x irq_sts=%08x\n",
+					drv->name, i, ctrl, sts, en, irq_sts);
+		}
+	}
+	pr_info("J716F RSC dump end\n");
+}
+#endif
 
 /**
  * find_slots() - Find a place to write the given message.
@@ -755,10 +966,12 @@ int rpmh_rsc_write_ctrl_data(struct rsc_drv *drv, const struct tcs_request *msg)
 	if (IS_ERR(tcs))
 		return PTR_ERR(tcs);
 
+	j716f_bc(J716F_BC_RSC_CTRLDATA_ENTER, msg->cmds[0].addr);
 	/* find the TCS id and the command in the TCS to write to */
 	ret = find_slots(tcs, msg, &tcs_id, &cmd_id);
 	if (!ret)
 		__tcs_buffer_write(drv, tcs_id, cmd_id, msg);
+	j716f_bc(J716F_BC_RSC_CTRLDATA_EXIT, msg->cmds[0].addr);
 
 	return ret;
 }
@@ -1114,6 +1327,28 @@ static int rpmh_rsc_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
+	drv->irq = irq;
+	{
+		const struct cpumask *aff = irq_get_effective_affinity_mask(irq);
+		struct irq_data *irqd = irq_get_irq_data(irq);
+
+		if (aff)
+			dev_info(&pdev->dev,
+				 "J716F RSC %s irq=%d hwirq=%lu aff=%*pbl\n",
+				 drv->name, irq, irqd ? irqd->hwirq : 0,
+				 cpumask_pr_args(aff));
+		else
+			dev_info(&pdev->dev,
+				 "J716F RSC %s irq=%d hwirq=%lu aff=none\n",
+				 drv->name, irq, irqd ? irqd->hwirq : 0);
+	}
+
+	if (enable_wake) {
+		ret = enable_irq_wake(irq);
+		dev_info(&pdev->dev, "J716F RSC %s enable_irq_wake=%d\n",
+			 drv->name, ret);
+	}
+
 	/*
 	 * CPU PM/genpd notification are not required for controllers that support
 	 * 'HW solver' mode where they can be in autonomous mode executing low
@@ -1151,6 +1386,9 @@ static int rpmh_rsc_probe(struct platform_device *pdev)
 
 	dev_set_drvdata(&pdev->dev, drv);
 	drv->dev = &pdev->dev;
+#ifdef CONFIG_QCOM_J716F_DIAG
+	list_add_tail(&drv->node, &rsc_drv_list);
+#endif
 
 	return devm_of_platform_populate(&pdev->dev);
 }

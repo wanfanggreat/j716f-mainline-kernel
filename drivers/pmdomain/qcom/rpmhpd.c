@@ -13,6 +13,7 @@
 #include <linux/platform_device.h>
 #include <linux/pm_opp.h>
 #include <soc/qcom/cmd-db.h>
+#include <soc/qcom/j716f-diag.h>
 #include <soc/qcom/rpmh.h>
 #include <dt-bindings/power/qcom-rpmpd.h>
 #include <dt-bindings/power/qcom,rpmhpd.h>
@@ -981,10 +982,11 @@ static int rpmhpd_aggregate_corner(struct rpmhpd *pd, unsigned int corner)
 
 	active_corner = max(this_active_corner, peer_active_corner);
 
+	j716f_bc(J716F_BC_RPMHPD_PERF_ENTER, ((unsigned long)corner << 16) | active_corner);
 	ret = rpmhpd_send_corner(pd, RPMH_ACTIVE_ONLY_STATE, active_corner,
 				 active_corner > pd->active_corner);
 	if (ret)
-		return ret;
+		goto out;
 
 	pd->active_corner = active_corner;
 
@@ -994,14 +996,16 @@ static int rpmhpd_aggregate_corner(struct rpmhpd *pd, unsigned int corner)
 		ret = rpmhpd_send_corner(pd, RPMH_WAKE_ONLY_STATE,
 					 active_corner, false);
 		if (ret)
-			return ret;
+			goto out;
 
 		sleep_corner = max(this_sleep_corner, peer_sleep_corner);
 
-		return rpmhpd_send_corner(pd, RPMH_SLEEP_STATE, sleep_corner,
-					  false);
+		ret = rpmhpd_send_corner(pd, RPMH_SLEEP_STATE, sleep_corner,
+					 false);
 	}
 
+out:
+	j716f_bc(J716F_BC_RPMHPD_PERF_EXIT, (unsigned long)ret);
 	return ret;
 }
 
@@ -1011,6 +1015,7 @@ static int rpmhpd_power_on(struct generic_pm_domain *domain)
 	unsigned int corner;
 	int ret;
 
+	j716f_bc(J716F_BC_RPMHPD_ON_ENTER, 1);
 	mutex_lock(&rpmhpd_lock);
 
 	corner = max(pd->corner, pd->enable_corner);
@@ -1019,6 +1024,7 @@ static int rpmhpd_power_on(struct generic_pm_domain *domain)
 		pd->enabled = true;
 
 	mutex_unlock(&rpmhpd_lock);
+	j716f_bc(J716F_BC_RPMHPD_ON_EXIT, 1);
 
 	return ret;
 }
@@ -1028,6 +1034,7 @@ static int rpmhpd_power_off(struct generic_pm_domain *domain)
 	struct rpmhpd *pd = domain_to_rpmhpd(domain);
 	int ret;
 
+	j716f_bc(J716F_BC_RPMHPD_ON_ENTER, 0);
 	mutex_lock(&rpmhpd_lock);
 
 	ret = rpmhpd_aggregate_corner(pd, 0);
@@ -1035,6 +1042,7 @@ static int rpmhpd_power_off(struct generic_pm_domain *domain)
 		pd->enabled = false;
 
 	mutex_unlock(&rpmhpd_lock);
+	j716f_bc(J716F_BC_RPMHPD_ON_EXIT, 0);
 
 	return ret;
 }

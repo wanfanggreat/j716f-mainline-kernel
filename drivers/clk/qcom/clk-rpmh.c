@@ -11,6 +11,7 @@
 #include <linux/platform_device.h>
 #include <linux/string_choices.h>
 #include <soc/qcom/cmd-db.h>
+#include <soc/qcom/j716f-diag.h>
 #include <soc/qcom/rpmh.h>
 #include <soc/qcom/tcs.h>
 
@@ -162,6 +163,8 @@ static int clk_rpmh_send_aggregate_command(struct clk_rpmh *c)
 	cmd_state = c->aggr_state;
 	on_val = c->res_on_val;
 
+	j716f_bc(J716F_BC_CLK_RPMH_ENTER, c->res_addr);
+
 	for (; state <= RPMH_ACTIVE_ONLY_STATE; state++) {
 		if (has_state_changed(c, state)) {
 			if (cmd_state & BIT(state))
@@ -182,6 +185,7 @@ static int clk_rpmh_send_aggregate_command(struct clk_rpmh *c)
 	c->last_sent_aggr_state = c->aggr_state;
 	c->peer->last_sent_aggr_state = c->last_sent_aggr_state;
 
+	j716f_bc(J716F_BC_CLK_RPMH_EXIT, c->res_addr);
 	return 0;
 }
 

@@ -20,6 +20,8 @@
 #include <drm/drm_framebuffer.h>
 #include <drm/drm_mode.h>
 #include <drm/drm_probe_helper.h>
+
+#include <soc/qcom/j716f-diag.h>
 #include <drm/drm_rect.h>
 #include <drm/drm_vblank.h>
 #include <drm/drm_self_refresh_helper.h>
@@ -1112,6 +1114,7 @@ static void dpu_crtc_atomic_flush(struct drm_crtc *crtc,
 
 	DRM_DEBUG_ATOMIC("crtc%d\n", crtc->base.id);
 
+	j716f_bc(J716F_BC_DPU_FLUSH_ENTER, crtc->base.id);
 	dpu_crtc = to_dpu_crtc(crtc);
 	cstate = to_dpu_crtc_state(crtc->state);
 	dev = crtc->dev;
@@ -1151,6 +1154,7 @@ static void dpu_crtc_atomic_flush(struct drm_crtc *crtc,
 	}
 
 	/* Kickoff will be scheduled by outer layer */
+	j716f_bc(J716F_BC_DPU_FLUSH_EXIT, crtc->base.id);
 }
 
 /**

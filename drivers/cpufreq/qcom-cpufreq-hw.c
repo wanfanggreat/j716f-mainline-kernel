@@ -20,6 +20,8 @@
 #include <linux/spinlock.h>
 #include <linux/units.h>
 
+#include <soc/qcom/j716f-diag.h>
+
 #define LUT_MAX_ENTRIES			40U
 #define LUT_SRC				GENMASK(31, 30)
 #define LUT_L_VAL			GENMASK(7, 0)
@@ -87,7 +89,9 @@ static int qcom_cpufreq_set_bw(struct cpufreq_policy *policy,
 	if (IS_ERR(opp))
 		return PTR_ERR(opp);
 
+	j716f_bc(J716F_BC_CPUFREQ_BW_ENTER, freq_hz);
 	ret = dev_pm_opp_set_opp(dev, opp);
+	j716f_bc(J716F_BC_CPUFREQ_BW_EXIT, freq_hz);
 	dev_pm_opp_put(opp);
 	return ret;
 }
@@ -120,6 +124,7 @@ static int qcom_cpufreq_hw_target_index(struct cpufreq_policy *policy,
 	unsigned long freq = policy->freq_table[index].frequency;
 	unsigned int i;
 
+	j716f_bc(J716F_BC_CPUFREQ_TARGET_ENTER, index);
 	writel_relaxed(index, data->base + soc_data->reg_perf_state);
 
 	if (data->per_core_dcvs)
@@ -129,6 +134,7 @@ static int qcom_cpufreq_hw_target_index(struct cpufreq_policy *policy,
 	if (icc_scaling_enabled)
 		qcom_cpufreq_set_bw(policy, freq);
 
+	j716f_bc(J716F_BC_CPUFREQ_TARGET_EXIT, index);
 	return 0;
 }
 

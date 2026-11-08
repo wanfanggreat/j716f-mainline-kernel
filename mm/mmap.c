@@ -13,6 +13,7 @@
 #include <linux/slab.h>
 #include <linux/backing-dev.h>
 #include <linux/mm.h>
+#include <soc/qcom/j716f-diag.h>
 #include <linux/mm_inline.h>
 #include <linux/shm.h>
 #include <linux/mman.h>
@@ -1293,6 +1294,7 @@ void exit_mmap(struct mm_struct *mm)
 	VMA_ITERATOR(vmi, mm, 0);
 	struct unmap_desc unmap;
 
+	j716f_bc(J716F_BC_MM_EXIT_ENTER, (unsigned long)mm);
 	/* mm's last user has gone, and its about to be pulled down */
 	mmu_notifier_release(mm);
 
@@ -1339,6 +1341,7 @@ destroy:
 	trace_exit_mmap(mm);
 	mmap_write_unlock(mm);
 	vm_unacct_memory(nr_accounted);
+	j716f_bc(J716F_BC_MM_EXIT_EXIT, (unsigned long)mm);
 }
 
 /*
@@ -1713,6 +1716,7 @@ __latent_entropy int dup_mmap(struct mm_struct *mm, struct mm_struct *oldmm)
 	LIST_HEAD(uf);
 	VMA_ITERATOR(vmi, mm, 0);
 
+	j716f_bc(J716F_BC_MM_DUP_ENTER, (unsigned long)oldmm);
 	if (mmap_write_lock_killable(oldmm))
 		return -EINTR;
 	flush_cache_dup_mm(oldmm);
@@ -1882,7 +1886,11 @@ loop_out:
 out:
 	mmap_write_unlock(mm);
 	flush_tlb_mm(oldmm);
+	j716f_bc(J716F_BC_MM_DUP_POST_FLUSH, (unsigned long)oldmm);
+	j716f_bc(J716F_BC_MM_DUP_UNLOCK_ENTER, (unsigned long)oldmm);
 	mmap_write_unlock(oldmm);
+	j716f_bc(J716F_BC_MM_DUP_UNLOCK_EXIT, (unsigned long)oldmm);
+	j716f_bc(J716F_BC_MM_DUP_EXIT, (unsigned long)oldmm);
 	if (!retval)
 		dup_userfaultfd_complete(&uf);
 	else

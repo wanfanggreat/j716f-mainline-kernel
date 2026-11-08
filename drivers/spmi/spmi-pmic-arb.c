@@ -14,6 +14,8 @@
 #include <linux/irq.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
+
+#include <soc/qcom/j716f-diag.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/of_irq.h>
@@ -502,11 +504,14 @@ static int pmic_arb_read_cmd_unlocked(struct spmi_controller *ctrl, u32 cmd,
 	u8 bc = len - 1;
 	int rc;
 
+	j716f_bc(J716F_BC_SPMI_XFER_ENTER, ((unsigned long)sid << 16) | addr);
 	pmic_arb_set_rd_cmd(pmic_arb, offset + PMIC_ARB_CMD, cmd);
 	rc = pmic_arb_wait_for_done(ctrl, pmic_arb->rd_base, sid, addr,
 				    PMIC_ARB_CHANNEL_OBS);
-	if (rc)
+	if (rc) {
+		j716f_bc(J716F_BC_SPMI_XFER_EXIT, (unsigned long)rc);
 		return rc;
+	}
 
 	pmic_arb_read_data(pmic_arb, buf, offset + PMIC_ARB_RDATA0,
 		     min_t(u8, bc, 3));
@@ -514,6 +519,7 @@ static int pmic_arb_read_cmd_unlocked(struct spmi_controller *ctrl, u32 cmd,
 	if (bc > 3)
 		pmic_arb_read_data(pmic_arb, buf + 4, offset + PMIC_ARB_RDATA1,
 					bc - 4);
+	j716f_bc(J716F_BC_SPMI_XFER_EXIT, 0);
 	return 0;
 }
 
@@ -581,7 +587,9 @@ static int pmic_arb_write_cmd_unlocked(struct spmi_controller *ctrl, u32 cmd,
 	struct spmi_pmic_arb_bus *bus = spmi_controller_get_drvdata(ctrl);
 	struct spmi_pmic_arb *pmic_arb = bus->pmic_arb;
 	u8 bc = len - 1;
+	int rc;
 
+	j716f_bc(J716F_BC_SPMI_XFER_ENTER, ((unsigned long)sid << 16) | addr);
 	/* Write data to FIFOs */
 	pmic_arb_write_data(pmic_arb, buf, offset + PMIC_ARB_WDATA0,
 				min_t(u8, bc, 3));
@@ -591,8 +599,10 @@ static int pmic_arb_write_cmd_unlocked(struct spmi_controller *ctrl, u32 cmd,
 
 	/* Start the transaction */
 	pmic_arb_base_write(pmic_arb, offset + PMIC_ARB_CMD, cmd);
-	return pmic_arb_wait_for_done(ctrl, pmic_arb->wr_base, sid, addr,
-				      PMIC_ARB_CHANNEL_RW);
+	rc = pmic_arb_wait_for_done(ctrl, pmic_arb->wr_base, sid, addr,
+				    PMIC_ARB_CHANNEL_RW);
+	j716f_bc(J716F_BC_SPMI_XFER_EXIT, (unsigned long)rc);
+	return rc;
 }
 
 static int pmic_arb_write_cmd(struct spmi_controller *ctrl, u8 opc, u8 sid,
