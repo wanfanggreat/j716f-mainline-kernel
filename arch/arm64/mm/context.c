@@ -6,12 +6,15 @@
  * Copyright (C) 2012 ARM Ltd.
  */
 
+#include <linux/atomic.h>
 #include <linux/bitfield.h>
 #include <linux/bitops.h>
 #include <linux/lockdep.h>
 #include <linux/sched.h>
 #include <linux/slab.h>
 #include <linux/mm.h>
+
+#include <soc/qcom/j716f-diag.h>
 
 #include <asm/cpufeature.h>
 #include <asm/mmu_context.h>
@@ -22,6 +25,8 @@ static u32 asid_bits;
 static DEFINE_RAW_SPINLOCK(cpu_asid_lock);
 
 static atomic64_t asid_generation;
+static atomic64_t asid_rollover_count;
+static DEFINE_PER_CPU(u64, asid_workaround_count);
 static unsigned long *asid_map;
 
 static DEFINE_PER_CPU(atomic64_t, active_asids);
@@ -79,15 +84,19 @@ void verify_cpu_asid_bits(void)
 
 /*
  * Cortex-A77 r0p0/r1p0 erratum 1542418: the core may fetch a stale
- * instruction from its macro-op cache after an ASID is reused.  Selecting
- * 60 fresh ASIDs in a row invalidates that history.  With KPTI the odd
- * ASIDs belong to user space and are avoided (the SDEI trampoline keys off
- * the user ASID bit).
+ * instruction from its macro-op cache after an ASID is reused.  The
+ * published workaround selects ASIDs 1..61 in a row (ASID 0 is reserved;
+ * the 61 iterations guarantee 60 usable ASIDs) to invalidate that history.
+ * With KPTI the odd ASIDs belong to user space and are avoided (the SDEI
+ * trampoline keys off the user ASID bit).
+ *
+ * The mask is the runtime ASID mask, not a hard-coded 16 bits: the same
+ * code must stay correct on a CPU that only implements 8 bits.
  */
 #ifdef CONFIG_UNMAP_KERNEL_AT_EL0
-#define idx2asid(idx)	(((u64)(idx) << 1) & 0xffffULL)
+#define idx2asid(idx)	(((u64)(idx) << 1) & ~ASID_MASK)
 #else
-#define idx2asid(idx)	((u64)(idx) & 0xffffULL)
+#define idx2asid(idx)	((u64)(idx) & ~ASID_MASK)
 #endif
 
 /*
@@ -104,19 +113,28 @@ static void __arm64_workaround_1542418_asid_rollover(void)
 	    !this_cpu_has_cap(ARM64_WORKAROUND_1542418))
 		return;
 
+	/*
+	 * Counted before the loop: if the CPU stops inside the 61 ASID
+	 * selects, the count and the enter breadcrumb still show that this
+	 * CPU reached the workaround and that the experiment exercised it.
+	 */
+	raw_cpu_inc(asid_workaround_count);
+	j716f_bc(J716F_BC_A77_ASID_WORKAROUND_ENTER, 0);
+
 	if (!system_supports_cnp())
 		cpu_set_reserved_ttbr0();
 
 	ttbr1 = read_sysreg(ttbr1_el1);
 	ttbr1_baddr = ttbr1 & ~TTBRx_EL1_ASID_MASK;
 
-	for (idx = 1; idx <= 60; idx++) {
+	for (idx = 1; idx <= 61; idx++) {
 		write_sysreg(FIELD_PREP(TTBRx_EL1_ASID_MASK, idx2asid(idx)) |
 			     ttbr1_baddr, ttbr1_el1);
 		isb();
 	}
 
 	write_sysreg(ttbr1, ttbr1_el1);
+	j716f_bc(J716F_BC_A77_ASID_WORKAROUND_EXIT, 0);
 }
 
 /*
@@ -173,6 +191,8 @@ static void flush_context(void)
 {
 	int i;
 	u64 asid;
+
+	atomic64_inc(&asid_rollover_count);
 
 	/* Update the list of reserved ASIDs and the ASID bitmap. */
 	set_reserved_asid_bits();
@@ -487,6 +507,35 @@ static int asids_init(void)
 	 */
 	if (IS_ENABLED(CONFIG_UNMAP_KERNEL_AT_EL0))
 		set_kpti_asid_bits(asid_map);
+	pr_info("ASID: %u bits, %lu user ASIDs, KPTI=%d, errata-1542418=%d\n",
+		asid_bits, NUM_USER_ASIDS,
+		IS_ENABLED(CONFIG_UNMAP_KERNEL_AT_EL0),
+		IS_ENABLED(CONFIG_ARM64_ERRATUM_1542418));
 	return 0;
 }
 early_initcall(asids_init);
+
+/*
+ * Evidence for the A77 1542418 controlled experiment.  The counters are
+ * read from the diag proc file and from the panic dump; the workaround
+ * count is per CPU because only the gold cores run it.
+ */
+u32 arm64_asid_bits(void)
+{
+	return asid_bits;
+}
+
+u64 arm64_asid_generation(void)
+{
+	return atomic64_read(&asid_generation);
+}
+
+u64 arm64_asid_rollover_count(void)
+{
+	return atomic64_read(&asid_rollover_count);
+}
+
+u64 arm64_asid_workaround_count(int cpu)
+{
+	return per_cpu(asid_workaround_count, cpu);
+}

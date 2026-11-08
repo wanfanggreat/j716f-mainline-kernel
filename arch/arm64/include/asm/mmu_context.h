@@ -293,9 +293,15 @@ void arm64_mm_context_put(struct mm_struct *mm);
 /*
  * Cortex-A77 r0p0/r1p0 (including the Kryo 5XX Gold cores that report an
  * A77 MIDR) may fetch a stale instruction after an ASID is reused.  The
- * workaround selects 60 ASIDs to invalidate the stale branch history.
+ * workaround selects ASIDs 1..61 to invalidate the stale branch history.
  */
 void arm64_workaround_1542418_asid_rollover(void);
+
+/* Evidence counters for the A77 1542418 controlled experiment. */
+u32 arm64_asid_bits(void);
+u64 arm64_asid_generation(void);
+u64 arm64_asid_rollover_count(void);
+u64 arm64_asid_workaround_count(int cpu);
 
 #define mm_untag_mask mm_untag_mask
 static inline unsigned long mm_untag_mask(struct mm_struct *mm)

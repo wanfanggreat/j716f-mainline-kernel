@@ -42,6 +42,8 @@
 #include <linux/timekeeping.h>
 #include <linux/uaccess.h>
 
+#include <asm/mmu_context.h>
+
 #include <soc/qcom/j716f-diag.h>
 
 #define J716F_BC_RING		16
@@ -277,6 +279,8 @@ static const char *const j716f_bc_names[J716F_BC_MAX] = {
 
 	[J716F_BC_IDLE_ENTER]		= "idle_enter",
 	[J716F_BC_IDLE_EXIT]		= "idle_exit",
+	[J716F_BC_A77_ASID_WORKAROUND_ENTER] = "a77_asid_wa_enter",
+	[J716F_BC_A77_ASID_WORKAROUND_EXIT]  = "a77_asid_wa_exit",
 };
 
 static const char *j716f_bc_name(u32 site)
@@ -420,6 +424,24 @@ static void j716f_ct_dump_cpu(int cpu)
 #else
 	pr_info("J716F CT cpu%d: context tracking idle disabled\n", cpu);
 #endif
+}
+
+/*
+ * ASID rollover/workaround evidence.  A long "no freeze" run without a
+ * rollover does not exercise the 1542418 path at all, so the experiment
+ * must show these counters moving on the A77 CPUs.
+ */
+static void j716f_asid_dump(const char *tag)
+{
+	int cpu;
+
+	pr_info("J716F ASID %s: bits=%u generation=%llu rollovers=%llu\n",
+		tag, arm64_asid_bits(),
+		(unsigned long long)arm64_asid_generation(),
+		(unsigned long long)arm64_asid_rollover_count());
+	for_each_online_cpu(cpu)
+		pr_info("J716F ASID cpu%d workarounds=%llu\n", cpu,
+			(unsigned long long)arm64_asid_workaround_count(cpu));
 }
 
 #if IS_ENABLED(CONFIG_ARM_GIC_V3)
@@ -724,6 +746,7 @@ void j716f_diag_dump(const char *reason)
 	for_each_online_cpu(cpu)
 		j716f_ct_dump_cpu(cpu);
 
+	j716f_asid_dump("dump");
 
 	/*
 	 * Flush the breadcrumbs before reading another CPU's redistributor:
@@ -794,6 +817,32 @@ static int j716f_diag_show(struct seq_file *m, void *v)
 	return 0;
 }
 
+static int j716f_asid_show(struct seq_file *m, void *v)
+{
+	int cpu;
+
+	seq_printf(m, "asid_bits=%u generation=%llu rollovers=%llu\n",
+		   arm64_asid_bits(),
+		   (unsigned long long)arm64_asid_generation(),
+		   (unsigned long long)arm64_asid_rollover_count());
+	for_each_online_cpu(cpu)
+		seq_printf(m, "cpu%d workarounds=%llu\n", cpu,
+			   (unsigned long long)arm64_asid_workaround_count(cpu));
+	return 0;
+}
+
+static int j716f_asid_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, j716f_asid_show, NULL);
+}
+
+static const struct proc_ops j716f_asid_proc_ops = {
+	.proc_open	= j716f_asid_open,
+	.proc_read	= seq_read,
+	.proc_lseek	= seq_lseek,
+	.proc_release	= single_release,
+};
+
 static int j716f_diag_open(struct inode *inode, struct file *file)
 {
 	return single_open(file, j716f_diag_show, NULL);
@@ -833,6 +882,9 @@ static int __init j716f_diag_init(void)
 		return -ENOMEM;
 	}
 
+	entry = proc_create("j716f_asid", 0600, NULL, &j716f_asid_proc_ops);
+	if (!entry)
+		pr_warn("failed to create /proc/j716f_asid\n");
 
 	atomic_notifier_chain_register(&panic_notifier_list, &j716f_panic_nb);
 
