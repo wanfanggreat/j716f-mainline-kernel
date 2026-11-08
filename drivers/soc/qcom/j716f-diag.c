@@ -39,6 +39,7 @@
 #include <linux/smp.h>
 #include <linux/seq_file.h>
 #include <linux/string.h>
+#include <linux/timekeeping.h>
 #include <linux/uaccess.h>
 
 #include <soc/qcom/j716f-diag.h>
@@ -99,13 +100,28 @@ static unsigned int bt_stage = 2;
 module_param(bt_stage, uint, 0644);
 MODULE_PARM_DESC(bt_stage, "J716F: stale-heartbeat stage that requests an NMI backtrace (0=off)");
 
-static unsigned int panic_stage = 3;
+/*
+ * Default 0: the v50 experiment must observe a hang without resetting the
+ * device.  A tester enables the self-panic only after the SNAP stream, the
+ * ASID counters and the GICR dump have been validated on the device.
+ */
+static unsigned int panic_stage;
 module_param(panic_stage, uint, 0644);
-MODULE_PARM_DESC(panic_stage, "J716F: stale-heartbeat stage that panics (0=off)");
+MODULE_PARM_DESC(panic_stage, "J716F: stale-heartbeat stage that panics (0=off, default)");
 
 static unsigned int snap_print = 1;
 module_param(snap_print, uint, 0644);
 MODULE_PARM_DESC(snap_print, "J716F: print one SNAP line per second (0=off)");
+
+/*
+ * All cross-CPU comparisons use the clocksource-based monotonic clock,
+ * not sched_clock(): a heartbeat written by another CPU must use the same
+ * time base as the printer's "now".  ktime_get_mono_fast_ns() is NMI-safe.
+ */
+static u64 j716f_now(void)
+{
+	return ktime_get_mono_fast_ns();
+}
 
 /* Ages are computed across CPUs, so clamp the clock skew. */
 static u64 j716f_age(u64 now, u64 then)
@@ -298,8 +314,14 @@ void j716f_bc(enum j716f_bc_site site, unsigned long arg)
 	seq = atomic64_fetch_inc(&c->seq);
 	r = &c->ring[seq & (J716F_BC_RING - 1)];
 
-	/* Tell a remote reader that this slot is being recycled. */
+	/*
+	 * Seqlock ordering: publish BUSY first, then make sure no payload
+	 * store is visible before it.  Without the write barrier a reader on
+	 * another CPU could see a new field while gen still looked like the
+	 * previous generation, and accept a mixed record.
+	 */
 	WRITE_ONCE(r->gen, J716F_BC_GEN_BUSY);
+	smp_wmb();
 	r->arg = arg;
 	r->flags = (irqs_disabled() ? J716F_BC_F_IRQOFF : 0) |
 		   (in_hardirq() ? J716F_BC_F_HARDIRQ : 0) |
@@ -308,7 +330,7 @@ void j716f_bc(enum j716f_bc_site site, unsigned long arg)
 	strscpy(r->comm, current->comm, sizeof(r->comm));
 	r->site = site;
 	/* The release stores publish the payload and then the generation. */
-	smp_store_release(&r->ts, local_clock());
+	smp_store_release(&r->ts, j716f_now());
 	smp_store_release(&r->gen, seq);
 
 	if (!nmi)
@@ -349,12 +371,23 @@ static void j716f_bc_dump_cpu(int cpu)
 {
 	struct j716f_bc_cpu *c = per_cpu_ptr(&j716f_bc_data, cpu);
 	u64 seq = atomic64_read(&c->seq);
-	u64 now = local_clock();
+	u64 now = j716f_now();
 	bool newest = true;
 	int i;
 
 	if (!seq)
 		return;
+
+	/*
+	 * If the newest slot is BUSY the target stopped inside j716f_bc()
+	 * while filling it.  Do not print its fields (they are not a
+	 * consistent record), but do show that the writer was in progress;
+	 * the loop below then reports the newest completed record.
+	 */
+	if (smp_load_acquire(&c->ring[(seq - 1) & (J716F_BC_RING - 1)].gen) ==
+	    J716F_BC_GEN_BUSY)
+		pr_info("J716F BC cpu%d seq=%llu site=<busy> (writer in progress)\n",
+			cpu, (unsigned long long)(seq - 1));
 
 	for (i = 0; i < J716F_BC_DUMP_DEPTH && i < seq; i++) {
 		struct j716f_bc_rec r;
@@ -473,7 +506,7 @@ static void j716f_snap_alert(u64 now)
 		int i;
 
 		beat = READ_ONCE(c->heartbeat);
-		if (!beat || !READ_ONCE(c->online))
+		if (!beat || !READ_ONCE(c->online) || cpu_dying(cpu))
 			continue;
 
 		age = j716f_age(now, beat);
@@ -538,7 +571,7 @@ static void j716f_snap_alert(u64 now)
 			 */
 			beat = READ_ONCE(c->heartbeat);
 			threshold = j716f_alert_ms[ps - 1] * NSEC_PER_MSEC;
-			if (!beat || j716f_age(local_clock(), beat) < threshold)
+			if (!beat || j716f_age(j716f_now(), beat) < threshold)
 				continue;
 			panic("j716f: cpu%d heartbeat stopped for %llums (last site %s, comm %s)",
 			      cpu, j716f_age(now, beat) / NSEC_PER_MSEC,
@@ -549,7 +582,7 @@ static void j716f_snap_alert(u64 now)
 
 static enum hrtimer_restart j716f_snap_fn(struct hrtimer *h)
 {
-	u64 now = local_clock();
+	u64 now = j716f_now();
 	int cpu = raw_smp_processor_id();
 	unsigned int online = num_online_cpus();
 	u64 tick = div_u64(now, NSEC_PER_SEC);
@@ -585,7 +618,7 @@ static void j716f_snap_start_cpu(void *unused)
 		WRITE_ONCE(c->timer_ready, 1);
 	}
 
-	WRITE_ONCE(c->heartbeat, local_clock());
+	WRITE_ONCE(c->heartbeat, j716f_now());
 	WRITE_ONCE(c->alert_stage, 0);
 	WRITE_ONCE(c->bt_stage, 0);
 	WRITE_ONCE(c->online, 1);
@@ -645,7 +678,7 @@ static int j716f_snap_pm_notify(struct notifier_block *nb,
 		return NOTIFY_DONE;
 	}
 
-	now = local_clock();
+	now = j716f_now();
 	WRITE_ONCE(j716f_snap_guard, now + 10ULL * NSEC_PER_SEC);
 	for_each_online_cpu(cpu) {
 		struct j716f_bc_cpu *c = per_cpu_ptr(&j716f_bc_data, cpu);
@@ -683,13 +716,14 @@ void j716f_diag_dump(const char *reason)
 
 	pr_info("J716F DIAG dump reason=%s cpu=%d\n", reason, raw_smp_processor_id());
 
-	j716f_snap_print(local_clock());
+	j716f_snap_print(j716f_now());
 
 	for_each_online_cpu(cpu)
 		j716f_bc_dump_cpu(cpu);
 
 	for_each_online_cpu(cpu)
 		j716f_ct_dump_cpu(cpu);
+
 
 	/*
 	 * Flush the breadcrumbs before reading another CPU's redistributor:
@@ -739,7 +773,7 @@ static int j716f_diag_show(struct seq_file *m, void *v)
 		   J716F_BC_MAX, J716F_BC_RING);
 	for_each_online_cpu(cpu) {
 		struct j716f_bc_rec r;
-		u64 now = local_clock();
+		u64 now = j716f_now();
 		u64 beat = READ_ONCE(per_cpu(j716f_bc_data, cpu).heartbeat);
 		u64 seq;
 
@@ -798,6 +832,7 @@ static int __init j716f_diag_init(void)
 		pr_err("failed to create /proc/j716f_diag\n");
 		return -ENOMEM;
 	}
+
 
 	atomic_notifier_chain_register(&panic_notifier_list, &j716f_panic_nb);
 
