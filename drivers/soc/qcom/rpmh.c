@@ -218,6 +218,15 @@ static int __fill_rpmh_msg(struct rpmh_request *req, enum rpmh_state state,
 	req->msg.cmds = req->cmd;
 	req->msg.num_cmds = n;
 	req->msg.is_read = is_read;
+#ifdef CONFIG_QCOM_J716F_DIAG
+	/*
+	 * M20-P1b: requests built here carry no transaction id.  Only the
+	 * caller that actually knows which client caused the transfer may
+	 * set one (see rpmh_write_batch_txid()); everything else stays 0 so
+	 * the dump reports "unattributable" instead of inventing a link.
+	 */
+	req->msg.j716f_txid = 0;
+#endif
 
 	return 0;
 }
@@ -404,7 +413,7 @@ static int flush_batch(struct rpmh_ctrlr *ctrlr)
 
 static int rpmh_write_batch_active(const struct device *dev,
 				   const struct tcs_cmd *cmd, u32 *n,
-				   int count)
+				   int count, u32 txid)
 {
 	struct rsc_drv *drv = ctrlr_to_drv(get_rpmh_ctrlr(dev));
 	struct rpmh_request **rpm_msgs;
@@ -430,6 +439,14 @@ static int rpmh_write_batch_active(const struct device *dev,
 
 		/* Our own reference, the controller owns the initial one */
 		refcount_inc(&rpm_msg->refcnt);
+#ifdef CONFIG_QCOM_J716F_DIAG
+		/*
+		 * M20-P1b: stamp the transaction id onto the request that
+		 * will be triggered, not onto a global.  A request that was
+		 * never stamped stays 0 and is reported as unattributable.
+		 */
+		rpm_msg->msg.j716f_txid = txid;
+#endif
 		rpm_msgs[nr_alloc] = rpm_msg;
 		cmd += n[nr_alloc];
 	}
@@ -492,8 +509,17 @@ static int rpmh_write_batch_active(const struct device *dev,
  *
  * May sleep. Do not call from atomic contexts for ACTIVE_ONLY requests.
  */
-int rpmh_write_batch(const struct device *dev, enum rpmh_state state,
-		     const struct tcs_cmd *cmd, u32 *n)
+/**
+ * rpmh_write_batch_txid - rpmh_write_batch() with an explicit transaction id
+ * @txid: J716F diagnostic transaction id, 0 for "unattributable"
+ *
+ * Only the caller that knows which client caused the transfer passes a
+ * non-zero id.  The id is attached to the request itself and travels with it
+ * into rpmh_rsc_send_data(), so a completion can never be attributed to a
+ * transaction other than the one that carried it.
+ */
+int rpmh_write_batch_txid(const struct device *dev, enum rpmh_state state,
+			  const struct tcs_cmd *cmd, u32 *n, u32 txid)
 {
 	struct batch_cache_req *req;
 	struct rpmh_ctrlr *ctrlr = get_rpmh_ctrlr(dev);
@@ -509,7 +535,7 @@ int rpmh_write_batch(const struct device *dev, enum rpmh_state state,
 		return -EINVAL;
 
 	if (state == RPMH_ACTIVE_ONLY_STATE)
-		return rpmh_write_batch_active(dev, cmd, n, count);
+		return rpmh_write_batch_active(dev, cmd, n, count, txid);
 
 	req = kzalloc_flex(*req, rpm_msgs, count, GFP_ATOMIC);
 	if (!req)
@@ -525,6 +551,18 @@ int rpmh_write_batch(const struct device *dev, enum rpmh_state state,
 	cache_batch(ctrlr, req);
 
 	return 0;
+}
+EXPORT_SYMBOL_GPL(rpmh_write_batch_txid);
+
+int rpmh_write_batch(const struct device *dev, enum rpmh_state state,
+		     const struct tcs_cmd *cmd, u32 *n)
+{
+	/*
+	 * M20-P1b: callers that do not know which client caused the transfer
+	 * pass 0 and the dump reports "unattributable".  Filling this in from
+	 * some global "current transaction" is exactly the bug this replaces.
+	 */
+	return rpmh_write_batch_txid(dev, state, cmd, n, 0);
 }
 EXPORT_SYMBOL_GPL(rpmh_write_batch);
 

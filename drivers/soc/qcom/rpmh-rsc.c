@@ -742,7 +742,7 @@ int rpmh_rsc_send_data(struct rsc_drv *drv, const struct tcs_request *msg)
 	 * request even when other transactions interleave.
 	 */
 	if (tcs_id < MAX_TCS_NR)
-		drv->txid[tcs_id] = j716f_vote_current_txid();
+		drv->txid[tcs_id] = msg->j716f_txid;
 	set_bit(tcs_id, drv->tcs_in_use);
 	if (msg->state == RPMH_ACTIVE_ONLY_STATE && tcs->type != ACTIVE_TCS) {
 		/*
@@ -767,14 +767,26 @@ int rpmh_rsc_send_data(struct rsc_drv *drv, const struct tcs_request *msg)
 	__tcs_buffer_write(drv, tcs_id, 0, msg);
 	j716f_bc(J716F_BC_RSC_SEND_TRIGGER, tcs_id);
 	/*
-	 * M20-P1: the TCS is about to be triggered.  Recording the first
-	 * command's addr/data here ties the client request and the aggregated
-	 * BCM value to the exact TCS that shows up in a later panic dump.
+	 * M20-P1b split the trigger evidence in two, because they prove
+	 * different things:
+	 *
+	 *   TCS_PRE   the command buffer is programmed and we are about to
+	 *             poke the trigger register.  Proves only "prepared".
+	 *   TCS_POKED the trigger register write has been issued.  Proves the
+	 *             store happened, NOT that the accelerator accepted or
+	 *             acted on it: this is writel_relaxed() with no readback,
+	 *             and the hardware may be wedged right here.
+	 *
+	 * Between them they bracket the actual trigger, and neither may be
+	 * reported as "hardware started".
 	 */
-	j716f_vote_record(J716F_VOTE_KIND_TCS, j716f_vote_current_txid(),
+	j716f_vote_record(J716F_VOTE_KIND_TCS_PRE, msg->j716f_txid,
 			  msg->cmds[0].addr, msg->cmds[0].data, (u32)tcs_id,
 			  ((u32)msg->num_cmds << 8) | (u32)msg->wait_for_compl);
 	__tcs_set_trigger(drv, tcs_id, true);
+	j716f_vote_record(J716F_VOTE_KIND_TCS_POKED, msg->j716f_txid,
+			  msg->cmds[0].addr, msg->cmds[0].data, (u32)tcs_id,
+			  ((u32)msg->num_cmds << 8) | (u32)msg->wait_for_compl);
 	j716f_bc(J716F_BC_RSC_SEND_EXIT, tcs_id);
 
 	return 0;

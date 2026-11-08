@@ -744,21 +744,24 @@ int icc_set_bw(struct icc_path *path, u32 avg_bw, u32 peak_bw)
 	 * record happens under icc_bw_lock in plain process context; the ring
 	 * itself is bounded and allocation free.
 	 */
+	/*
+	 * M20-P1b: the transaction context is scoped to this call and always
+	 * cleared before returning.  Two cases must NOT inherit an id:
+	 *   - no actual change: apply_constraints() below may still run and
+	 *     the voter may still commit, but nothing new was requested here;
+	 *   - a later failure retry: that "apply_constraints(path)" call is a
+	 *     rollback of an already-recorded request, not a new transaction.
+	 * Both get txid 0, which the dump reports as unattributable.
+	 */
+	txid = 0;
 	if (old_avg != avg_bw || old_peak != peak_bw) {
-		/*
-		 * M20-P1a: the node id identifies an interconnect node, not a
-		 * BCM resource, so it cannot be matched against the TCS
-		 * command address.  Keep it in aux (for "which endpoint") and
-		 * carry a transaction id so this request can be lined up with
-		 * the commit, the trigger and the completion instead.
-		 */
 		node = path->reqs[path->num_nodes - 1].node;
 		txid = j716f_vote_alloc_txid();
-		j716f_vote_set_current_txid(txid);
 		j716f_vote_record(J716F_VOTE_KIND_REQ, txid, 0, peak_bw,
 				   J716F_VOTE_NO_TCS,
 				   (node ? (u32)node->id : 0) | (avg_bw << 16));
 	}
+	j716f_vote_set_current_txid(txid);
 
 	for (i = 0; i < path->num_nodes; i++) {
 		node = path->reqs[i].node;
@@ -778,6 +781,11 @@ int icc_set_bw(struct icc_path *path, u32 avg_bw, u32 peak_bw)
 		pr_debug("interconnect: error applying constraints (%d)\n",
 			 ret);
 
+		/*
+		 * Rollback re-commit: explicitly not part of the failed
+		 * transaction, and not a transaction of its own.
+		 */
+		j716f_vote_set_current_txid(0);
 		for (i = 0; i < path->num_nodes; i++) {
 			node = path->reqs[i].node;
 			path->reqs[i].avg_bw = old_avg;
@@ -787,6 +795,7 @@ int icc_set_bw(struct icc_path *path, u32 avg_bw, u32 peak_bw)
 		apply_constraints(path);
 	}
 
+	j716f_vote_set_current_txid(0);
 	mutex_unlock(&icc_bw_lock);
 
 	trace_icc_set_bw_end(path, ret);

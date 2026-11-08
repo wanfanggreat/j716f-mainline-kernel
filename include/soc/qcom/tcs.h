@@ -63,6 +63,19 @@ struct tcs_request {
 	u32 wait_for_compl;
 	u32 num_cmds;
 	struct tcs_cmd *cmds;
+#ifdef CONFIG_QCOM_J716F_DIAG
+	/*
+	 * J716F M20-P1b diagnostic transaction id.  Travels with the request
+	 * itself instead of a global "current transaction", so a completion
+	 * can only ever be attributed to the request that actually carried
+	 * that id.  0 means "not attributable" and must stay that way rather
+	 * than being filled in from whatever ran last.
+	 *
+	 * This does not affect the RPMh wire protocol: the id is never
+	 * programmed into a register.
+	 */
+	u32 j716f_txid;
+#endif
 };
 
 #define BCM_TCS_CMD_COMMIT_MASK		BIT(30)

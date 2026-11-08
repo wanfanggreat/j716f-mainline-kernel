@@ -145,6 +145,12 @@ struct j716f_vote_ring {
 	u32 head;
 	u32 count;
 	u32 overwritten;	/* records lost to wrap since boot */
+	/*
+	 * Generation is bumped on every push while the lock is held.  The
+	 * dump brackets each chunk with it: if it moved across the copy, a
+	 * writer got in between and the chunk may mix two time windows.
+	 */
+	u32 generation;
 	struct j716f_vote_rec rec[J716F_VOTE_RING];
 };
 
@@ -172,12 +178,21 @@ static struct j716f_vote_ring j716f_votes_mc0 = {
 static atomic_t j716f_vote_txid = ATOMIC_INIT(1);
 
 /*
- * The transaction id currently being built by icc_set_bw().  It is a single
- * value because icc_bw_lock serialises the whole set() call: request ->
- * aggregate -> provider set() -> BCM commit all happen under that mutex, so
- * a second setter cannot be in flight at the same time.  The RSC layer runs
- * later, outside that mutex, but by then the trigger carries the id
- * explicitly, so nothing relies on this variable after set() returns.
+ * The transaction id currently being built by icc_set_bw().
+ *
+ * M20-P1b: this used to leak.  It was set only when the bandwidth actually
+ * changed, never cleared, and read by every RPMh sender - including
+ * rpmh_write() from regulators and rpmhpd, which never go through
+ * icc_set_bw() at all.  Those transfers therefore inherited the id of
+ * whatever interconnect transaction happened to run last, and the dump
+ * presented them as belonging to that transaction.
+ *
+ * The contract now:
+ *   - icc_set_bw() sets it while it holds icc_bw_lock, and clears it in all
+ *     exit paths, including the no-change path and the failure retry;
+ *   - only qcom_icc_bcm_voter_commit() reads it (it runs inside that lock);
+ *   - rpmh_rsc_send_data() never reads it: the id travels in the request.
+ * A reader that finds 0 records "unattributable" rather than guessing.
  */
 static u32 j716f_vote_cur_txid;
 
@@ -202,6 +217,16 @@ EXPORT_SYMBOL_GPL(j716f_vote_current_txid);
  * unresolved address as important so nothing is dropped before init runs.
  */
 static u32 j716f_mc0_addr;
+
+/*
+ * Small hash set of transaction ids that have been seen voting on MC0.
+ * A ring entry is stored as the txid itself, and 0 means empty; a false hit
+ * needs a hash collision with a live id, in which case the only consequence
+ * is that one extra transaction's records land in the MC0 ring.  That is the
+ * safe direction: it never drops MC0 evidence.
+ */
+#define J716F_VOTE_MC0_TX_LEN	64
+static u32 j716f_vote_mc0_tx[J716F_VOTE_MC0_TX_LEN];
 
 /* Diagnostics must never become a fault source: allow turning it off. */
 static bool vote_trace = true;
@@ -483,23 +508,63 @@ void j716f_bc_quiet(enum j716f_bc_site site, unsigned long arg)
 EXPORT_SYMBOL_GPL(j716f_bc_quiet);
 
 /*
- * A record about the MC0 resource, or one that cannot be attributed to a
- * resource at all (a client request, a completion), is what the A/B/C
- * decision needs.  Those go into the MC0 ring so a burst of unrelated
- * per-frame votes cannot push them out.
+ * MC0 retention ring admission (M20-P1b).
+ *
+ * v56 admitted every record with addr == 0, which is all client requests and
+ * all completion records - i.e. the busiest, least MC0-specific traffic
+ * filled the ring that exists to protect MC0 evidence.
+ *
+ * Admission is now based on actual MC0 attribution:
+ *   - the record names the MC0 resource address (agg/tcs/pre/poked), or
+ *   - the record belongs to a transaction that already showed MC0 (the
+ *     REQ for that txid), or
+ *   - the record is for a TCS that was observed carrying MC0.
+ * Anything else is "unclassified": it stays in the general ring only, and
+ * the dump says so.  Unresolved MC0 address admits nothing rather than
+ * everything, so a failed Command DB lookup cannot silently turn this back
+ * into the v56 behaviour.
  */
-static bool j716f_vote_is_important(u32 addr)
+static bool j716f_vote_txid_touched_mc0(u32 txid)
+{
+	if (!txid)
+		return false;
+	return READ_ONCE(j716f_vote_mc0_tx[txid & (J716F_VOTE_MC0_TX_LEN - 1)]) == txid;
+}
+
+static void j716f_vote_mark_txid_mc0(u32 txid)
+{
+	if (!txid)
+		return;
+	WRITE_ONCE(j716f_vote_mc0_tx[txid & (J716F_VOTE_MC0_TX_LEN - 1)], txid);
+}
+
+static bool j716f_vote_is_important(enum j716f_vote_kind kind, u32 txid,
+				    u32 addr)
 {
 	u32 mc0 = READ_ONCE(j716f_mc0_addr);
 
-	/*
-	 * Unresolved MC0 address: keep everything in the important ring rather
-	 * than silently classifying nothing.  This only happens before the
-	 * Command DB lookup at init, i.e. for a handful of records.
-	 */
 	if (!mc0)
+		return false;
+	if (addr == mc0) {
+		j716f_vote_mark_txid_mc0(txid);
 		return true;
-	return addr == 0 || addr == mc0;
+	}
+	/*
+	 * Only records that can be tied to MC0 by resource or by transaction
+	 * enter the retention ring:
+	 *   - DONE/RECLAIM: the tx already voted on MC0 (the agg/pre/poked
+	 *     records carried the address and marked it);
+	 *   - REQ: normally precedes the agg, so it cannot be classified yet.
+	 *     It is admitted only if the tx was marked by an earlier round,
+	 *     and otherwise stays in the general ring.  That is deliberate:
+	 *     a client request that never reaches MC0 must not displace MC0
+	 *     evidence, and a request that does reach it is already
+	 *     represented by its agg + tcs records.
+	 */
+	if (kind == J716F_VOTE_KIND_DONE || kind == J716F_VOTE_KIND_RECLAIM ||
+	    kind == J716F_VOTE_KIND_REQ)
+		return j716f_vote_txid_touched_mc0(txid);
+	return false;
 }
 
 /* Copy one record and update the ring bookkeeping; caller holds the lock. */
@@ -515,6 +580,7 @@ static void j716f_vote_push(struct j716f_vote_ring *r,
 		r->count++;
 	else
 		r->overwritten++;
+	r->generation++;
 }
 
 /**
@@ -592,7 +658,7 @@ void j716f_vote_record(enum j716f_vote_kind kind, u32 txid, u32 addr, u32 data,
 	if (kind != J716F_VOTE_KIND_DONE && kind != J716F_VOTE_KIND_RECLAIM)
 		strscpy(rec.comm, current->comm, sizeof(rec.comm));
 
-	if (j716f_vote_is_important(addr)) {
+	if (j716f_vote_is_important(kind, txid, addr)) {
 		spin_lock_irqsave(&j716f_votes_mc0.lock, flags);
 		j716f_vote_push(&j716f_votes_mc0, &rec);
 		spin_unlock_irqrestore(&j716f_votes_mc0.lock, flags);
@@ -648,7 +714,8 @@ static const char *j716f_vote_kind_name(u32 kind)
 	switch (kind) {
 	case J716F_VOTE_KIND_REQ:	return "req";
 	case J716F_VOTE_KIND_AGG:	return "agg";
-	case J716F_VOTE_KIND_TCS:	return "tcs";
+	case J716F_VOTE_KIND_TCS_PRE:	return "tcs-pre";
+	case J716F_VOTE_KIND_TCS_POKED:	return "tcs-poked";
 	case J716F_VOTE_KIND_DONE:	return "done";
 	case J716F_VOTE_KIND_RECLAIM:	return "reclaim";
 	default:			return "?";
@@ -661,12 +728,22 @@ static void j716f_vote_dump_ring(struct j716f_vote_ring *r, const char *tag,
 	/*
 	 * Copy a bounded chunk at a time rather than the whole ring onto the
 	 * stack: at 64 records a full slab is 4 KiB, which the compiler
-	 * rightly rejects for a function that may run in the panic path.  A
-	 * chunk keeps the stack small and still prints the ring in order.
+	 * rightly rejects for a function that may run in the panic path.
+	 *
+	 * M20-P1b: chunks are bracketed by the ring generation.  v56 released
+	 * the lock between chunks, so a writer could wrap the ring mid-dump
+	 * and the printed lines would silently mix two different time
+	 * windows.  Every chunk now records the generation before and after
+	 * the copy, and the sequence numbers are checked to be consecutive;
+	 * any mismatch marks the whole snapshot inconsistent.
 	 */
 	struct j716f_vote_rec chunk[8];
 	unsigned long flags;
 	u32 i, n, count, start, lost, off;
+	u32 gen_before, gen_after;
+	bool inconsistent = false;
+	u32 expect_seq = 0;
+	bool have_expect = false;
 
 	(void)is_mc0;
 
@@ -676,44 +753,63 @@ static void j716f_vote_dump_ring(struct j716f_vote_ring *r, const char *tag,
 	}
 	count = r->count;
 	lost = r->overwritten;
+	gen_before = r->generation;
 	start = (r->head - count) & (J716F_VOTE_RING - 1);
 	spin_unlock_irqrestore(&r->lock, flags);
 
-	/*
-	 * Print the loss count explicitly.  A dump that quietly shows only the
-	 * newest N records invites "this is the whole story"; if the busiest
-	 * window overwrote records, that must be visible so the reader can
-	 * downgrade the evidence to "undecidable" instead of reasoning from a
-	 * truncated history.
-	 */
-	pr_info("J716F VOTE %s: %u/%u records, %u overwritten%s\n",
-		tag, count, J716F_VOTE_RING, lost,
+	pr_info("J716F VOTE %s: %u/%u records, %u overwritten, gen=%u%s\n",
+		tag, count, J716F_VOTE_RING, lost, gen_before,
 		lost ? " (history truncated)" : "");
 
 	for (off = 0; off < count; off += n) {
 		n = min_t(u32, ARRAY_SIZE(chunk), count - off);
 
 		if (!spin_trylock_irqsave(&r->lock, flags)) {
-			pr_info("J716F VOTE %s: lock busy after %u records\n",
+			pr_info("J716F VOTE %s: lock busy after %u records, snapshot inconsistent\n",
 				tag, off);
-			return;
+			inconsistent = true;
+			break;
 		}
+		gen_after = r->generation;
+		/* The ring must not have moved by more than the chunk we take. */
+		if (gen_after - gen_before != 0 && gen_after - gen_before != off + n)
+			inconsistent = true;
 		for (i = 0; i < n; i++)
 			chunk[i] = r->rec[(start + off + i) &
 					  (J716F_VOTE_RING - 1)];
 		spin_unlock_irqrestore(&r->lock, flags);
 
+		/*
+		 * seq is a monotonically increasing per-record counter.  If the
+		 * copied records are not consecutive, the window was disturbed.
+		 */
+		for (i = 0; i < n; i++) {
+			if (have_expect && chunk[i].seq != expect_seq)
+				inconsistent = true;
+			expect_seq = chunk[i].seq + 1;
+			have_expect = true;
+		}
+
 		for (i = 0; i < n; i++) {
 			const struct j716f_vote_rec *v = &chunk[i];
+			const char *cls = v->addr == 0 && !v->txid ? "unattr" :
+					  "tx";
 
-			pr_info("J716F VOTE %s %-7s tx=%u seq=%u cpu%u pid=%u comm=%s addr=0x%x tcs=%d data=0x%08x aux=0x%x age=%llums\n",
+			pr_info("J716F VOTE %s %-9s tx=%u seq=%u %s cpu%u pid=%u comm=%s addr=0x%x tcs=%d data=0x%08x aux=0x%x age=%llums\n",
 				tag, j716f_vote_kind_name(v->kind), v->txid,
-				v->seq, v->cpu, v->pid, v->comm, v->addr,
+				v->seq, cls, v->cpu, v->pid, v->comm, v->addr,
 				v->tcs == J716F_VOTE_NO_TCS ? -1 : (int)v->tcs,
 				v->data, v->aux,
 				j716f_age(now, v->ts) / NSEC_PER_MSEC);
 		}
 	}
+
+	/*
+	 * Say it loudly and last, so it is not missed between record lines.
+	 */
+	if (inconsistent)
+		pr_info("J716F VOTE %s: snapshot inconsistent (records may span two windows)\n",
+			tag);
 }
 
 /**

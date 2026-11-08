@@ -255,7 +255,12 @@ void j716f_diag_dump(const char *reason);
  *   REQ      a client asked for bandwidth.  Not proof that hardware moved.
  *   AGG      the BCM voter merged the request into this value.  The thread
  *            here is the commit thread, not the original consumer.
- *   TCS      the request was programmed and triggered into a TCS.
+ *   TCS_PRE  the command buffer is programmed; the trigger is about to be
+ *            written.  Proves "prepared", nothing more.
+ *   TCS_POKED the trigger register store has been issued.  It is a
+ *            writel_relaxed() with no readback, so this proves the CPU
+ *            executed the store, NOT that the accelerator accepted or acted
+ *            on it.  The hardware may be wedged at exactly this point.
  *   DONE     tcs_tx_done() observed the completion bit.  This is the HANDLER
  *            observing an already-set bit; it is not the instant the
  *            accelerator finished, and it is strictly later than it.
@@ -268,7 +273,8 @@ void j716f_diag_dump(const char *reason);
 enum j716f_vote_kind {
 	J716F_VOTE_KIND_REQ = 1,	/* icc_set_bw(): client request */
 	J716F_VOTE_KIND_AGG,		/* bcm commit: aggregated value */
-	J716F_VOTE_KIND_TCS,		/* rpmh_rsc_send_data(): TCS trigger */
+	J716F_VOTE_KIND_TCS_PRE,	/* buffer programmed, trigger not yet */
+	J716F_VOTE_KIND_TCS_POKED,	/* trigger register written (no readback) */
 	J716F_VOTE_KIND_DONE,		/* tcs_tx_done(): handler saw it done */
 	J716F_VOTE_KIND_RECLAIM,	/* tcs_tx_done(): TCS released */
 };

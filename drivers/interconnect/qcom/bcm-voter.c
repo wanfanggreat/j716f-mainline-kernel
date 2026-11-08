@@ -330,8 +330,14 @@ int qcom_icc_bcm_voter_commit(struct bcm_voter *voter)
 	rpmh_invalidate(voter->dev);
 
 	j716f_bc(J716F_BC_ICC_COMMIT_BATCH, cmds[0].addr);
-	ret = rpmh_write_batch(voter->dev, RPMH_ACTIVE_ONLY_STATE,
-			       cmds, commit_idx);
+	/*
+	 * M20-P1b: pass the transaction id explicitly so it is attached to the
+	 * request that is actually triggered.  rpmh_write_batch() callers that
+	 * do not know the origin get 0.
+	 */
+	ret = rpmh_write_batch_txid(voter->dev, RPMH_ACTIVE_ONLY_STATE,
+				    cmds, commit_idx,
+				    j716f_vote_current_txid());
 	if (ret) {
 		pr_err("Error sending AMC RPMH requests (%d)\n", ret);
 		goto out;
