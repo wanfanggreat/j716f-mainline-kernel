@@ -3018,7 +3018,14 @@ void free_unref_folios(struct folio_batch *folios)
 	struct zone *locked_zone = NULL;
 	int i, j;
 
-	j716f_bc(J716F_BC_PAGE_FREE_LIST_ENTER, (unsigned long)folios);
+	j716f_bc_quiet(J716F_BC_PAGE_FREE_LIST_ENTER, (unsigned long)_RET_IP_);
+	/*
+	 * M19: arm the exception window.  Any IRQ/NMI taken from here to
+	 * BATCH_DONE is recorded by the exception entry path, so the ring can
+	 * distinguish "the CPU stopped on the page-free path" from "an
+	 * exception arrived and never returned".
+	 */
+	j716f_bc_win_enter();
 
 	/* Prepare folios for freeing */
 	for (i = 0, j = 0; i < folios->nr; i++) {
@@ -3103,14 +3110,35 @@ void free_unref_folios(struct folio_batch *folios)
 
 	if (pcp)
 		pcp_spin_unlock(pcp);
-	j716f_bc(J716F_BC_PAGE_FREE_LIST_EXIT, (unsigned long)folios);
+	/*
+	 * M19: quiet, so this record cannot itself enter the scheduler.
+	 *
+	 * v52 used the loud j716f_bc() here.  It publishes the record and then
+	 * runs preempt_enable(); that call can reach preempt_schedule() ->
+	 * __schedule().  A hang inside that window is therefore *after* the
+	 * exit record yet still entirely inside the breadcrumb, which is why
+	 * the v52 ring could not tell "the page-free path stopped" from "the
+	 * breadcrumb's own preemption stopped".
+	 */
+	j716f_bc_quiet(J716F_BC_PAGE_FREE_LIST_EXIT, (unsigned long)folios);
 	/*
 	 * A second record immediately after the exit: if a freeze stops in
-	 * the exit breadcrumb's preempt_enable(), this RET is missing and the
+	 * the exit record's first instructions, this RET is missing and the
 	 * page-free path itself is exonerated.
+	 *
+	 * M19: the RET is written before folio_batch_reinit(), i.e. still
+	 * inside free_unref_folios().
 	 */
-	j716f_bc(J716F_BC_PAGE_FREE_LIST_RET, (unsigned long)folios);
+	j716f_bc_quiet(J716F_BC_PAGE_FREE_LIST_RET, (unsigned long)folios);
 	folio_batch_reinit(folios);
+	/*
+	 * M19: written after the only remaining work in the function.  If
+	 * BATCH_DONE is the last record, the CPU stopped in the epilogue
+	 * (register restore, autiasp, ret) - not in the batch reset, and not
+	 * in the caller.
+	 */
+	j716f_bc_quiet(J716F_BC_PAGE_FREE_BATCH_DONE, (unsigned long)folios);
+	j716f_bc_win_leave();
 }
 
 static void __split_page(struct page *page, unsigned int order)

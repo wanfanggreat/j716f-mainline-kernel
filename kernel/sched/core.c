@@ -7466,12 +7466,19 @@ static void __sched notrace preempt_schedule_common(void)
 		 * breadcrumb) can reach here from preempt_enable().  If the
 		 * CPU stops in __schedule(), ENTER is the last record and
 		 * EXIT is missing.
+		 *
+		 * M19: quiet records.  A loud record here would call
+		 * preempt_enable() from inside preempt_schedule_common()
+		 * (preempt_disable_notrace() has just decremented the count
+		 * back to the pre-existing level), so the instrument itself
+		 * could re-enter the scheduler and change the very timing it
+		 * is supposed to report.
 		 */
-		j716f_bc(J716F_BC_PREEMPT_SCHED_ENTER, 0);
+		j716f_bc_quiet(J716F_BC_PREEMPT_SCHED_ENTER, _RET_IP_);
 		preempt_latency_start(1);
 		__schedule(SM_PREEMPT);
 		preempt_latency_stop(1);
-		j716f_bc(J716F_BC_PREEMPT_SCHED_EXIT, 0);
+		j716f_bc_quiet(J716F_BC_PREEMPT_SCHED_EXIT, _RET_IP_);
 		preempt_enable_no_resched_notrace();
 
 		/*

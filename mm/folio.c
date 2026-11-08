@@ -203,6 +203,13 @@ static void folio_batch_move_lru(struct folio_batch *fbatch, move_fn_t move_fn)
 	if (is_lru_add) {
 		mem_cgroup_uncharge_folios(&free_fbatch);
 		free_unref_folios(&free_fbatch);
+		/*
+		 * M19: written only after free_unref_folios() returned, so it
+		 * separates "still inside the callee" from "back in the lru_add
+		 * drain path".  The callee's ENTER record carries _RET_IP_,
+		 * which decodes to the call site above.
+		 */
+		j716f_bc_quiet(J716F_BC_PAGE_FREE_RET_BCM_LRU, _RET_IP_);
 	}
 
 	folios_put(fbatch);
@@ -1034,6 +1041,8 @@ void folios_put_refs(struct folio_batch *folios, unsigned int *refs)
 	folios->nr = j;
 	mem_cgroup_uncharge_folios(folios);
 	free_unref_folios(folios);
+	/* M19: caller-side return mark; see j716f-diag.h. */
+	j716f_bc_quiet(J716F_BC_PAGE_FREE_RET_REFS, _RET_IP_);
 }
 EXPORT_SYMBOL(folios_put_refs);
 

@@ -1509,6 +1509,8 @@ free_it:
 			mem_cgroup_uncharge_folios(&free_folios);
 			try_to_unmap_flush();
 			free_unref_folios(&free_folios);
+			/* M19: caller-side return mark (shrink_folio_list). */
+			j716f_bc_quiet(J716F_BC_PAGE_FREE_RET_SHRINK, _RET_IP_);
 		}
 		continue;
 
@@ -1578,6 +1580,8 @@ keep:
 	mem_cgroup_uncharge_folios(&free_folios);
 	try_to_unmap_flush();
 	free_unref_folios(&free_folios);
+	/* M19: caller-side return mark (shrink_folio_list, tail batch). */
+	j716f_bc_quiet(J716F_BC_PAGE_FREE_RET_SHRINK, _RET_IP_);
 
 	list_splice(&ret_folios, folio_list);
 	count_vm_events(PGACTIVATE, pgactivate);
@@ -1904,6 +1908,8 @@ static unsigned int move_folios_to_lru(struct list_head *list)
 				lruvec_unlock_irq(lruvec);
 				mem_cgroup_uncharge_folios(&free_folios);
 				free_unref_folios(&free_folios);
+				/* M19: caller-side return mark (move_folios_to_lru). */
+				j716f_bc_quiet(J716F_BC_PAGE_FREE_RET_MOVE_LRU, _RET_IP_);
 				lruvec = NULL;
 			}
 
@@ -1923,6 +1929,8 @@ static unsigned int move_folios_to_lru(struct list_head *list)
 	if (free_folios.nr) {
 		mem_cgroup_uncharge_folios(&free_folios);
 		free_unref_folios(&free_folios);
+		/* M19: caller-side return mark (move_folios_to_lru, tail). */
+		j716f_bc_quiet(J716F_BC_PAGE_FREE_RET_MOVE_LRU, _RET_IP_);
 	}
 
 	return nr_moved;
