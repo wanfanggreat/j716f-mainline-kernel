@@ -49,6 +49,8 @@
 #include <soc/qcom/j716f-diag.h>
 #include <soc/qcom/tcs.h>
 
+#include "j716f-vote-sm.h"
+
 #define J716F_BC_RING		16
 #define J716F_BC_DUMP_DEPTH	6
 #define J716F_BC_COMM_LEN	12
@@ -503,71 +505,53 @@ static void j716f_vote_push(struct j716f_vote_ring *r,
 			    const struct j716f_vote_rec *in);
 
 /*
- * MC0 retention (M20-P1c).
+ * MC0 retention and the in-flight transaction state machine (M20-P1d).
  *
- * v57 classified records by address and remembered "this txid touched MC0" in
- * a direct-mapped array indexed by txid & 63.  Two things were wrong:
+ * v58 kept a per-txid trigger counter, but three things were still wrong:
  *
- *   - a later txid hashing to the same slot silently evicted an earlier one,
- *     so that earlier transaction's DONE/RECLAIM no longer matched and its
- *     completion evidence never reached the MC0 ring.  The comment claiming
- *     collisions could only over-collect was simply false;
- *   - the client REQ record is written before the aggregate exists, so it can
- *     never carry the MC0 address and always stayed in the general ring, where
- *     ~120 commits/s wrap it in well under a second.  The one record that
- *     names the real requester was therefore the one record most likely lost.
+ *   - the counter was incremented in TCS_POKED, i.e. AFTER the trigger store.
+ *     A completion on another CPU could run tcs_tx_done() -> tx_release()
+ *     first, see pending==1, and free the entry; the increment then landed on
+ *     nothing (or on a recycled slot).  The transaction that was supposed to
+ *     be the durable evidence was exactly the one that vanished;
+ *   - release was keyed by txid only.  One txid can own several TCS batches
+ *     (apply_constraints() per provider, tcs_list_gen() splitting at
+ *     MAX_RPMH_PAYLOAD), and only some contain MC0.  A non-MC0 batch's
+ *     completion therefore decremented the MC0 count and could free a live
+ *     MC0 transaction;
+ *   - an entry created by the voter before submission had no way to be
+ *     removed if allocation or submission failed before any trigger.  It sat
+ *     at pending==0 forever and slowly exhausted the 32 slots.
  *
- * Both are fixed by one small table of MC0 transactions that are still in
- * flight.  An entry is created when the voter confirms the batch really
- * contains MC0, carries the original client's provenance, and is only freed
- * when tcs_tx_done() reclaims the TCS.  Consequences:
+ * The state machine in j716f-vote-sm.h fixes the model rather than moving the
+ * increment: a transaction entry is PREPARED by the voter (open, zero
+ * batches), each actual MC0 batch is registered against the exact key
+ * (txid, rsc, tcs) BEFORE the trigger store, and only the completion of that
+ * exact registered batch may consume it.  Completion frees the entry only
+ * when the last registered batch is gone AND the transaction is no longer
+ * open; a failed submission keeps the entry whenever a batch may be in
+ * flight, and drops it when nothing was triggered.
  *
- *   - a transaction that never completes keeps its entry, so its provenance
- *     and its trigger survive any amount of later ring traffic - the case the
- *     whole diagnostic exists for;
- *   - capacity is explicit (J716F_VOTE_MC0_TX_LEN concurrent MC0
- *     transactions).  Nothing in flight is ever evicted.  If the table is
- *     full the transaction is NOT tracked and the overflow counter says so,
- *     rather than a silent hash collision hiding it;
- *   - it is not a hash: lookup compares the full 32-bit txid, so there is no
- *     aliasing at all.
+ * J716F_VOTE_SM_BATCH_LEN is deliberately much larger than the number of
+ * RPMh TCS in flight (MAX_TCS_NR is 12 on this SoC): the table is an evidence
+ * store, not a scheduler.  If it ever fills, arm refuses to track and
+ * batch_overflow is printed; nothing live is evicted.
  *
- * Locking: mutations take j716f_mc0_tx_lock.  It is a leaf in both callers -
- * the commit path holds icc_bw_lock/voter->lock mutexes, the completion path
- * holds no RSC lock (RECLAIM is recorded after drv->lock is dropped).  Lookups
- * used for ring classification are lockless: a stale "not found" only means a
- * record stays in the general ring, never that evidence is invented.
+ * Locking: every state mutation takes j716f_mc0_tx_lock.  It is a leaf:
+ *   - the commit path holds icc_bw_lock/voter->lock mutexes;
+ *   - the completion path records RECLAIM after drv->lock is dropped and
+ *     only then calls release;
+ *   - the dump copies with trylock and prints after unlocking;
+ *   - the lockless classification helper only reads the batch publication
+ *     word/keys; it is not used for counting.
+ *
+ * The table lives in BSS and is protected by a statically initialised
+ * spinlock, so early probe paths cannot take an uninitialised lock.
  */
-#define J716F_VOTE_MC0_TX_LEN	32
-#define J716F_VOTE_PATH_LEN	20
-
-struct j716f_mc0_tx {
-	u32 txid;		/* 0 = slot free */
-	u32 pending;		/* MC0 triggers issued, decremented on RECLAIM */
-	u32 promoted;		/* REQ_MC0 already emitted for this txid */
-	u32 tcs;		/* last TCS it was triggered on */
-	u32 mc0_idx;		/* MC0's index in the batch, NONE if unknown */
-	u32 addr;
-	u32 data;
-	u32 avg_bw;
-	u32 peak_bw;
-	u32 pid;
-	u32 cpu;
-	u64 req_ts;		/* when the client called icc_set_bw() */
-	u64 trig_ts;		/* when the TCS trigger was written */
-	char comm[J716F_VOTE_COMM_LEN];
-	char path[J716F_VOTE_PATH_LEN];
-};
-
-static struct j716f_mc0_tx j716f_mc0_txs[J716F_VOTE_MC0_TX_LEN];
 static DEFINE_SPINLOCK(j716f_mc0_tx_lock);
-/*
- * Counters are atomic: the commit path can run on several CPUs through
- * different voters at once, and a diagnostics counter that silently loses
- * increments cannot be used to argue "this never happened".
- */
-static atomic_t j716f_mc0_tx_overflow = ATOMIC_INIT(0);	/* no free slot */
-static atomic_t j716f_vote_agg_unattr = ATOMIC_INIT(0);	/* MC0 commit, no request */
+static struct j716f_vote_sm j716f_vote_sm;
+/* MC0 commits with no client request behind them (per-frame no-op sets). */
+static atomic_t j716f_vote_agg_unattr = ATOMIC_INIT(0);
 
 /*
  * The client request that is currently being committed.
@@ -591,34 +575,8 @@ static struct {
 	u32 cpu;
 	u64 ts;
 	char comm[J716F_VOTE_COMM_LEN];
-	char path[J716F_VOTE_PATH_LEN];
+	char path[J716F_VOTE_SM_PATH_LEN];
 } j716f_cur_req;
-
-/* Caller holds j716f_mc0_tx_lock. */
-static struct j716f_mc0_tx *j716f_mc0_tx_find(u32 txid)
-{
-	int i;
-
-	if (!txid)
-		return NULL;
-	for (i = 0; i < J716F_VOTE_MC0_TX_LEN; i++)
-		if (j716f_mc0_txs[i].txid == txid)
-			return &j716f_mc0_txs[i];
-	return NULL;
-}
-
-/* Lockless lookup used only to classify a record; see the locking note. */
-static bool j716f_vote_txid_touched_mc0(u32 txid)
-{
-	int i;
-
-	if (!txid)
-		return false;
-	for (i = 0; i < J716F_VOTE_MC0_TX_LEN; i++)
-		if (READ_ONCE(j716f_mc0_txs[i].txid) == txid)
-			return true;
-	return false;
-}
 
 /*
  * Record a client request for later promotion.  Called from icc_set_bw()
@@ -650,17 +608,24 @@ EXPORT_SYMBOL_GPL(j716f_vote_note_request);
  * @addr: MC0's resource address as it appeared in the batch
  * @data: the raw vote word the voter produced for MC0
  *
- * Called once per commit from qcom_icc_bcm_voter_commit() after it has looked
- * at every command.  Creates the in-flight entry and emits the promoted
- * request record, which is the only record that carries the original client's
- * pid/comm/cpu/bandwidth/timestamp.
+ * Called once per MC0-bearing TCS batch from qcom_icc_bcm_voter_commit(),
+ * before any of the batches is submitted.  It PREPARES the transaction entry:
+ * the entry is now open and carries the original client's provenance, but it
+ * holds no outstanding batch yet.  The batch is only registered by
+ * j716f_vote_record_tcs(TCS_PRE) immediately before the trigger store.
+ *
+ * Preparing before submission is what makes the failure path cancellable: if
+ * allocation or submission fails before a trigger, j716f_vote_tx_abort() can
+ * drop an entry with no batches.  If a batch did get registered, abort keeps
+ * the entry and its evidence.
  */
 void j716f_vote_mc0_commit(u32 txid, u32 idx, u32 addr, u32 data)
 {
-	struct j716f_mc0_tx *t;
-	struct j716f_mc0_tx snap;
+	struct j716f_vote_sm_req req;
+	struct j716f_vote_sm_tx snap;
+	struct j716f_vote_sm_tx *t;
 	unsigned long flags;
-	bool have_prov, emit;
+	bool have_prov, emit = false;
 
 	if (!READ_ONCE(vote_trace))
 		return;
@@ -676,72 +641,36 @@ void j716f_vote_mc0_commit(u32 txid, u32 idx, u32 addr, u32 data)
 		return;
 	}
 
-	spin_lock_irqsave(&j716f_mc0_tx_lock, flags);
-	t = j716f_mc0_tx_find(txid);
 	/*
-	 * One icc_set_bw() can commit more than once (apply_constraints() runs
-	 * per provider), so an existing entry must keep its outstanding-trigger
-	 * count.  Only the provenance fields are refreshed, and only when the
-	 * handoff still belongs to this transaction; otherwise they are left
-	 * as they are rather than being replaced by another client's values.
+	 * The handoff is only trusted when it belongs to this transaction.
+	 * It is read before taking the table lock; icc_bw_lock keeps the
+	 * writer from changing it while the voter is committing.
 	 */
+	memset(&req, 0, sizeof(req));
 	have_prov = j716f_cur_req.txid == txid;
-	if (!t) {
-		int i;
-
-		for (i = 0; i < J716F_VOTE_MC0_TX_LEN; i++) {
-			if (!j716f_mc0_txs[i].txid) {
-				t = &j716f_mc0_txs[i];
-				break;
-			}
-		}
-		if (t) {
-			memset(t, 0, sizeof(*t));
-			t->txid = txid;
-			t->mc0_idx = J716F_VOTE_MC0_NONE;
-			if (have_prov) {
-				t->avg_bw = j716f_cur_req.avg_bw;
-				t->peak_bw = j716f_cur_req.peak_bw;
-				t->pid = j716f_cur_req.pid;
-				t->cpu = j716f_cur_req.cpu;
-				t->req_ts = j716f_cur_req.ts;
-				memcpy(t->comm, j716f_cur_req.comm, sizeof(t->comm));
-				memcpy(t->path, j716f_cur_req.path, sizeof(t->path));
-			}
-		}
+	if (have_prov) {
+		req.avg_bw = j716f_cur_req.avg_bw;
+		req.peak_bw = j716f_cur_req.peak_bw;
+		req.pid = j716f_cur_req.pid;
+		req.cpu = j716f_cur_req.cpu;
+		req.ts = j716f_cur_req.ts;
+		memcpy(req.comm, j716f_cur_req.comm, sizeof(req.comm));
+		memcpy(req.path, j716f_cur_req.path, sizeof(req.path));
 	}
+
+	spin_lock_irqsave(&j716f_mc0_tx_lock, flags);
+	t = j716f_vote_sm_prepare(&j716f_vote_sm, txid, idx, addr, data,
+				  have_prov ? &req : NULL, have_prov, &emit);
 	if (!t) {
 		/*
 		 * Every slot is held by a transaction that has not completed.
 		 * Refusing to track this one is the honest outcome; the
-		 * alternative would be evicting live evidence.
+		 * alternative would be evicting live evidence.  overflow was
+		 * incremented by the state machine.
 		 */
-		atomic_inc(&j716f_mc0_tx_overflow);
 		spin_unlock_irqrestore(&j716f_mc0_tx_lock, flags);
 		return;
 	}
-
-	t->mc0_idx = idx;
-	t->addr = addr;
-	t->data = data;
-	if (have_prov && !t->pid) {
-		t->avg_bw = j716f_cur_req.avg_bw;
-		t->peak_bw = j716f_cur_req.peak_bw;
-		t->pid = j716f_cur_req.pid;
-		t->cpu = j716f_cur_req.cpu;
-		t->req_ts = j716f_cur_req.ts;
-		memcpy(t->comm, j716f_cur_req.comm, sizeof(t->comm));
-		memcpy(t->path, j716f_cur_req.path, sizeof(t->path));
-	}
-
-	/*
-	 * Emit the promoted request exactly once per transaction.  A wide
-	 * icc_set_bw() commits per provider, so without this guard the ring
-	 * would show the same client request several times and a reader would
-	 * count them as separate MC0 events.
-	 */
-	emit = !t->promoted;
-	t->promoted = 1;
 	snap = *t;
 	spin_unlock_irqrestore(&j716f_mc0_tx_lock, flags);
 
@@ -773,13 +702,20 @@ void j716f_vote_mc0_commit(u32 txid, u32 idx, u32 addr, u32 data)
 EXPORT_SYMBOL_GPL(j716f_vote_mc0_commit);
 
 /*
- * Ring classification.  Only records that can be tied to MC0 by resource or
- * by a tracked transaction enter the retention ring.  The MC0 address being
- * unresolved admits nothing, so a failed Command DB lookup cannot silently
- * turn this back into "keep everything".
+ * Ring classification (M20-P1d).
+ *
+ * Only records that can be tied to MC0 by resource, or to the EXACT batch
+ * that was registered as MC0, enter the retention ring.  Classifying a
+ * completion by txid alone was the ring-side half of the v58 bug: a non-MC0
+ * batch of the same transaction produced DONE/RECLAIM records that looked
+ * like MC0 completion evidence.  The batch key (txid, rsc, tcs) is checked
+ * instead; an unregistered or duplicate completion stays in the general ring.
+ *
+ * The MC0 address being unresolved admits nothing, so a failed Command DB
+ * lookup cannot silently turn this back into "keep everything".
  */
 static bool j716f_vote_is_important(enum j716f_vote_kind kind, u32 txid,
-				    u32 addr)
+				    u32 addr, u32 aux)
 {
 	u32 mc0 = READ_ONCE(j716f_mc0_addr);
 
@@ -788,12 +724,12 @@ static bool j716f_vote_is_important(enum j716f_vote_kind kind, u32 txid,
 	if (addr == mc0)
 		return txid != 0;
 	/*
-	 * DONE/RECLAIM belong to a transaction that was seen carrying MC0;
-	 * REQ never can (it predates the aggregate) and is only promoted
-	 * through REQ_MC0.
+	 * DONE/RECLAIM carry the batch key in the call site's aux bit.  REQ
+	 * never can (it predates the aggregate) and is only promoted through
+	 * REQ_MC0.
 	 */
 	if (kind == J716F_VOTE_KIND_DONE || kind == J716F_VOTE_KIND_RECLAIM)
-		return j716f_vote_txid_touched_mc0(txid);
+		return txid && (aux & J716F_VOTE_AUX_MC0_BATCH);
 	return false;
 }
 
@@ -847,14 +783,30 @@ EXPORT_SYMBOL_GPL(j716f_vote_mc0_addr);
 /**
  * j716f_vote_alloc_txid - allocate a transaction id for one RPMh round trip
  *
- * Called by icc_set_bw() before it records the client request.  The id is
- * carried through the BCM commit, the TCS trigger and the completion so a
- * dump can line the four up even when other transactions interleave.
+ * Called by icc_set_bw() before it records the client request, while holding
+ * icc_bw_lock.  The id is carried through the BCM commit, the TCS trigger and
+ * the completion so a dump can line the four up even when other transactions
+ * interleave.
+ *
+ * M20-P1d: this is also the safe point to collect entries that a transaction
+ * left behind without ever arming a batch (a missed finish, or an error path
+ * that returned before the normal end).  icc_bw_lock is held here, so no
+ * other icc_set_bw() can be active; every entry with outstanding==0 belongs
+ * to a previous call and is stale.  Entries with batches in flight are never
+ * touched.  Counting the sweep makes the cleanup visible instead of silently
+ * deleting evidence.
  */
 u32 j716f_vote_alloc_txid(void)
 {
+	unsigned long flags;
+
 	if (!READ_ONCE(vote_trace))
 		return 0;
+
+	spin_lock_irqsave(&j716f_mc0_tx_lock, flags);
+	j716f_vote_sm_gc(&j716f_vote_sm);
+	spin_unlock_irqrestore(&j716f_mc0_tx_lock, flags);
+
 	return (u32)atomic_inc_return(&j716f_vote_txid);
 }
 EXPORT_SYMBOL_GPL(j716f_vote_alloc_txid);
@@ -903,7 +855,7 @@ void j716f_vote_record(enum j716f_vote_kind kind, u32 txid, u32 addr, u32 data,
 	if (kind != J716F_VOTE_KIND_DONE && kind != J716F_VOTE_KIND_RECLAIM)
 		strscpy(rec.comm, current->comm, sizeof(rec.comm));
 
-	if (j716f_vote_is_important(kind, txid, addr))
+	if (j716f_vote_is_important(kind, txid, addr, aux))
 		j716f_vote_push(&j716f_votes_mc0, &rec);
 
 	j716f_vote_push(&j716f_votes, &rec);
@@ -938,31 +890,42 @@ u32 j716f_vote_scan_mc0(const struct tcs_request *msg)
 EXPORT_SYMBOL_GPL(j716f_vote_scan_mc0);
 
 /**
- * j716f_vote_record_tcs - record one TCS trigger boundary for a batch
+ * j716f_vote_record_tcs - record and register one TCS trigger boundary
  * @kind: TCS_PRE or TCS_POKED
  * @msg: the batch being triggered
+ * @rsc: the RSC instance that owns @tcs
+ * @rsc_name: stable controller name, for the dump only
  * @tcs: the TCS id it was assigned
  *
- * The record is emitted once per batch, not once per command: a batch is one
- * hardware trigger, so one record is the honest granularity.  It carries the
- * MC0 command's index, address and data word, so a batch where MC0 sat in the
- * middle is still recognisable, plus the batch size and whether a response
- * was requested.
+ * The ring record is emitted once per MC0-bearing batch, not once per command:
+ * a batch is one hardware trigger, so one record is the honest granularity.
+ * It carries the MC0 command's index, address and data word, so a batch where
+ * MC0 sat in the middle is still recognisable, plus the batch size and whether
+ * a response was requested.
  *
- * Also counts the trigger on the in-flight transaction.  It is a counter, not
- * a flag: one icc_set_bw() can commit several times (apply_constraints() runs
- * once per provider along the path, and a wide commit splits into more than
- * one TCS batch), and the entry must not be freed by the first RECLAIM while
- * a second trigger is still outstanding.
+ * M20-P1d: TCS_PRE also REGISTERS the exact batch (txid, rsc, tcs) before the
+ * caller writes the trigger.  v58 incremented its counter in TCS_POKED, after
+ * the trigger store, so a completion on another CPU could release the
+ * transaction before the increment existed.  Here the registration is
+ * complete before the hardware can complete anything, and the counter belongs
+ * to this batch, not to the txid as a whole.  TCS_POKED only annotates that
+ * the store was seen; it is allowed to find the batch already gone because the
+ * completion won the race.
+ *
+ * State transitions are NOT gated on vote_trace: if the parameter is turned
+ * off while a transaction is open, the entry must still be armed and released
+ * or it would become permanent garbage.  vote_trace only suppresses the ring
+ * records.
  */
 void j716f_vote_record_tcs(enum j716f_vote_kind kind,
-			   const struct tcs_request *msg, u32 tcs)
+			   const struct tcs_request *msg,
+			   const struct rsc_drv *rsc, const char *rsc_name,
+			   u32 tcs)
 {
-	struct j716f_mc0_tx *t;
 	unsigned long flags;
 	u32 idx, aux, addr, data;
 
-	if (!READ_ONCE(vote_trace) || !msg)
+	if (!msg)
 		return;
 
 	idx = j716f_vote_scan_mc0(msg);
@@ -981,61 +944,139 @@ void j716f_vote_record_tcs(enum j716f_vote_kind kind,
 	      ((msg->wait_for_compl ? 1u : 0u) << 8) |
 	      (idx << 16);
 
-	j716f_vote_record(kind, msg->j716f_txid, addr, data, tcs, aux);
-
-	if (!msg->j716f_txid)
-		return;
-
-	spin_lock_irqsave(&j716f_mc0_tx_lock, flags);
-	t = j716f_mc0_tx_find(msg->j716f_txid);
-	if (t) {
-		t->tcs = tcs;
-		t->mc0_idx = idx;
-		t->addr = addr;
-		t->data = data;
-		if (kind == J716F_VOTE_KIND_TCS_POKED) {
-			if (t->pending != U32_MAX)
-				t->pending++;
-			t->trig_ts = j716f_now();
+	if (kind == J716F_VOTE_KIND_TCS_PRE) {
+		/*
+		 * Register BEFORE the trigger store and before the ring
+		 * record.  The caller calls this immediately before
+		 * __tcs_set_trigger(); a completion cannot exist yet, so the
+		 * count is in place before any handler can consume it.
+		 */
+		if (msg->j716f_txid) {
+			spin_lock_irqsave(&j716f_mc0_tx_lock, flags);
+			j716f_vote_sm_arm(&j716f_vote_sm, msg->j716f_txid,
+					   rsc, rsc_name, tcs, idx, data,
+					   j716f_now());
+			spin_unlock_irqrestore(&j716f_mc0_tx_lock, flags);
 		}
+		if (READ_ONCE(vote_trace))
+			j716f_vote_record(kind, msg->j716f_txid, addr, data,
+					   tcs, aux);
+		return;
 	}
-	spin_unlock_irqrestore(&j716f_mc0_tx_lock, flags);
+
+	/*
+	 * POKED: emit the durable record first.  It proves the store was
+	 * executed even if a completion frees the batch entry before the
+	 * annotation below; the annotation may then fail, which is honest
+	 * ("trigger not observed in the state table"), not a lost trigger.
+	 */
+	if (READ_ONCE(vote_trace))
+		j716f_vote_record(kind, msg->j716f_txid, addr, data, tcs, aux);
+
+	if (msg->j716f_txid) {
+		spin_lock_irqsave(&j716f_mc0_tx_lock, flags);
+		j716f_vote_sm_poked(&j716f_vote_sm, msg->j716f_txid,
+				     rsc, tcs, j716f_now());
+		spin_unlock_irqrestore(&j716f_mc0_tx_lock, flags);
+	}
 }
 EXPORT_SYMBOL_GPL(j716f_vote_record_tcs);
 
 /**
- * j716f_vote_tx_release - one MC0 trigger of a transaction was reclaimed
+ * j716f_vote_tx_release - consume the completion of one exact MC0 batch
  * @txid: transaction id read from drv->txid[] by the handler
+ * @rsc: the RSC instance that completed @tcs
+ * @tcs: the TCS id the handler reclaimed
  *
- * Decrements the outstanding-trigger count and frees the entry only when the
- * last one is reclaimed.  A transaction that never completes therefore keeps
- * its entry (and its provenance) forever, which is exactly the case a hang
- * dump must show.
+ * Only a completion whose (txid, rsc, tcs) matches a batch registered by
+ * TCS_PRE may decrement the outstanding count.  This is the fix for the v58
+ * cross-batch release: a non-MC0 batch of the same txid, a duplicate
+ * completion, or a completion from a re-used TCS finds no key and changes
+ * nothing.  A transaction that never completes keeps its entry (and its
+ * provenance) forever, which is exactly the case a hang dump must show.
  *
- * A RECLAIM for an id that is not tracked is NOT an error and is not counted:
- * the handler runs for every RPMh transaction, and the overwhelming majority
- * never touched MC0.  v57 would have had to guess here; this version simply
- * has nothing to do.
+ * Not gated on vote_trace: an entry created before the parameter was turned
+ * off must still be releasable.
  */
-void j716f_vote_tx_release(u32 txid)
+void j716f_vote_tx_release(u32 txid, const struct rsc_drv *rsc, u32 tcs)
 {
-	struct j716f_mc0_tx *t;
 	unsigned long flags;
 
-	if (!READ_ONCE(vote_trace) || !txid)
+	if (!txid)
 		return;
 
 	spin_lock_irqsave(&j716f_mc0_tx_lock, flags);
-	t = j716f_mc0_tx_find(txid);
-	if (t) {
-		if (t->pending > 1)
-			t->pending--;
-		else
-			memset(t, 0, sizeof(*t));
-	}
+	j716f_vote_sm_release(&j716f_vote_sm, txid, rsc, tcs);
 	spin_unlock_irqrestore(&j716f_mc0_tx_lock, flags);
 }
 EXPORT_SYMBOL_GPL(j716f_vote_tx_release);
+
+/**
+ * j716f_vote_tx_abort - submission failed for a prepared transaction
+ * @txid: transaction id whose RPMh batch call failed
+ * @reason: negative errno from the failed submission
+ *
+ * Called by the BCM voter after rpmh_write_batch_txid() returns an error.  If
+ * no batch was registered, nothing can ever complete and the entry is dropped
+ * (abort_clean).  If at least one batch may be in flight, the entry is kept
+ * as FAILED with the first error and its provenance; only the matching
+ * completions may free it (abort_partial).  This is what stops a failed
+ * commit from leaving a permanent pending==0 entry while never deleting a
+ * transaction that really did reach the hardware.
+ */
+void j716f_vote_tx_abort(u32 txid, int reason)
+{
+	unsigned long flags;
+
+	if (!txid)
+		return;
+
+	spin_lock_irqsave(&j716f_mc0_tx_lock, flags);
+	j716f_vote_sm_abort(&j716f_vote_sm, txid, reason);
+	spin_unlock_irqrestore(&j716f_mc0_tx_lock, flags);
+}
+EXPORT_SYMBOL_GPL(j716f_vote_tx_abort);
+
+/**
+ * j716f_vote_tx_finish - icc_set_bw() is done with this transaction
+ * @txid: transaction id allocated by that call
+ *
+ * Drops the open reference at every exit of icc_set_bw(), after the normal
+ * commit or after the rollback retry.  Completion is then allowed to free the
+ * entry as soon as the last registered batch is reclaimed.  Without this a
+ * short transaction whose batches all completed between two commits could
+ * free the entry too early and lose the next batch's registration.
+ */
+void j716f_vote_tx_finish(u32 txid)
+{
+	unsigned long flags;
+
+	if (!txid)
+		return;
+
+	spin_lock_irqsave(&j716f_mc0_tx_lock, flags);
+	j716f_vote_sm_finish(&j716f_vote_sm, txid);
+	spin_unlock_irqrestore(&j716f_mc0_tx_lock, flags);
+}
+EXPORT_SYMBOL_GPL(j716f_vote_tx_finish);
+
+/**
+ * j716f_vote_tx_batch_is_mc0 - was this exact completion a registered MC0 batch?
+ * @txid: transaction id read from drv->txid[] by the handler
+ * @rsc: the RSC instance that completed @tcs
+ * @tcs: the TCS id the handler is servicing
+ *
+ * Used only to classify the DONE/RECLAIM ring records.  The batch entry is
+ * still present when DONE is recorded and when RECLAIM is recorded (release
+ * runs after both), so this is exact on the normal path.  A duplicate
+ * completion after release may miss and stays in the general ring; it never
+ * affects a count.
+ */
+bool j716f_vote_tx_batch_is_mc0(u32 txid, const struct rsc_drv *rsc, u32 tcs)
+{
+	return j716f_vote_sm_batch_is_mc0(&j716f_vote_sm, txid, rsc, tcs);
+}
+EXPORT_SYMBOL_GPL(j716f_vote_tx_batch_is_mc0);
 
 /**
  * j716f_vote_decode - decode one BCM TCS data word
@@ -1189,6 +1230,31 @@ static void j716f_vote_dump_ring(struct j716f_vote_ring *r, const char *tag,
 						-1 : (int)J716F_VOTE_AUX_MC0IDX(aux),
 					J716F_VOTE_AUX_WAIT(aux),
 					j716f_age(now, v->ts) / NSEC_PER_MSEC);
+			else if (v->kind == J716F_VOTE_KIND_DONE ||
+				 v->kind == J716F_VOTE_KIND_RECLAIM)
+				/*
+				 * DONE is the handler observing an already-set
+				 * completion bit, not the instant hardware
+				 * finished.  RECLAIM is Linux releasing the
+				 * TCS, not a hardware action.  Keep them
+				 * distinguishable: a DONE without a following
+				 * RECLAIM means the handler started but did not
+				 * finish the software release; it does not mean
+				 * the IRQ was never delivered.
+				 *
+				 * irq_sts is the raw RSC_DRV_IRQ_STATUS word the
+				 * handler read; only its bit @tcs belongs to
+				 * this record.  batch-mc0=1 means the exact
+				 * (txid, rsc, tcs) batch was registered as MC0
+				 * and this completion may consume it.
+				 */
+				pr_info("J716F VOTE %s %-9s tx=%u seq=%u tcs=%d irq_sts=0x%08x batch-mc0=%u age=%llums\n",
+					tag, j716f_vote_kind_name(v->kind), v->txid,
+					v->seq,
+					v->tcs == J716F_VOTE_NO_TCS ? -1 : (int)v->tcs,
+					v->data,
+					!!(aux & J716F_VOTE_AUX_MC0_BATCH),
+					j716f_age(now, v->ts) / NSEC_PER_MSEC);
 			else
 				pr_info("J716F VOTE %s %-9s tx=%u seq=%u %s cpu%u pid=%u comm=%s addr=0x%x tcs=%d data=0x%08x aux=0x%x age=%llums\n",
 					tag, j716f_vote_kind_name(v->kind), v->txid,
@@ -1223,29 +1289,44 @@ static void j716f_vote_dump_ring(struct j716f_vote_ring *r, const char *tag,
 	 * Say it loudly and last, so it is not missed between record lines.
 	 * A record that failed its seq check is not this window's record, so
 	 * the whole printed set is unusable for causal reasoning.
-	 */	if (inconsistent)
+	 */
+	if (inconsistent)
 		pr_info("J716F VOTE %s: snapshot inconsistent (records may span two windows) - undecidable\n",
 			tag);
 }
 
 /*
- * In-flight MC0 transactions.
+ * In-flight MC0 transactions and their exact TCS batches.
  *
  * This is the part that survives a hang.  A transaction whose TCS was never
- * reclaimed keeps its slot, so its client provenance, its trigger time and its
- * TCS id are still there no matter how much later traffic filled the rings.
+ * reclaimed keeps its slot, so its client provenance and its trigger survive
+ * any amount of later ring traffic.
  *
- * Copied and printed 8 entries at a time: the whole table is ~3 KiB, and this
- * runs in the panic path where a large stack frame is not acceptable.
+ * Snapshot consistency (M20-P1d): v58 copied 8 entries at a time, dropping
+ * the lock between chunks, and printed the result as if it were one moment.
+ * A transaction created or freed between two chunks made the printed set span
+ * two windows, which is exactly what an A/B/C judgement must not do.  The
+ * table now has a mutation sequence (j716f_vote_sm.seq); the dump reads it
+ * before the first chunk and after the last, and reports "moved" together
+ * with an explicit undecidable verdict if anything changed.  Each entry also
+ * carries its own gen, so a reader can see which slots were touched.
+ *
+ * The two tables share the sequence and the same lock, so one verdict covers
+ * both.  Copy and print are always separated: the lock is only held for the
+ * memcpy, never for printk.  Chunks are 4 entries to keep the panic stack
+ * small; the whole table is 32 transactions + 64 batch keys.
  */
-#define J716F_VOTE_INFLIGHT_CHUNK	8
+#define J716F_VOTE_INFLIGHT_CHUNK	4
 
 static void j716f_vote_dump_inflight(u64 now)
 {
-	struct j716f_mc0_tx chunk[J716F_VOTE_INFLIGHT_CHUNK];
+	struct j716f_vote_sm_tx tchunk[J716F_VOTE_INFLIGHT_CHUNK];
+	struct j716f_vote_sm_batch bchunk[J716F_VOTE_INFLIGHT_CHUNK];
 	unsigned long flags;
-	u32 i, off, n, live = 0;
-	u32 overflow = (u32)atomic_read(&j716f_mc0_tx_overflow);
+	u32 i, off, n, tx_live = 0, batch_live = 0;
+	u32 seq_start = 0, seq_end = 0, moved = 0;
+	u32 overflow, batch_overflow, abort_clean, abort_partial;
+	u32 orphan, gc, dup;
 	u32 unattr = (u32)atomic_read(&j716f_vote_agg_unattr);
 	bool busy = false;
 
@@ -1253,45 +1334,128 @@ static void j716f_vote_dump_inflight(u64 now)
 		pr_info("J716F VOTE inflight: table lock busy, entries skipped (undecidable)\n");
 		return;
 	}
-	for (i = 0; i < J716F_VOTE_MC0_TX_LEN; i++)
-		if (j716f_mc0_txs[i].txid)
-			live++;
+	seq_start = j716f_vote_sm.seq;
+	seq_end = seq_start;
+	for (i = 0; i < J716F_VOTE_SM_TX_LEN; i++)
+		if (j716f_vote_sm.tx[i].txid)
+			tx_live++;
+	for (i = 0; i < J716F_VOTE_SM_BATCH_LEN; i++)
+		if (j716f_vote_sm.batch[i].txid)
+			batch_live++;
+	overflow = j716f_vote_sm.overflow;
+	batch_overflow = j716f_vote_sm.batch_overflow;
+	abort_clean = j716f_vote_sm.abort_clean;
+	abort_partial = j716f_vote_sm.abort_partial;
+	orphan = j716f_vote_sm.orphan_release;
+	gc = j716f_vote_sm.gc_stale;
+	dup = j716f_vote_sm.dup_arm;
 	spin_unlock_irqrestore(&j716f_mc0_tx_lock, flags);
 
-	pr_info("J716F VOTE inflight: %u/%u slots in use, overflow=%u unattr_commits=%u%s\n",
-		live, J716F_VOTE_MC0_TX_LEN, overflow, unattr,
-		overflow ? " (MC0 batch not tracked: table full)" : "");
+	pr_info("J716F VOTE inflight: tx=%u/%u batch=%u/%u overflow=%u batch_overflow=%u abort_clean=%u abort_partial=%u orphan_release=%u gc_stale=%u dup_arm=%u unattr_commits=%u%s%s\n",
+		tx_live, J716F_VOTE_SM_TX_LEN, batch_live,
+		J716F_VOTE_SM_BATCH_LEN, overflow, batch_overflow,
+		abort_clean, abort_partial, orphan, gc, dup, unattr,
+		overflow ? " (MC0 tx not tracked: table full)" : "",
+		batch_overflow ? " (MC0 batch not tracked: table full)" : "");
 
-	for (off = 0; off < J716F_VOTE_MC0_TX_LEN; off += n) {
+	for (off = 0; off < J716F_VOTE_SM_TX_LEN; off += n) {
 		n = min_t(u32, J716F_VOTE_INFLIGHT_CHUNK,
-			  J716F_VOTE_MC0_TX_LEN - off);
+			  J716F_VOTE_SM_TX_LEN - off);
 
 		if (!spin_trylock_irqsave(&j716f_mc0_tx_lock, flags)) {
-			pr_info("J716F VOTE inflight: lock busy after %u entries (undecidable)\n",
+			pr_info("J716F VOTE inflight: lock busy after %u tx entries (undecidable)\n",
 				off);
 			busy = true;
 			break;
 		}
-		memcpy(chunk, &j716f_mc0_txs[off], n * sizeof(chunk[0]));
+		memcpy(tchunk, &j716f_vote_sm.tx[off], n * sizeof(tchunk[0]));
 		spin_unlock_irqrestore(&j716f_mc0_tx_lock, flags);
 
 		for (i = 0; i < n; i++) {
-			const struct j716f_mc0_tx *t = &chunk[i];
+			const struct j716f_vote_sm_tx *t = &tchunk[i];
 
 			if (!t->txid)
 				continue;
-			pr_info("J716F VOTE inflight tx=%u pid=%u comm=%s cpu%u path=%s avg=%u peak=%u tcs=%d triggers=%u mc0=%d addr=0x%x data=0x%08x req_age=%llums trig_age=%llums\n",
-				t->txid, t->pid, t->comm, t->cpu, t->path,
-				t->avg_bw, t->peak_bw,
-				t->pending, t->tcs,
-				t->mc0_idx == J716F_VOTE_MC0_NONE ? -1 : (int)t->mc0_idx,
-				t->addr, t->data,
+			/*
+			 * Field order is part of the runbook contract:
+			 * state, open and outstanding first, then provenance,
+			 * then the aggregate word.  "trig_age" is the age of
+			 * the first arm (registered immediately before the
+			 * trigger store); a batch line says whether the store
+			 * was actually observed (poked).
+			 */
+			pr_info("J716F VOTE inflight tx=%u state=%s open=%u outstanding=%u pid=%u comm=%s cpu%u path=%s avg=%u peak=%u mc0=%d addr=0x%x data=0x%08x fail=%d req_age=%llums trig_age=%llums gen=%u\n",
+				t->txid, j716f_vote_sm_state_name(t->state),
+				t->open, t->outstanding, t->pid, t->comm,
+				t->cpu, t->path, t->avg_bw, t->peak_bw,
+				t->mc0_idx == J716F_VOTE_SM_MC0_NONE ?
+					-1 : (int)t->mc0_idx,
+				t->addr, t->data, t->fail_reason,
 				t->req_ts ? j716f_age(now, t->req_ts) / NSEC_PER_MSEC : 0,
-				t->trig_ts ? j716f_age(now, t->trig_ts) / NSEC_PER_MSEC : 0);
+				t->first_arm_ts ? j716f_age(now, t->first_arm_ts) / NSEC_PER_MSEC : 0,
+				t->gen);
 		}
 	}
-	if (busy)
-		pr_info("J716F VOTE inflight: snapshot incomplete - undecidable\n");
+
+	for (off = 0; !busy && off < J716F_VOTE_SM_BATCH_LEN; off += n) {
+		n = min_t(u32, J716F_VOTE_INFLIGHT_CHUNK,
+			  J716F_VOTE_SM_BATCH_LEN - off);
+
+		if (!spin_trylock_irqsave(&j716f_mc0_tx_lock, flags)) {
+			pr_info("J716F VOTE inflight: lock busy after %u batch entries (undecidable)\n",
+				off);
+			busy = true;
+			break;
+		}
+		memcpy(bchunk, &j716f_vote_sm.batch[off],
+		       n * sizeof(bchunk[0]));
+		spin_unlock_irqrestore(&j716f_mc0_tx_lock, flags);
+
+		for (i = 0; i < n; i++) {
+			const struct j716f_vote_sm_batch *b = &bchunk[i];
+
+			if (!b->txid)
+				continue;
+			/*
+			 * One line per actual TCS batch.  This is the only
+			 * place that says which TCS an MC0 transaction was
+			 * registered on; a transaction can have more than
+			 * one, and a batch without MC0 is not here at all.
+			 */
+			pr_info("J716F VOTE batch tx=%u rsc=%s tcs=%u mc0=%d poked=%u gen=%u arm_age=%llums poked_age=%llums\n",
+				b->txid,
+				b->rsc_name ? b->rsc_name : "?",
+				b->tcs,
+				b->mc0_idx == J716F_VOTE_SM_MC0_NONE ?
+					-1 : (int)b->mc0_idx,
+				b->poked, b->gen,
+				b->arm_ts ? j716f_age(now, b->arm_ts) / NSEC_PER_MSEC : 0,
+				b->poked_ts ? j716f_age(now, b->poked_ts) / NSEC_PER_MSEC : 0);
+		}
+	}
+
+	if (!busy) {
+		if (!spin_trylock_irqsave(&j716f_mc0_tx_lock, flags)) {
+			busy = true;
+		} else {
+			seq_end = j716f_vote_sm.seq;
+			spin_unlock_irqrestore(&j716f_mc0_tx_lock, flags);
+			moved = seq_end - seq_start;
+		}
+	}
+
+	pr_info("J716F VOTE inflight: gen=%u..%u moved=%u%s%s\n",
+		seq_start, seq_end, moved,
+		moved ? " (window advanced)" : "",
+		busy ? " (lock busy)" : "");
+
+	/*
+	 * Say it loudly and last.  Any mutation between the first and last
+	 * chunk means the printed entries may come from different time
+	 * windows; that set must not be used to argue A/B/C.
+	 */
+	if (busy || moved)
+		pr_info("J716F VOTE inflight: snapshot inconsistent (entries may span two windows) - undecidable\n");
 }
 
 /**

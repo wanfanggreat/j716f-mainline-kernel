@@ -271,6 +271,26 @@ enum j716f_bc_site {
  * and at or before DONE (handler).  Treat DONE as "no later than", never as
  * "the moment hardware finished".
  *
+ * M20-P1d: the DONE/RECLAIM records now carry a batch-mc0 flag (aux bit 0) and
+ * only enter the MC0 ring when the exact (txid, rsc, tcs) batch was
+ * registered as MC0.  This keeps a completion of a non-MC0 batch from being
+ * read as MC0 completion evidence.  It also separates the two B-class
+ * observations that v58's prose merged:
+ *
+ *   RSC DONE=1, no VOTE done   the completion bit was observed in the RSC
+ *                              register dump, but no handler entry record
+ *                              exists.  Proves the hardware/status bit was
+ *                              set; does NOT prove the IRQ was delivered or
+ *                              that the handler ran.
+ *   VOTE done, no VOTE reclaim the handler DID run and recorded the
+ *                              completion; it did not reach the software
+ *                              reclaim record.  This is a handler-progress
+ *                              failure, not an unserved IRQ.
+ *
+ * Neither observation excludes a NoC/DDR failure shared with the vote path;
+ * a set completion bit only proves the accelerator/status side reached that
+ * point.
+ *
  * M20-P1c: this enum lives OUTSIDE the CONFIG_QCOM_J716F_DIAG guard.  The
  * call sites pass J716F_VOTE_KIND_* to j716f_vote_record(), and the no-op
  * inline used when the option is off still type-checks its arguments, so a
@@ -303,7 +323,16 @@ enum j716f_vote_kind {
 #define J716F_VOTE_AUX_WAIT(a)		(((a) >> 8) & 1u)
 #define J716F_VOTE_AUX_MC0IDX(a)	(((a) >> 16) & 0xffu)
 
+/*
+ * DONE/RECLAIM aux bit: the exact (txid, rsc, tcs) batch was registered as
+ * MC0 before its trigger.  It is what admits the completion into the MC0 ring;
+ * "txid was seen carrying MC0 somewhere" is not enough, because one txid can
+ * own several batches and only some are MC0.
+ */
+#define J716F_VOTE_AUX_MC0_BATCH	0x1u
+
 struct tcs_request;
+struct rsc_drv;
 
 #if IS_ENABLED(CONFIG_QCOM_J716F_DIAG)
 void j716f_bc(enum j716f_bc_site site, unsigned long arg);
@@ -321,9 +350,14 @@ void j716f_vote_mc0_commit(u32 txid, u32 idx, u32 addr, u32 data);
 void j716f_vote_record(enum j716f_vote_kind kind, u32 txid, u32 addr, u32 data,
 		       u32 tcs, u32 aux);
 void j716f_vote_record_tcs(enum j716f_vote_kind kind,
-			   const struct tcs_request *msg, u32 tcs);
+			   const struct tcs_request *msg,
+			   const struct rsc_drv *rsc, const char *rsc_name,
+			   u32 tcs);
 u32 j716f_vote_scan_mc0(const struct tcs_request *msg);
-void j716f_vote_tx_release(u32 txid);
+void j716f_vote_tx_release(u32 txid, const struct rsc_drv *rsc, u32 tcs);
+void j716f_vote_tx_abort(u32 txid, int reason);
+void j716f_vote_tx_finish(u32 txid);
+bool j716f_vote_tx_batch_is_mc0(u32 txid, const struct rsc_drv *rsc, u32 tcs);
 void j716f_vote_dump(void);
 /*
  * M20-P1 IRQ accounting.  Cheap enough for the RSC completion handler: one
@@ -350,10 +384,18 @@ static inline void j716f_vote_mc0_commit(u32 txid, u32 idx, u32 addr, u32 data) 
 static inline void j716f_vote_record(enum j716f_vote_kind kind, u32 txid,
 				     u32 addr, u32 data, u32 tcs, u32 aux) { }
 static inline void j716f_vote_record_tcs(enum j716f_vote_kind kind,
-					 const struct tcs_request *msg, u32 tcs) { }
+					 const struct tcs_request *msg,
+					 const struct rsc_drv *rsc,
+					 const char *rsc_name, u32 tcs) { }
 static inline u32 j716f_vote_scan_mc0(const struct tcs_request *msg)
 { return J716F_VOTE_MC0_NONE; }
-static inline void j716f_vote_tx_release(u32 txid) { }
+static inline void j716f_vote_tx_release(u32 txid, const struct rsc_drv *rsc,
+					 u32 tcs) { }
+static inline void j716f_vote_tx_abort(u32 txid, int reason) { }
+static inline void j716f_vote_tx_finish(u32 txid) { }
+static inline bool j716f_vote_tx_batch_is_mc0(u32 txid,
+					      const struct rsc_drv *rsc,
+					      u32 tcs) { return false; }
 static inline void j716f_vote_dump(void) { }
 static inline void j716f_irq_enter(int irq) { }
 static inline void j716f_irq_exit(int irq) { }

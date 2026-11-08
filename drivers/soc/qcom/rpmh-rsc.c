@@ -480,6 +480,7 @@ static irqreturn_t tcs_tx_done(int irq, void *p)
 	const struct tcs_request *req;
 	u32 reg;
 	u32 txid;
+	bool mc0_batch;
 
 	j716f_bc(J716F_BC_RSC_IRQ_ENTER, irq);
 	j716f_irq_enter(irq);
@@ -496,10 +497,17 @@ static irqreturn_t tcs_tx_done(int irq, void *p)
 		 * carries the raw status (evidence that the bit was set) and
 		 * the TCS id (which request it belongs to), and the dump
 		 * labels it "handler observed", never "hardware finished".
+		 *
+		 * M20-P1d: batch-mc0 says whether the exact (txid, rsc, tcs)
+		 * batch was registered as MC0.  A completion of a non-MC0
+		 * batch of the same transaction must not look like MC0
+		 * completion evidence.
 		 */
-		j716f_vote_record(J716F_VOTE_KIND_DONE,
-				   rpmh_rsc_get_txid(drv, i),
-				   0, irq_status, (u32)i, 0);
+		txid = rpmh_rsc_get_txid(drv, i);
+		mc0_batch = j716f_vote_tx_batch_is_mc0(txid, drv, (u32)i);
+		j716f_vote_record(J716F_VOTE_KIND_DONE, txid, 0, irq_status,
+				   (u32)i,
+				   mc0_batch ? J716F_VOTE_AUX_MC0_BATCH : 0);
 		req = get_req_from_tcs(drv, i);
 		if (WARN_ON(!req))
 			goto skip;
@@ -539,16 +547,17 @@ skip:
 		 * Recorded AFTER releasing drv->lock: the vote ring has its own
 		 * lock, and taking it inside drv->lock would add a nesting edge
 		 * to a path this diagnostic is not supposed to perturb.
+		 *
+		 * M20-P1d: the batch entry is still present here (release runs
+		 * below), so batch-mc0 is exact for this completion.  The
+		 * release is keyed by (txid, rsc, tcs), never by txid alone: a
+		 * non-MC0 batch of the same txid must not consume an MC0 count.
 		 */
+		mc0_batch = j716f_vote_tx_batch_is_mc0(txid, drv, (u32)i);
 		j716f_vote_record(J716F_VOTE_KIND_RECLAIM, txid, 0, irq_status,
-				   (u32)i, 0);
-		/*
-		 * M20-P1c: the transaction is over, so release its in-flight
-		 * MC0 entry.  Done here, after the record above, so the
-		 * completion itself is still classified as MC0; anything that
-		 * never reaches this point keeps its provenance for the dump.
-		 */
-		j716f_vote_tx_release(txid);
+				   (u32)i,
+				   mc0_batch ? J716F_VOTE_AUX_MC0_BATCH : 0);
+		j716f_vote_tx_release(txid, drv, (u32)i);
 		wake_up(&drv->tcs_wait);
 		if (req)
 			rpmh_tx_done(req);
@@ -786,10 +795,19 @@ int rpmh_rsc_send_data(struct rsc_drv *drv, const struct tcs_request *msg)
 	 *
 	 * Between them they bracket the actual trigger, and neither may be
 	 * reported as "hardware started".
+	 *
+	 * M20-P1d: TCS_PRE also registers this exact batch as MC0 in the
+	 * in-flight table BEFORE __tcs_set_trigger() is called.  The
+	 * completion handler on another CPU can therefore never consume a
+	 * count that has not been taken yet.  TCS_POKED only annotates the
+	 * trigger store after the fact; it may legitimately find the batch
+	 * already gone if the completion won the race.
 	 */
-	j716f_vote_record_tcs(J716F_VOTE_KIND_TCS_PRE, msg, (u32)tcs_id);
+	j716f_vote_record_tcs(J716F_VOTE_KIND_TCS_PRE, msg, drv, drv->name,
+			      (u32)tcs_id);
 	__tcs_set_trigger(drv, tcs_id, true);
-	j716f_vote_record_tcs(J716F_VOTE_KIND_TCS_POKED, msg, (u32)tcs_id);
+	j716f_vote_record_tcs(J716F_VOTE_KIND_TCS_POKED, msg, drv, drv->name,
+			      (u32)tcs_id);
 	j716f_bc(J716F_BC_RSC_SEND_EXIT, tcs_id);
 
 	return 0;

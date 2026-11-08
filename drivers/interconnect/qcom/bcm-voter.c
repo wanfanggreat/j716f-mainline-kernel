@@ -282,6 +282,7 @@ int qcom_icc_bcm_voter_commit(struct bcm_voter *voter)
 	struct tcs_cmd cmds[MAX_BCMS];
 	int ret = 0;
 	int i;
+	u32 txid;
 
 	if (!voter)
 		return 0;
@@ -385,11 +386,20 @@ int qcom_icc_bcm_voter_commit(struct bcm_voter *voter)
 	 * M20-P1b: pass the transaction id explicitly so it is attached to the
 	 * request that is actually triggered.  rpmh_write_batch() callers that
 	 * do not know the origin get 0.
+	 *
+	 * M20-P1d: keep the id in a local for the failure path.  If the AMC
+	 * submission fails, the in-flight state machine must decide what to do
+	 * with the entry that j716f_vote_mc0_commit() prepared above: drop it
+	 * when no batch was ever registered, or keep it as failed evidence
+	 * when at least one batch may be in the hardware.  Only the AMC call
+	 * can own this transaction; a later WAKE/SLEEP write failure is not a
+	 * failure of the MC0 batch set.
 	 */
+	txid = j716f_vote_current_txid();
 	ret = rpmh_write_batch_txid(voter->dev, RPMH_ACTIVE_ONLY_STATE,
-				    cmds, commit_idx,
-				    j716f_vote_current_txid());
+				    cmds, commit_idx, txid);
 	if (ret) {
+		j716f_vote_tx_abort(txid, ret);
 		pr_err("Error sending AMC RPMH requests (%d)\n", ret);
 		goto out;
 	}

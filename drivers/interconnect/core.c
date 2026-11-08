@@ -817,6 +817,15 @@ int icc_set_bw(struct icc_path *path, u32 avg_bw, u32 peak_bw)
 		apply_constraints(path);
 	}
 
+	/*
+	 * M20-P1d: this icc_set_bw() can no longer commit a batch for @txid.
+	 * Drop the transaction's open reference so the state machine may free
+	 * the entry once the last registered batch is reclaimed.  This runs on
+	 * both exits (normal and failed+rollback); without it a transaction
+	 * whose batches all completed between two provider commits would free
+	 * the entry early and the next commit would arm into a missing entry.
+	 */
+	j716f_vote_tx_finish(txid);
 	j716f_vote_set_current_txid(0);
 	mutex_unlock(&icc_bw_lock);
 
