@@ -273,7 +273,7 @@ static const char *const j716f_bc_names[J716F_BC_MAX] = {
 	[J716F_BC_FORK_WAKE_EXIT]	= "wake_new_task_exit",
 	[J716F_BC_PAGE_FREE_LIST_ENTER]	= "free_unref_folios_enter",
 	[J716F_BC_PAGE_FREE_LIST_EXIT]	= "free_unref_folios_exit",
-	[J716F_BC_PAGE_FREE_LIST_RET]	= "free_unref_folios_ret",
+	[J716F_BC_PAGE_FREE_PRE_REINIT]	= "free_unref_pre_reinit",
 	[J716F_BC_PAGE_FREE_PCP_ENTER]	= "free_pcppages_bulk_enter",
 	[J716F_BC_PAGE_FREE_PCP_EXIT]	= "free_pcppages_bulk_exit",
 	[J716F_BC_TLB_BATCHED_ENTER]	= "tlb_batched_enter",
@@ -290,9 +290,6 @@ static const char *const j716f_bc_names[J716F_BC_MAX] = {
 	[J716F_BC_PAGE_FREE_RET_REFS]	= "free_unref_ret_refs",
 	[J716F_BC_PAGE_FREE_RET_SHRINK]	= "free_unref_ret_shrink",
 	[J716F_BC_PAGE_FREE_RET_MOVE_LRU] = "free_unref_ret_move_lru",
-	[J716F_BC_EXC_IRQ]		= "exc_irq",
-	[J716F_BC_EXC_NMI]		= "exc_nmi",
-	[J716F_BC_EXC_SERROR]		= "exc_serror",
 };
 
 static const char *j716f_bc_name(u32 site)
@@ -359,118 +356,6 @@ void j716f_bc_quiet(enum j716f_bc_site site, unsigned long arg)
 		preempt_enable_no_resched_notrace();
 }
 EXPORT_SYMBOL_GPL(j716f_bc_quiet);
-
-/*
- * M19 exception window.
- *
- * The page-free path is short, but the M18 ring could not prove that the
- * CPU stayed on it: an IRQ/NMI/SError taken between two page-free records
- * leaves the same "last record" trace as a CPU that stopped dead.  Rather
- * than instrumenting every interrupt on the machine (which would perturb
- * exactly the timing we are trying to observe), the page-free path arms a
- * per-CPU window, and only the arm64 exception entry path consults it.
- *
- * The window is a counter, not a flag: the page-free path may nest (an IRQ
- * that frees pages inside a window is legitimate) and an unpaired leave
- * must not be able to disarm a nested window.
- *
- * @win_ts makes the dump self-checking: a record older than the window is
- * not evidence that the exception arrived inside it.
- */
-struct j716f_bc_win {
-	u32 depth;
-	u64 entered;
-};
-static DEFINE_PER_CPU(struct j716f_bc_win, j716f_bc_windows);
-
-/*
- * Number of CPUs with an armed window.  Read by the exception entry path
- * with a plain load (see j716f_bc_win_armed()); it only has to be a hint,
- * because j716f_bc_irq_probe() re-checks this CPU's own window depth before
- * recording anything.
- */
-unsigned int j716f_bc_win_armed_cnt;
-EXPORT_SYMBOL_GPL(j716f_bc_win_armed_cnt);
-
-/* Only used from the dump, to explain an armed-but-unused window. */
-static unsigned int win_max_ms = 50;
-module_param(win_max_ms, uint, 0444);
-MODULE_PARM_DESC(win_max_ms, "J716F: window age above which an exception record is reported as stale");
-
-void j716f_bc_win_enter(void)
-{
-	struct j716f_bc_win *w = this_cpu_ptr(&j716f_bc_windows);
-
-	if (!w->depth) {
-		w->entered = j716f_now();
-		WRITE_ONCE(j716f_bc_win_armed_cnt,
-			   READ_ONCE(j716f_bc_win_armed_cnt) + 1);
-	}
-	w->depth++;
-}
-
-void j716f_bc_win_leave(void)
-{
-	struct j716f_bc_win *w = this_cpu_ptr(&j716f_bc_windows);
-
-	if (WARN_ON_ONCE(!w->depth))
-		return;
-	w->depth--;
-	if (!w->depth)
-		WRITE_ONCE(j716f_bc_win_armed_cnt,
-			   READ_ONCE(j716f_bc_win_armed_cnt) - 1);
-}
-
-/**
- * j716f_bc_irq_probe - record an exception taken inside a page-free window
- * @nmi: true for pseudo-NMI/SError entry, false for a normal IRQ
- *
- * Called from the arm64 exception entry path before any handler runs.  It
- * must stay cheap and must not allocate, lock, or schedule: the caller is
- * either in the middle of irqentry_enter() or in NMI context.
- *
- * The global armed counter is only a hint (it can be armed by another CPU),
- * so the per-CPU depth is re-checked here before anything is recorded.
- */
-void j716f_bc_irq_probe(bool nmi)
-{
-	struct j716f_bc_win *w = this_cpu_ptr(&j716f_bc_windows);
-
-	if (!READ_ONCE(w->depth))
-		return;
-
-	/*
-	 * Do not recurse: the record is written from exception context and an
-	 * exception taken inside it would re-enter this function.
-	 */
-	if (in_nmi() && !nmi)
-		return;
-
-	j716f_bc_quiet(nmi ? J716F_BC_EXC_NMI : J716F_BC_EXC_IRQ,
-		       (unsigned long)w->entered);
-}
-EXPORT_SYMBOL_GPL(j716f_bc_irq_probe);
-
-/**
- * j716f_bc_serror_probe - record an SError taken inside a page-free window
- *
- * SEPARATE from j716f_bc_irq_probe() on purpose.  An SError that arrives
- * while the page-free path is armed is the one exception type that can
- * explain "the CPU stopped on the exact instruction that touched Device
- * memory": it is asynchronous, so it is reported at an arbitrary later
- * instruction, and it can be taken with DAIF masked (ARM64_AS_ERROR).
- * Recording it as exc_nmi would hide exactly the distinction M19 needs.
- */
-void j716f_bc_serror_probe(void)
-{
-	struct j716f_bc_win *w = this_cpu_ptr(&j716f_bc_windows);
-
-	if (!READ_ONCE(w->depth))
-		return;
-
-	j716f_bc_quiet(J716F_BC_EXC_SERROR, (unsigned long)w->entered);
-}
-EXPORT_SYMBOL_GPL(j716f_bc_serror_probe);
 
 /**
  * j716f_bc - record one breadcrumb on the current CPU
@@ -961,28 +846,6 @@ void j716f_diag_dump(const char *reason)
 	j716f_asid_dump("dump");
 
 	/*
-	 * M19: report the exception window of every CPU.  A CPU whose window
-	 * is still armed was inside free_unref_folios() when it stopped, and
-	 * any EXC_* record newer than the window's start is evidence that an
-	 * exception was taken there.  This is what separates "stopped on the
-	 * page-free path" from "took an IRQ/NMI/SError that never returned".
-	 */
-	for_each_online_cpu(cpu) {
-		struct j716f_bc_win *w = per_cpu_ptr(&j716f_bc_windows, cpu);
-		u64 entered = READ_ONCE(w->entered);
-		u32 depth = READ_ONCE(w->depth);
-
-		if (!depth && !entered)
-			continue;
-		pr_info("J716F WIN cpu%d depth=%u age=%llums%s\n", cpu, depth,
-			entered ? j716f_age(j716f_now(), entered) / NSEC_PER_MSEC : 0,
-			(depth && entered &&
-			 j716f_age(j716f_now(), entered) >
-			 (u64)READ_ONCE(win_max_ms) * NSEC_PER_MSEC) ?
-			" (stale: window was never left)" : "");
-	}
-
-	/*
 	 * Flush the breadcrumbs before reading another CPU's redistributor:
 	 * the GICR frame of a CPU stuck in EL3 or in a collapsed power domain
 	 * is exactly the kind of device read that can wedge the reader too.
@@ -1055,21 +918,7 @@ static int j716f_diag_show(struct seq_file *m, void *v)
 			   r.pid, r.comm,
 			   r.ts ? j716f_age(now, r.ts) / NSEC_PER_MSEC : 0);
 	}
-	/*
-	 * M19: the page-free exception window.  depth > 0 means this CPU is
-	 * inside free_unref_folios() right now; a depth that stays non-zero
-	 * across samples is a stuck (or leaked) window.
-	 */
-	for_each_online_cpu(cpu) {
-		struct j716f_bc_win *w = per_cpu_ptr(&j716f_bc_windows, cpu);
-		u32 depth = READ_ONCE(w->depth);
-		u64 entered = READ_ONCE(w->entered);
 
-		if (!depth && !entered)
-			continue;
-		seq_printf(m, "cpu%d win_depth=%u win_age=%llums\n", cpu, depth,
-			   j716f_age(j716f_now(), entered) / NSEC_PER_MSEC);
-	}
 	return 0;
 }
 

@@ -3019,13 +3019,6 @@ void free_unref_folios(struct folio_batch *folios)
 	int i, j;
 
 	j716f_bc_quiet(J716F_BC_PAGE_FREE_LIST_ENTER, (unsigned long)_RET_IP_);
-	/*
-	 * M19: arm the exception window.  Any IRQ/NMI taken from here to
-	 * BATCH_DONE is recorded by the exception entry path, so the ring can
-	 * distinguish "the CPU stopped on the page-free path" from "an
-	 * exception arrived and never returned".
-	 */
-	j716f_bc_win_enter();
 
 	/* Prepare folios for freeing */
 	for (i = 0, j = 0; i < folios->nr; i++) {
@@ -3123,22 +3116,32 @@ void free_unref_folios(struct folio_batch *folios)
 	j716f_bc_quiet(J716F_BC_PAGE_FREE_LIST_EXIT, (unsigned long)folios);
 	/*
 	 * A second record immediately after the exit: if a freeze stops in
-	 * the exit record's first instructions, this RET is missing and the
-	 * page-free path itself is exonerated.
+	 * the exit record's first instructions, this record is missing and
+	 * the page-free loop itself is exonerated.
 	 *
-	 * M19: the RET is written before folio_batch_reinit(), i.e. still
-	 * inside free_unref_folios().
+	 * M19a: named PRE_REINIT, not RET.  It is written before
+	 * folio_batch_reinit(), i.e. still inside free_unref_folios(); the
+	 * v53 name "free_unref_folios_ret" invited the M18 mistake of
+	 * reading this record as proof that the function had returned.
 	 */
-	j716f_bc_quiet(J716F_BC_PAGE_FREE_LIST_RET, (unsigned long)folios);
+	j716f_bc_quiet(J716F_BC_PAGE_FREE_PRE_REINIT, (unsigned long)folios);
 	folio_batch_reinit(folios);
 	/*
-	 * M19: written after the only remaining work in the function.  If
+	 * M19a: barrier() so the record is provably ordered after the batch
+	 * reset.  Without it the compiler is free to move the two stores of
+	 * folio_batch_reinit() past the call, and "BATCH_DONE present" would
+	 * not prove the reset happened.  A compiler barrier is enough: the
+	 * record's own smp_wmb()/smp_store_release() publish it to readers,
+	 * and no other CPU observes this stack-local batch.
+	 */
+	barrier();
+	/*
+	 * Written after the only remaining work in the function.  If
 	 * BATCH_DONE is the last record, the CPU stopped in the epilogue
 	 * (register restore, autiasp, ret) - not in the batch reset, and not
 	 * in the caller.
 	 */
 	j716f_bc_quiet(J716F_BC_PAGE_FREE_BATCH_DONE, (unsigned long)folios);
-	j716f_bc_win_leave();
 }
 
 static void __split_page(struct page *page, unsigned int order)

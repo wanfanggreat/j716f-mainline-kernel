@@ -31,8 +31,6 @@
 #include <asm/sysreg.h>
 #include <asm/system_misc.h>
 
-#include <soc/qcom/j716f-diag.h>
-
 /*
  * Handle IRQ/context state management when entering from kernel mode.
  * Before this function is called it is not safe to call regular kernel code,
@@ -547,21 +545,6 @@ static void noinstr el1_interrupt(struct pt_regs *regs,
 
 asmlinkage void noinstr el1h_64_irq_handler(struct pt_regs *regs)
 {
-	/*
-	 * M19: record an IRQ that arrives while the page-free path has armed
-	 * its window.  The check is a single per-CPU load on the normal path,
-	 * so the cost when no window is armed is one LDR of an already-hot
-	 * cache line plus a predictable branch.
-	 *
-	 * A pseudo-NMI taken from a context with DAIF masked also lands here
-	 * (el1_interrupt() routes it to __el1_pnmi()), but in that case
-	 * regs_irqs_disabled(regs) is true, which is what distinguishes the
-	 * two for the record.
-	 */
-	if (j716f_bc_win_armed())
-		j716f_bc_irq_probe(IS_ENABLED(CONFIG_ARM64_PSEUDO_NMI) &&
-				   regs_irqs_disabled(regs));
-
 	el1_interrupt(regs, handle_arch_irq);
 }
 
@@ -574,16 +557,6 @@ asmlinkage void noinstr el1h_64_error_handler(struct pt_regs *regs)
 {
 	unsigned long esr = read_sysreg(esr_el1);
 	irqentry_state_t state;
-
-	/*
-	 * M19: an SError inside the page-free window would abort the access
-	 * that is currently in flight; record it before any handler runs so
-	 * the breadcrumb ring can tell it apart from a plain stop.  A
-	 * separate probe (not the IRQ one) because an SError is the exception
-	 * type that can explain a stop on a Device access.
-	 */
-	if (j716f_bc_win_armed())
-		j716f_bc_serror_probe();
 
 	local_daif_restore(DAIF_ERRCTX);
 	state = irqentry_nmi_enter(regs);

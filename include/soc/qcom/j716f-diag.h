@@ -150,7 +150,7 @@ enum j716f_bc_site {
 	 * preempt_enable(), so seeing this record only proves the payload
 	 * was stored; it does not prove preempt_enable() returned.
 	 */
-	J716F_BC_PAGE_FREE_LIST_RET,
+	J716F_BC_PAGE_FREE_PRE_REINIT,
 	J716F_BC_PAGE_FREE_PCP_ENTER,
 	J716F_BC_PAGE_FREE_PCP_EXIT,
 	J716F_BC_TLB_BATCHED_ENTER,
@@ -176,11 +176,16 @@ enum j716f_bc_site {
 	 * That is what makes them decisive: with a loud record, "last record
 	 * present" never proves the record's own preempt_enable() returned.
 	 *
+	 * PAGE_FREE_PRE_REINIT is written just before folio_batch_reinit()
+	 * (it was named PAGE_FREE_LIST_RET in v53, which invited the M18
+	 * mistake of reading it as "the function returned"); it is still
+	 * inside free_unref_folios().
+	 *
 	 * PAGE_FREE_BATCH_DONE is written after folio_batch_reinit() and
 	 * before the epilogue; the caller marks are written in the caller
-	 * immediately after free_unref_folios() returned.  Together with the
-	 * existing PAGE_FREE_LIST_RET they separate "inside the callee" ->
-	 * "batch reset done" -> "epilogue" -> "back in the caller".
+	 * immediately after free_unref_folios() returned.  Together they
+	 * separate "inside the callee" -> "batch reset done" -> "epilogue"
+	 * -> "back in the caller".
 	 */
 	J716F_BC_PAGE_FREE_BATCH_DONE,
 	/*
@@ -196,17 +201,6 @@ enum j716f_bc_site {
 	J716F_BC_PAGE_FREE_RET_SHRINK,
 	J716F_BC_PAGE_FREE_RET_MOVE_LRU,
 
-	/*
-	 * M19: exception entry observed while a page-free window is armed.
-	 * j716f_bc_irq_probe() is called from the arm64 IRQ/NMI/SError entry
-	 * path and does nothing unless j716f_bc_win_enter() armed the window
-	 * recently.  These records answer the question the M18 ring could not:
-	 * did an exception arrive between two page-free records?
-	 */
-	J716F_BC_EXC_IRQ,
-	J716F_BC_EXC_NMI,
-	J716F_BC_EXC_SERROR,
-
 	J716F_BC_MAX,
 };
 
@@ -214,43 +208,13 @@ enum j716f_bc_site {
 #define J716F_BC_F_HARDIRQ	BIT(1)
 #define J716F_BC_F_NMI		BIT(2)
 
-/*
- * M19 exception window.
- *
- * The page-free path arms a window; only the arm64 exception entry path
- * consults it.  The armed flag is a single global, not per-CPU, because the
- * exception entry fast path must be one plain load: computing a per-CPU
- * offset from TPIDR_EL1 does not inline into the noinstr entry code and
- * became an out-of-line call, which is far too heavy to run on every
- * interrupt on the machine.
- *
- * A global flag can be armed by another CPU, so the hot path only tests it;
- * j716f_bc_irq_probe() then does the per-CPU check on the cold path before
- * recording anything.  A false positive therefore costs one cold call, not
- * a wrong record.
- */
-extern unsigned int j716f_bc_win_armed_cnt;
-
-static __always_inline bool j716f_bc_win_armed(void)
-{
-	return unlikely(READ_ONCE(j716f_bc_win_armed_cnt));
-}
-
 #if IS_ENABLED(CONFIG_QCOM_J716F_DIAG)
 void j716f_bc(enum j716f_bc_site site, unsigned long arg);
 void j716f_bc_quiet(enum j716f_bc_site site, unsigned long arg);
-void j716f_bc_win_enter(void);
-void j716f_bc_win_leave(void);
-void j716f_bc_irq_probe(bool nmi);
-void j716f_bc_serror_probe(void);
 void j716f_diag_dump(const char *reason);
 #else
 static inline void j716f_bc(enum j716f_bc_site site, unsigned long arg) { }
 static inline void j716f_bc_quiet(enum j716f_bc_site site, unsigned long arg) { }
-static inline void j716f_bc_win_enter(void) { }
-static inline void j716f_bc_win_leave(void) { }
-static inline void j716f_bc_irq_probe(bool nmi) { }
-static inline void j716f_bc_serror_probe(void) { }
 static inline void j716f_diag_dump(const char *reason) { }
 #endif
 
