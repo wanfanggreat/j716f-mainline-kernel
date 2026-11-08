@@ -503,6 +503,9 @@ static void j716f_snap_print(u64 now)
 					 j716f_bc_name(r.site),
 					 r.ts ? j716f_age(now, r.ts) / NSEC_PER_MSEC : 0);
 	}
+	len += scnprintf(buf + len, sizeof(buf) - len,
+			 " asid=%u/r=%llu", arm64_asid_bits(),
+			 (unsigned long long)arm64_asid_rollover_count());
 	pr_info("%s\n", buf);
 }
 
@@ -794,6 +797,13 @@ static int j716f_diag_show(struct seq_file *m, void *v)
 
 	seq_printf(m, "j716f diag: %d sites, %d records/cpu\n",
 		   J716F_BC_MAX, J716F_BC_RING);
+	seq_printf(m, "asid bits=%u generation=%llu rollovers=%llu\n",
+		   arm64_asid_bits(),
+		   (unsigned long long)arm64_asid_generation(),
+		   (unsigned long long)arm64_asid_rollover_count());
+	for_each_online_cpu(cpu)
+		seq_printf(m, "asid cpu%d workarounds=%llu\n", cpu,
+			   (unsigned long long)arm64_asid_workaround_count(cpu));
 	for_each_online_cpu(cpu) {
 		struct j716f_bc_rec r;
 		u64 now = j716f_now();
