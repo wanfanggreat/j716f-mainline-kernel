@@ -45,6 +45,7 @@
 #include <asm/memory.h>
 #include <asm/mmu_context.h>
 
+#include <soc/qcom/cmd-db.h>
 #include <soc/qcom/j716f-diag.h>
 #include <soc/qcom/tcs.h>
 
@@ -85,33 +86,57 @@ static DEFINE_PER_CPU(struct j716f_bc_cpu, j716f_bc_data);
 static DEFINE_PER_CPU(struct hrtimer, j716f_snap_timer);
 
 /*
- * M20-P1 vote provenance ring.
+ * M20-P1a vote provenance ring.
  *
  * The BCM voter merges several clients into one MC0 vote, so the thread that
  * calls rpmh_write_batch() is not necessarily the requester.  This ring keeps
- * the last N client-side requests (comm/pid/cpu/addr/x/y) and the last N
- * aggregated commits, both with the same monotonic timestamp base as the
- * per-CPU breadcrumbs, so a panic dump can answer "who asked for MC0, and
- * when, relative to the CPUs going stale".
+ * the client-side request, the aggregated commit, the TCS trigger and the
+ * handler's observation of the completion, all with the monotonic timestamp
+ * base the per-CPU breadcrumbs use, so a panic dump can answer "who asked
+ * for MC0, when, and did the completion ever get serviced".
  *
- * Deliberately NOT per-CPU: a request on CPU4 for a GPU path and the commit
- * on CPU0 must be comparable in one timeline.  Writers are serialised by a
- * spinlock that is only ever taken in plain process context (icc_set_bw and
- * the BCM commit path), never from IRQ/NMI, so this can never run inside the
- * crash window it is meant to observe.  No allocation, no printk.
+ * Deliberately NOT per-CPU: a request on CPU4 and the commit on CPU0 must be
+ * comparable in one timeline.
+ *
+ * Locking (M20-P1a): the lock is initialised statically with
+ * DEFINE_SPINLOCK.  v55 declared a bare "spinlock_t lock" inside a BSS
+ * structure that was never passed to spin_lock_init(); with
+ * CONFIG_DEBUG_SPINLOCK off that is not caught at build or boot time and the
+ * lock only works because zeroed memory happens to be a valid unlocked
+ * spinlock on arm64.  That is not something a diagnostic should rely on.
+ *
+ * Retention (M20-P1a): a single time-ordered ring loses the interesting
+ * records when the rate is high.  dpu_crtc_atomic_flush() calls icc_set_bw()
+ * once per CRTC per commit, i.e. ~120 writes/s at 60 Hz on this device, which
+ * would wrap 32 entries in well under a second.  Records about the MC0
+ * resource (or that cannot be attributed to a resource) therefore go into a
+ * separate, slower-wrapping MC0 ring, and both rings count what they
+ * overwrote so a dump can say "evidence was lost" instead of silently
+ * showing a plausible but truncated history.
  */
-#define J716F_VOTE_RING		32
+#define J716F_VOTE_RING		64	/* general: req/agg/tcs/done */
+#define J716F_VOTE_MC0_RING	64	/* MC0 + unattributed only */
 #define J716F_VOTE_COMM_LEN	16
 
+/*
+ * A transaction id ties the four records of one RPMh round trip together.
+ * It is a plain per-boot monotonic counter, allocated by the client request
+ * and re-used by the commit, the TCS trigger and the completion observed by
+ * the handler.  It is NOT a hardware identifier: the hardware only knows the
+ * TCS number, which is recorded separately because it can be re-used long
+ * before the software transaction is done.
+ */
 struct j716f_vote_rec {
 	u64 ts;
 	u32 kind;		/* enum j716f_vote_kind */
 	u32 cpu;
 	u32 pid;
-	u32 addr;		/* BCM/RPMh resource address */
+	u32 txid;		/* transaction id, see above */
+	u32 addr;		/* BCM/RPMh resource address (0 if unknown) */
 	u32 data;		/* raw TCS data word (vote_x/vote_y encoded) */
 	u32 aux;		/* kind specific extra (see dump) */
-	u32 pad;
+	u32 tcs;		/* TCS id when known, else ~0 */
+	u32 seq;		/* ring-local sequence, for ordering after wrap */
 	char comm[J716F_VOTE_COMM_LEN];
 };
 
@@ -119,10 +144,64 @@ struct j716f_vote_ring {
 	spinlock_t lock;
 	u32 head;
 	u32 count;
+	u32 overwritten;	/* records lost to wrap since boot */
 	struct j716f_vote_rec rec[J716F_VOTE_RING];
 };
 
-static struct j716f_vote_ring j716f_votes;
+/*
+ * Static initialisation: __SPIN_LOCK_UNLOCKED initialises the lock at
+ * compile time, so no early caller can ever take an uninitialised one before
+ * j716f_diag_init() runs.  icc_set_bw() can be reached from device probe
+ * paths that are not ordered against this driver's initcall, which is exactly
+ * the case a bare BSS spinlock fails.
+ */
+static struct j716f_vote_ring j716f_votes = {
+	.lock = __SPIN_LOCK_UNLOCKED(j716f_votes.lock),
+};
+static struct j716f_vote_ring j716f_votes_mc0 = {
+	.lock = __SPIN_LOCK_UNLOCKED(j716f_votes_mc0.lock),
+};
+
+/*
+ * Transaction id allocator.  A plain atomic counter: ids only have to be
+ * unique within a boot, and 32 bits gives far more headroom than any
+ * experiment.  Wrapping is harmless because the rings only hold tens of
+ * records, so a duplicate id would have to come from 4 billion transactions
+ * earlier.
+ */
+static atomic_t j716f_vote_txid = ATOMIC_INIT(1);
+
+/*
+ * The transaction id currently being built by icc_set_bw().  It is a single
+ * value because icc_bw_lock serialises the whole set() call: request ->
+ * aggregate -> provider set() -> BCM commit all happen under that mutex, so
+ * a second setter cannot be in flight at the same time.  The RSC layer runs
+ * later, outside that mutex, but by then the trigger carries the id
+ * explicitly, so nothing relies on this variable after set() returns.
+ */
+static u32 j716f_vote_cur_txid;
+
+void j716f_vote_set_current_txid(u32 txid)
+{
+	WRITE_ONCE(j716f_vote_cur_txid, txid);
+}
+EXPORT_SYMBOL_GPL(j716f_vote_set_current_txid);
+
+u32 j716f_vote_current_txid(void)
+{
+	return READ_ONCE(j716f_vote_cur_txid);
+}
+EXPORT_SYMBOL_GPL(j716f_vote_current_txid);
+
+/*
+ * MC0's RPMh address.  Resolved from the Command DB by name at init instead
+ * of being hard-coded: 0x50000 is what this firmware reports today, but the
+ * whole point of the MC0 ring is to keep the records that matter, so the
+ * classifier must not silently stop matching if the address changes.
+ * 0 means "not resolved yet", and j716f_vote_is_important() treats an
+ * unresolved address as important so nothing is dropped before init runs.
+ */
+static u32 j716f_mc0_addr;
 
 /* Diagnostics must never become a fault source: allow turning it off. */
 static bool vote_trace = true;
@@ -403,55 +482,125 @@ void j716f_bc_quiet(enum j716f_bc_site site, unsigned long arg)
 }
 EXPORT_SYMBOL_GPL(j716f_bc_quiet);
 
+/*
+ * A record about the MC0 resource, or one that cannot be attributed to a
+ * resource at all (a client request, a completion), is what the A/B/C
+ * decision needs.  Those go into the MC0 ring so a burst of unrelated
+ * per-frame votes cannot push them out.
+ */
+static bool j716f_vote_is_important(u32 addr)
+{
+	u32 mc0 = READ_ONCE(j716f_mc0_addr);
+
+	/*
+	 * Unresolved MC0 address: keep everything in the important ring rather
+	 * than silently classifying nothing.  This only happens before the
+	 * Command DB lookup at init, i.e. for a handful of records.
+	 */
+	if (!mc0)
+		return true;
+	return addr == 0 || addr == mc0;
+}
+
+/* Copy one record and update the ring bookkeeping; caller holds the lock. */
+static void j716f_vote_push(struct j716f_vote_ring *r,
+			    const struct j716f_vote_rec *in)
+{
+	u32 slot = r->head;
+
+	r->rec[slot] = *in;
+	r->rec[slot].seq = r->count + r->overwritten;
+	r->head = (slot + 1) & (J716F_VOTE_RING - 1);
+	if (r->count < J716F_VOTE_RING)
+		r->count++;
+	else
+		r->overwritten++;
+}
+
+/**
+ * j716f_vote_set_mc0 - remember MC0's RPMh address for ring classification
+ * @addr: address from cmd_db_read_addr("MC0"), 0 if unavailable
+ *
+ * Called from init after the Command DB is ready.  Kept as a setter rather
+ * than a hard-coded constant so a firmware that moves the resource cannot
+ * silently disable the MC0 retention ring.
+ */
+void j716f_vote_set_mc0(u32 addr)
+{
+	WRITE_ONCE(j716f_mc0_addr, addr);
+}
+EXPORT_SYMBOL_GPL(j716f_vote_set_mc0);
+
+/**
+ * j716f_vote_alloc_txid - allocate a transaction id for one RPMh round trip
+ *
+ * Called by icc_set_bw() before it records the client request.  The id is
+ * carried through the BCM commit, the TCS trigger and the completion so a
+ * dump can line the four up even when other transactions interleave.
+ */
+u32 j716f_vote_alloc_txid(void)
+{
+	if (!READ_ONCE(vote_trace))
+		return 0;
+	return (u32)atomic_inc_return(&j716f_vote_txid);
+}
+EXPORT_SYMBOL_GPL(j716f_vote_alloc_txid);
+
 /**
  * j716f_vote_record - remember one MC0/RPMh vote event
  * @kind: which boundary produced the event
+ * @txid: transaction id from j716f_vote_alloc_txid(), 0 if unknown
  * @addr: BCM/RPMh resource address (0 for a client request)
  * @data: raw TCS data word, i.e. commit/valid/vote_x/vote_y as encoded
+ * @tcs:  TCS id when the event came from the RSC layer, else J716F_VOTE_NO_TCS
  * @aux:  kind specific extra value
  *
- * Called from icc_set_bw() (client boundary), the BCM commit path and
- * rpmh_rsc_send_data().  All three run in plain process context with
- * interrupts enabled, so a spinlock is appropriate; the critical section is
- * a few stores and one strscpy(), well below anything that could perturb the
- * timing this is supposed to measure.
+ * Called from icc_set_bw() (client boundary), the BCM commit path,
+ * rpmh_rsc_send_data() and tcs_tx_done().  The first three run in plain
+ * process context; the completion is recorded from hardirq context, which is
+ * why the critical section contains only stores and never strscpy().
  *
- * No allocation, no printk, no sleeping call.  Bounded ring: old entries are
- * overwritten, so memory use is fixed at boot.
+ * No allocation, no printk, no sleeping call.  Bounded rings: old entries are
+ * overwritten and counted, so the dump can admit that history was lost.
  */
-void j716f_vote_record(enum j716f_vote_kind kind, u32 addr, u32 data, u32 aux)
+void j716f_vote_record(enum j716f_vote_kind kind, u32 txid, u32 addr, u32 data,
+		       u32 tcs, u32 aux)
 {
-	struct j716f_vote_ring *r = &j716f_votes;
-	struct j716f_vote_rec *rec;
+	struct j716f_vote_ring *r;
+	struct j716f_vote_rec rec;
 	unsigned long flags;
-	u32 slot;
 
 	if (!READ_ONCE(vote_trace))
 		return;
 
-	spin_lock_irqsave(&r->lock, flags);
-	slot = r->head;
-	rec = &r->rec[slot];
-	rec->ts = j716f_now();
-	rec->kind = kind;
-	rec->cpu = raw_smp_processor_id();
-	rec->pid = current->pid;
-	rec->addr = addr;
-	rec->data = data;
-	rec->aux = aux;
+	memset(&rec, 0, sizeof(rec));
+	rec.ts = j716f_now();
+	rec.kind = kind;
+	rec.cpu = raw_smp_processor_id();
+	rec.pid = current->pid;
+	rec.txid = txid;
+	rec.addr = addr;
+	rec.data = data;
+	rec.tcs = tcs;
+	rec.aux = aux;
 	/*
 	 * The completion records come from hardirq context.  strscpy() is
-	 * safe there, but it walks current->comm for a name that is always
-	 * the same interrupt-time task, so skip it and keep the IRQ path to a
+	 * safe there, but it reads current->comm for a name that is always
+	 * some interrupt-time task, so skip it and keep the IRQ path to a
 	 * handful of stores.
 	 */
-	if (kind != J716F_VOTE_KIND_DONE)
-		strscpy(rec->comm, current->comm, sizeof(rec->comm));
-	else
-		rec->comm[0] = '\0';
-	r->head = (slot + 1) & (J716F_VOTE_RING - 1);
-	if (r->count < J716F_VOTE_RING)
-		r->count++;
+	if (kind != J716F_VOTE_KIND_DONE && kind != J716F_VOTE_KIND_RECLAIM)
+		strscpy(rec.comm, current->comm, sizeof(rec.comm));
+
+	if (j716f_vote_is_important(addr)) {
+		spin_lock_irqsave(&j716f_votes_mc0.lock, flags);
+		j716f_vote_push(&j716f_votes_mc0, &rec);
+		spin_unlock_irqrestore(&j716f_votes_mc0.lock, flags);
+	}
+
+	r = &j716f_votes;
+	spin_lock_irqsave(&r->lock, flags);
+	j716f_vote_push(r, &rec);
 	spin_unlock_irqrestore(&r->lock, flags);
 }
 EXPORT_SYMBOL_GPL(j716f_vote_record);
@@ -494,36 +643,95 @@ EXPORT_SYMBOL_GPL(j716f_vote_decode);
  * consistently, so the dump says so and skips it rather than printing
  * half-written records.
  */
-void j716f_vote_dump(void)
+static const char *j716f_vote_kind_name(u32 kind)
 {
-	struct j716f_vote_ring *r = &j716f_votes;
-	struct j716f_vote_rec copy[J716F_VOTE_RING];
+	switch (kind) {
+	case J716F_VOTE_KIND_REQ:	return "req";
+	case J716F_VOTE_KIND_AGG:	return "agg";
+	case J716F_VOTE_KIND_TCS:	return "tcs";
+	case J716F_VOTE_KIND_DONE:	return "done";
+	case J716F_VOTE_KIND_RECLAIM:	return "reclaim";
+	default:			return "?";
+	}
+}
+
+static void j716f_vote_dump_ring(struct j716f_vote_ring *r, const char *tag,
+				 bool is_mc0, u64 now)
+{
+	/*
+	 * Copy a bounded chunk at a time rather than the whole ring onto the
+	 * stack: at 64 records a full slab is 4 KiB, which the compiler
+	 * rightly rejects for a function that may run in the panic path.  A
+	 * chunk keeps the stack small and still prints the ring in order.
+	 */
+	struct j716f_vote_rec chunk[8];
 	unsigned long flags;
-	u32 i, count, start;
-	u64 now = j716f_now();
+	u32 i, n, count, start, lost, off;
+
+	(void)is_mc0;
 
 	if (!spin_trylock_irqsave(&r->lock, flags)) {
-		pr_info("J716F VOTE dump: ring lock busy, records skipped\n");
+		pr_info("J716F VOTE %s: ring lock busy, records skipped\n", tag);
 		return;
 	}
 	count = r->count;
+	lost = r->overwritten;
 	start = (r->head - count) & (J716F_VOTE_RING - 1);
-	for (i = 0; i < count; i++)
-		copy[i] = r->rec[(start + i) & (J716F_VOTE_RING - 1)];
 	spin_unlock_irqrestore(&r->lock, flags);
 
-	pr_info("J716F VOTE dump: %u/%u records\n", count, J716F_VOTE_RING);
-	for (i = 0; i < count; i++) {
-		const struct j716f_vote_rec *v = &copy[i];
-		const char *kind = v->kind == J716F_VOTE_KIND_REQ ? "req" :
-				   v->kind == J716F_VOTE_KIND_AGG ? "agg" :
-				   v->kind == J716F_VOTE_KIND_TCS ? "tcs" :
-				   v->kind == J716F_VOTE_KIND_DONE ? "done" : "?";
+	/*
+	 * Print the loss count explicitly.  A dump that quietly shows only the
+	 * newest N records invites "this is the whole story"; if the busiest
+	 * window overwrote records, that must be visible so the reader can
+	 * downgrade the evidence to "undecidable" instead of reasoning from a
+	 * truncated history.
+	 */
+	pr_info("J716F VOTE %s: %u/%u records, %u overwritten%s\n",
+		tag, count, J716F_VOTE_RING, lost,
+		lost ? " (history truncated)" : "");
 
-		pr_info("J716F VOTE %s cpu%u pid=%u comm=%s addr=0x%x data=0x%08x aux=0x%x age=%llums\n",
-			kind, v->cpu, v->pid, v->comm, v->addr, v->data, v->aux,
-			j716f_age(now, v->ts) / NSEC_PER_MSEC);
+	for (off = 0; off < count; off += n) {
+		n = min_t(u32, ARRAY_SIZE(chunk), count - off);
+
+		if (!spin_trylock_irqsave(&r->lock, flags)) {
+			pr_info("J716F VOTE %s: lock busy after %u records\n",
+				tag, off);
+			return;
+		}
+		for (i = 0; i < n; i++)
+			chunk[i] = r->rec[(start + off + i) &
+					  (J716F_VOTE_RING - 1)];
+		spin_unlock_irqrestore(&r->lock, flags);
+
+		for (i = 0; i < n; i++) {
+			const struct j716f_vote_rec *v = &chunk[i];
+
+			pr_info("J716F VOTE %s %-7s tx=%u seq=%u cpu%u pid=%u comm=%s addr=0x%x tcs=%d data=0x%08x aux=0x%x age=%llums\n",
+				tag, j716f_vote_kind_name(v->kind), v->txid,
+				v->seq, v->cpu, v->pid, v->comm, v->addr,
+				v->tcs == J716F_VOTE_NO_TCS ? -1 : (int)v->tcs,
+				v->data, v->aux,
+				j716f_age(now, v->ts) / NSEC_PER_MSEC);
+		}
 	}
+}
+
+/**
+ * j716f_vote_dump - print both vote provenance rings
+ *
+ * The MC0 ring is printed first: it is the one that survives a per-frame
+ * vote burst, so it is the set to reason from.  The general ring is printed
+ * for context and may be heavily truncated, which the loss count states.
+ */
+void j716f_vote_dump(void)
+{
+	u64 now = j716f_now();
+
+	pr_info("J716F VOTE dump: mc0_addr=0x%x txid_next=%d\n",
+		READ_ONCE(j716f_mc0_addr),
+		atomic_read(&j716f_vote_txid));
+	j716f_vote_dump_ring(&j716f_votes_mc0, "mc0", true, now);
+	j716f_vote_dump_ring(&j716f_votes, "all", false, now);
 }
 EXPORT_SYMBOL_GPL(j716f_vote_dump);
 
@@ -1246,6 +1454,15 @@ static int __init j716f_diag_init(void)
 	 * across the boots of one experiment.
 	 */
 	j716f_boot_tag = (u32)((kaslr_offset() >> 21) ^ (u32)(j716f_now() >> 12));
+
+	/*
+	 * M20-P1a: resolve MC0 from the Command DB so the retention ring keeps
+	 * the right records even if firmware moves the resource.  Best effort:
+	 * an unavailable Command DB leaves the address at 0, which makes every
+	 * record "important" rather than silently classifying none.
+	 */
+	j716f_vote_set_mc0(cmd_db_read_addr("MC0"));
+	pr_info("j716f-diag: MC0 rpmh addr=0x%x\n", READ_ONCE(j716f_mc0_addr));
 
 	entry = proc_create("j716f_diag", 0600, NULL, &j716f_diag_proc_ops);
 	if (!entry) {

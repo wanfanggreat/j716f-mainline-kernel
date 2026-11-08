@@ -321,8 +321,10 @@ int qcom_icc_bcm_voter_commit(struct bcm_voter *voter)
 	 * icc_set_bw(), which is why the two must be read together.
 	 */
 	for (i = 0; i < commit_idx[0]; i++)
-		j716f_vote_record(J716F_VOTE_KIND_AGG, cmds[i].addr,
-				   cmds[i].data, cmds[i].wait);
+		j716f_vote_record(J716F_VOTE_KIND_AGG,
+				   j716f_vote_current_txid(), cmds[i].addr,
+				   cmds[i].data, J716F_VOTE_NO_TCS,
+				   ((u32)commit_idx[0] << 16) | (u32)i);
 
 	j716f_bc(J716F_BC_ICC_COMMIT_INVAL, cmds[0].addr);
 	rpmh_invalidate(voter->dev);

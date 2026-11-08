@@ -141,6 +141,14 @@ struct rsc_drv {
 	u32 *regs;
 #ifdef CONFIG_QCOM_J716F_DIAG
 	struct list_head node;
+	/*
+	 * M20-P1a: transaction id currently programmed into each TCS.  Written
+	 * in rpmh_rsc_send_data() while the TCS is claimed, read by
+	 * tcs_tx_done(); this is what lets the completion be attributed to the
+	 * request that caused it without guessing from timing.  Not a hardware
+	 * field: the accelerator knows nothing about these ids.
+	 */
+	u32 txid[MAX_TCS_NR];
 #endif
 };
 

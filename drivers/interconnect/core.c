@@ -717,7 +717,7 @@ EXPORT_SYMBOL_GPL(icc_get_name);
 int icc_set_bw(struct icc_path *path, u32 avg_bw, u32 peak_bw)
 {
 	struct icc_node *node;
-	u32 old_avg, old_peak;
+	u32 old_avg, old_peak, txid;
 	size_t i;
 	int ret;
 
@@ -745,9 +745,19 @@ int icc_set_bw(struct icc_path *path, u32 avg_bw, u32 peak_bw)
 	 * itself is bounded and allocation free.
 	 */
 	if (old_avg != avg_bw || old_peak != peak_bw) {
+		/*
+		 * M20-P1a: the node id identifies an interconnect node, not a
+		 * BCM resource, so it cannot be matched against the TCS
+		 * command address.  Keep it in aux (for "which endpoint") and
+		 * carry a transaction id so this request can be lined up with
+		 * the commit, the trigger and the completion instead.
+		 */
 		node = path->reqs[path->num_nodes - 1].node;
-		j716f_vote_record(J716F_VOTE_KIND_REQ,
-				   node ? node->id : 0, peak_bw, avg_bw);
+		txid = j716f_vote_alloc_txid();
+		j716f_vote_set_current_txid(txid);
+		j716f_vote_record(J716F_VOTE_KIND_REQ, txid, 0, peak_bw,
+				   J716F_VOTE_NO_TCS,
+				   (node ? (u32)node->id : 0) | (avg_bw << 16));
 	}
 
 	for (i = 0; i < path->num_nodes; i++) {

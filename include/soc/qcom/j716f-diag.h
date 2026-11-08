@@ -248,14 +248,39 @@ void j716f_diag_dump(const char *reason);
  * request on one CPU and the aggregation/commit on another must be readable
  * in one timeline.
  */
+/*
+ * What each record actually proves, and - just as important - what it does
+ * not prove:
+ *
+ *   REQ      a client asked for bandwidth.  Not proof that hardware moved.
+ *   AGG      the BCM voter merged the request into this value.  The thread
+ *            here is the commit thread, not the original consumer.
+ *   TCS      the request was programmed and triggered into a TCS.
+ *   DONE     tcs_tx_done() observed the completion bit.  This is the HANDLER
+ *            observing an already-set bit; it is not the instant the
+ *            accelerator finished, and it is strictly later than it.
+ *   RECLAIM  the TCS was released back to the pool (tcs_in_use cleared).
+ *
+ * The hardware completion instant is only bounded: it is after TCS (trigger)
+ * and at or before DONE (handler).  Treat DONE as "no later than", never as
+ * "the moment hardware finished".
+ */
 enum j716f_vote_kind {
 	J716F_VOTE_KIND_REQ = 1,	/* icc_set_bw(): client request */
 	J716F_VOTE_KIND_AGG,		/* bcm commit: aggregated value */
 	J716F_VOTE_KIND_TCS,		/* rpmh_rsc_send_data(): TCS trigger */
-	J716F_VOTE_KIND_DONE,		/* tcs_tx_done(): hardware completion */
+	J716F_VOTE_KIND_DONE,		/* tcs_tx_done(): handler saw it done */
+	J716F_VOTE_KIND_RECLAIM,	/* tcs_tx_done(): TCS released */
 };
 
-void j716f_vote_record(enum j716f_vote_kind kind, u32 addr, u32 data, u32 aux);
+#define J716F_VOTE_NO_TCS	0xffffffffu
+
+void j716f_vote_set_mc0(u32 addr);
+void j716f_vote_set_current_txid(u32 txid);
+u32 j716f_vote_current_txid(void);
+u32 j716f_vote_alloc_txid(void);
+void j716f_vote_record(enum j716f_vote_kind kind, u32 txid, u32 addr, u32 data,
+		       u32 tcs, u32 aux);
 void j716f_vote_dump(void);
 /*
  * M20-P1 IRQ accounting.  Cheap enough for the RSC completion handler: one
@@ -271,8 +296,12 @@ void j716f_vote_decode(u32 data, bool *valid, bool *commit, u32 *vote_x,
 static inline void j716f_bc(enum j716f_bc_site site, unsigned long arg) { }
 static inline void j716f_bc_quiet(enum j716f_bc_site site, unsigned long arg) { }
 static inline void j716f_diag_dump(const char *reason) { }
-static inline void j716f_vote_record(enum j716f_vote_kind kind, u32 addr,
-				     u32 data, u32 aux) { }
+static inline void j716f_vote_set_mc0(u32 addr) { }
+static inline void j716f_vote_set_current_txid(u32 txid) { }
+static inline u32 j716f_vote_current_txid(void) { return 0; }
+static inline u32 j716f_vote_alloc_txid(void) { return 0; }
+static inline void j716f_vote_record(enum j716f_vote_kind kind, u32 txid,
+				     u32 addr, u32 data, u32 tcs, u32 aux) { }
 static inline void j716f_vote_dump(void) { }
 static inline void j716f_irq_enter(int irq) { }
 static inline void j716f_irq_exit(int irq) { }

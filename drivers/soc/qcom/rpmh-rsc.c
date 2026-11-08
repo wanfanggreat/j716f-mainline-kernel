@@ -478,7 +478,7 @@ static irqreturn_t tcs_tx_done(int irq, void *p)
 	int i;
 	unsigned long irq_status;
 	const struct tcs_request *req;
-	u32 reg;
+	u32 reg, txid;
 
 	j716f_bc(J716F_BC_RSC_IRQ_ENTER, irq);
 	j716f_irq_enter(irq);
@@ -487,13 +487,18 @@ static irqreturn_t tcs_tx_done(int irq, void *p)
 	for_each_set_bit(i, &irq_status, BITS_PER_TYPE(u32)) {
 		j716f_bc(J716F_BC_RSC_IRQ_TCS, i);
 		/*
-		 * M20-P1: the hardware already completed these TCSes - that is
-		 * what this bit means.  Recording the raw status plus the TCS
-		 * id puts "hardware finished" on the same timeline as the vote
-		 * that started it, so a dump can distinguish "hardware never
-		 * finished" from "finished but nobody serviced the IRQ".
+		 * M20-P1a: this is the HANDLER observing an already-set
+		 * completion bit, not the instant the accelerator finished.
+		 *
+		 * The bit was set at some unknown earlier time, so the true
+		 * completion lies in (trigger, DONE].  The record therefore
+		 * carries the raw status (evidence that the bit was set) and
+		 * the TCS id (which request it belongs to), and the dump
+		 * labels it "handler observed", never "hardware finished".
 		 */
-		j716f_vote_record(J716F_VOTE_KIND_DONE, 0, irq_status, (u32)i);
+		j716f_vote_record(J716F_VOTE_KIND_DONE,
+				   i < MAX_TCS_NR ? READ_ONCE(drv->txid[i]) : 0,
+				   0, irq_status, (u32)i, 0);
 		req = get_req_from_tcs(drv, i);
 		if (WARN_ON(!req))
 			goto skip;
@@ -522,7 +527,20 @@ skip:
 		 */
 		if (!drv->tcs[ACTIVE_TCS].num_tcs)
 			enable_tcs_irq(drv, i, false);
+		txid = i < MAX_TCS_NR ? READ_ONCE(drv->txid[i]) : 0;
 		spin_unlock(&drv->lock);
+		/*
+		 * M20-P1a: separate "hardware done" from "software released
+		 * the TCS".  A dump that shows DONE but no RECLAIM proves the
+		 * completion was seen but the bookkeeping never finished, which
+		 * is a different failure than "never completed at all".
+		 *
+		 * Recorded AFTER releasing drv->lock: the vote ring has its own
+		 * lock, and taking it inside drv->lock would add a nesting edge
+		 * to a path this diagnostic is not supposed to perturb.
+		 */
+		j716f_vote_record(J716F_VOTE_KIND_RECLAIM, txid, 0, irq_status,
+				   (u32)i, 0);
 		wake_up(&drv->tcs_wait);
 		if (req)
 			rpmh_tx_done(req);
@@ -718,6 +736,13 @@ int rpmh_rsc_send_data(struct rsc_drv *drv, const struct tcs_request *msg)
 
 	j716f_bc(J716F_BC_RSC_SEND_CLAIM, tcs_id);
 	tcs->req[tcs_id - tcs->offset] = msg;
+	/*
+	 * M20-P1a: bind the transaction id to this TCS while holding
+	 * drv->lock, so tcs_tx_done() can attribute the completion to the
+	 * request even when other transactions interleave.
+	 */
+	if (tcs_id < MAX_TCS_NR)
+		drv->txid[tcs_id] = j716f_vote_current_txid();
 	set_bit(tcs_id, drv->tcs_in_use);
 	if (msg->state == RPMH_ACTIVE_ONLY_STATE && tcs->type != ACTIVE_TCS) {
 		/*
@@ -746,9 +771,9 @@ int rpmh_rsc_send_data(struct rsc_drv *drv, const struct tcs_request *msg)
 	 * command's addr/data here ties the client request and the aggregated
 	 * BCM value to the exact TCS that shows up in a later panic dump.
 	 */
-	j716f_vote_record(J716F_VOTE_KIND_TCS,
-			  msg->cmds[0].addr, msg->cmds[0].data,
-			  ((u32)msg->num_cmds << 8) | (u32)tcs_id);
+	j716f_vote_record(J716F_VOTE_KIND_TCS, j716f_vote_current_txid(),
+			  msg->cmds[0].addr, msg->cmds[0].data, (u32)tcs_id,
+			  ((u32)msg->num_cmds << 8) | (u32)msg->wait_for_compl);
 	__tcs_set_trigger(drv, tcs_id, true);
 	j716f_bc(J716F_BC_RSC_SEND_EXIT, tcs_id);
 
