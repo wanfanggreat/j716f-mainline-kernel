@@ -195,6 +195,19 @@ static inline void j716f_vote_sm_tx_clear(struct j716f_vote_sm_tx *t)
 	memset(t, 0, sizeof(*t));
 }
 
+/*
+ * Freeing an occupied transaction or batch is an observable table change:
+ * the dump can see the slot disappear.  Advance the snapshot sequence with
+ * it, otherwise a release between two dump chunks leaves moved==0 and the
+ * printed set is wrongly declared coherent.
+ */
+static inline void j716f_vote_sm_tx_free(struct j716f_vote_sm *sm,
+					 struct j716f_vote_sm_tx *t)
+{
+	j716f_vote_sm_tx_clear(t);
+	sm->seq++;
+}
+
 static inline void j716f_vote_sm_batch_clear(struct j716f_vote_sm_batch *b)
 {
 	/*
@@ -205,6 +218,15 @@ static inline void j716f_vote_sm_batch_clear(struct j716f_vote_sm_batch *b)
 	 */
 	j716f_sm_store_release(&b->txid, 0);
 	memset(b, 0, sizeof(*b));
+}
+
+static inline void j716f_vote_sm_batch_free(struct j716f_vote_sm *sm,
+					    struct j716f_vote_sm_batch *b)
+{
+	if (!b->txid)
+		return;
+	j716f_vote_sm_batch_clear(b);
+	sm->seq++;
 }
 
 static inline struct j716f_vote_sm_tx *
@@ -297,6 +319,7 @@ j716f_vote_sm_prepare(struct j716f_vote_sm *sm, j716f_sm_u32 txid,
 		}
 		if (!t) {
 			sm->overflow++;
+			sm->seq++;	/* overflow changes the dump verdict */
 			return NULL;
 		}
 		j716f_vote_sm_tx_clear(t);
@@ -374,6 +397,7 @@ static inline bool j716f_vote_sm_arm(struct j716f_vote_sm *sm,
 	b = j716f_vote_sm_batch_find(sm, txid, rsc, tcs);
 	if (b) {
 		sm->dup_arm++;
+		sm->seq++;	/* counter changes the dump header */
 		return true;
 	}
 
@@ -391,6 +415,7 @@ static inline bool j716f_vote_sm_arm(struct j716f_vote_sm *sm,
 		 * is what tells the reader that the set is incomplete.
 		 */
 		sm->batch_overflow++;
+		sm->seq++;	/* counter changes the dump verdict */
 		return false;
 	}
 
@@ -432,10 +457,10 @@ static inline bool j716f_vote_sm_poked(struct j716f_vote_sm *sm,
 		b->poked = 1;
 		b->poked_ts = now;
 		b->gen = ++sm->seq;
+		t = j716f_vote_sm_tx_find(sm, txid);
+		if (t)
+			t->gen = ++sm->seq;
 	}
-	t = j716f_vote_sm_tx_find(sm, txid);
-	if (t)
-		t->gen = ++sm->seq;
 	return true;
 }
 
@@ -461,7 +486,7 @@ static inline bool j716f_vote_sm_release(struct j716f_vote_sm *sm,
 		return false;
 
 	t = j716f_vote_sm_tx_find(sm, txid);
-	j716f_vote_sm_batch_clear(b);
+	j716f_vote_sm_batch_free(sm, b);
 	if (!t) {
 		sm->orphan_release++;
 		return true;
@@ -474,7 +499,7 @@ static inline bool j716f_vote_sm_release(struct j716f_vote_sm *sm,
 
 	if (!t->outstanding) {
 		if (!t->open) {
-			j716f_vote_sm_tx_clear(t);
+			j716f_vote_sm_tx_free(sm, t);
 		} else if (t->state == J716F_VOTE_SM_ARMED) {
 			t->state = J716F_VOTE_SM_PREPARED;
 			t->gen = ++sm->seq;
@@ -501,7 +526,7 @@ static inline int j716f_vote_sm_abort(struct j716f_vote_sm *sm,
 	if (!t->fail_reason)
 		t->fail_reason = reason;
 	if (!t->outstanding) {
-		j716f_vote_sm_tx_clear(t);
+		j716f_vote_sm_tx_free(sm, t);
 		sm->abort_clean++;
 		return 1;
 	}
@@ -525,9 +550,10 @@ static inline bool j716f_vote_sm_finish(struct j716f_vote_sm *sm,
 	if (!t)
 		return false;
 	t->open = 0;
-	t->gen = ++sm->seq;
 	if (!t->outstanding)
-		j716f_vote_sm_tx_clear(t);
+		j716f_vote_sm_tx_free(sm, t);
+	else
+		t->gen = ++sm->seq;
 	return true;
 }
 
@@ -547,7 +573,7 @@ static inline j716f_sm_u32 j716f_vote_sm_gc(struct j716f_vote_sm *sm)
 		struct j716f_vote_sm_tx *t = &sm->tx[i];
 
 		if (t->txid && !t->outstanding) {
-			j716f_vote_sm_tx_clear(t);
+			j716f_vote_sm_tx_free(sm, t);
 			sm->gc_stale++;
 			freed++;
 		}
