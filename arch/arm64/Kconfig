@@ -813,6 +813,22 @@ config ARM64_ERRATUM_1508412
 
 	  If unsure, say Y.
 
+config ARM64_ERRATUM_1542418
+	bool "Cortex-A77: 1542418: core may fetch a stale instruction after ASID reuse"
+	default y
+	help
+	  This option adds a workaround for Arm Cortex-A77 erratum 1542418.
+
+	  On the affected Cortex-A77 cores (r0p0 and r1p0), software relying
+	  on the prefetch-speculation-protection instead of explicit
+	  synchronisation may fetch a stale instruction from a CPU-specific
+	  cache. This violates the ordering rules for instruction fetches.
+
+	  Work around the erratum by ensuring that 60 ASIDs are selected
+	  before any ASID is reused.
+
+	  If unsure, say Y.
+
 config ARM64_WORKAROUND_TRBE_OVERWRITE_FILL_MODE
 	bool
 

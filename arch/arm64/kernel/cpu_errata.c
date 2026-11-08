@@ -13,6 +13,7 @@
 #include <asm/cpufeature.h>
 #include <asm/fpsimd.h>
 #include <asm/kvm_asm.h>
+#include <asm/mmu_context.h>
 #include <asm/smp_plat.h>
 
 static u64 target_impl_cpu_num;
@@ -674,6 +675,20 @@ static const struct midr_range cnp_erratum_cpus[] = {
 };
 #endif
 
+#ifdef CONFIG_ARM64_ERRATUM_1542418
+static void run_workaround_1542418_asid_rollover(
+		const struct arm64_cpu_capabilities *cap)
+{
+	/*
+	 * The boot CPU (and a CPU coming online after kexec) may inherit
+	 * branch history from an address space whose ASID we are about to
+	 * reuse.  Flush it before the first user task runs.
+	 */
+	if (cap->matches(cap, SCOPE_LOCAL_CPU))
+		arm64_workaround_1542418_asid_rollover();
+}
+#endif
+
 const struct arm64_cpu_capabilities arm64_errata[] = {
 #ifdef CONFIG_ARM64_WORKAROUND_CLEAN_CACHE
 	{
@@ -865,6 +880,14 @@ const struct arm64_cpu_capabilities arm64_errata[] = {
 		ERRATA_MIDR_RANGE(MIDR_CORTEX_A77,
 				  0, 0,
 				  1, 0),
+	},
+#endif
+#ifdef CONFIG_ARM64_ERRATUM_1542418
+	{
+		.desc = "ARM erratum 1542418",
+		.capability = ARM64_WORKAROUND_1542418,
+		ERRATA_MIDR_RANGE(MIDR_CORTEX_A77, 0, 0, 1, 0),
+		.cpu_enable = run_workaround_1542418_asid_rollover,
 	},
 #endif
 #ifdef CONFIG_ARM64_WORKAROUND_DISABLE_CNP

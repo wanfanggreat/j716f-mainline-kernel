@@ -290,6 +290,13 @@ void post_ttbr_update_workaround(void);
 unsigned long arm64_mm_context_get(struct mm_struct *mm);
 void arm64_mm_context_put(struct mm_struct *mm);
 
+/*
+ * Cortex-A77 r0p0/r1p0 (including the Kryo 5XX Gold cores that report an
+ * A77 MIDR) may fetch a stale instruction after an ASID is reused.  The
+ * workaround selects 60 ASIDs to invalidate the stale branch history.
+ */
+void arm64_workaround_1542418_asid_rollover(void);
+
 #define mm_untag_mask mm_untag_mask
 static inline unsigned long mm_untag_mask(struct mm_struct *mm)
 {

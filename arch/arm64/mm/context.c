@@ -8,6 +8,7 @@
 
 #include <linux/bitfield.h>
 #include <linux/bitops.h>
+#include <linux/lockdep.h>
 #include <linux/sched.h>
 #include <linux/slab.h>
 #include <linux/mm.h>
@@ -74,6 +75,73 @@ void verify_cpu_asid_bits(void)
 				smp_processor_id(), asid, asid_bits);
 		cpu_panic_kernel();
 	}
+}
+
+/*
+ * Cortex-A77 r0p0/r1p0 erratum 1542418: the core may fetch a stale
+ * instruction from its macro-op cache after an ASID is reused.  Selecting
+ * 60 fresh ASIDs in a row invalidates that history.  With KPTI the odd
+ * ASIDs belong to user space and are avoided (the SDEI trampoline keys off
+ * the user ASID bit).
+ */
+#ifdef CONFIG_UNMAP_KERNEL_AT_EL0
+#define idx2asid(idx)	(((u64)(idx) << 1) & 0xffffULL)
+#else
+#define idx2asid(idx)	((u64)(idx) & 0xffffULL)
+#endif
+
+/*
+ * Called with IRQs disabled.  When CnP is active the caller must already
+ * have installed the reserved TTBR0; otherwise this installs it itself.
+ * local_flush_tlb_all() at the call site completes the final ASID restore.
+ */
+static void __arm64_workaround_1542418_asid_rollover(void)
+{
+	u64 idx, ttbr1, ttbr1_baddr;
+
+	if (!IS_ENABLED(CONFIG_ARM64_ERRATUM_1542418) ||
+	    !cpus_have_cap(ARM64_WORKAROUND_1542418) ||
+	    !this_cpu_has_cap(ARM64_WORKAROUND_1542418))
+		return;
+
+	if (!system_supports_cnp())
+		cpu_set_reserved_ttbr0();
+
+	ttbr1 = read_sysreg(ttbr1_el1);
+	ttbr1_baddr = ttbr1 & ~TTBRx_EL1_ASID_MASK;
+
+	for (idx = 1; idx <= 60; idx++) {
+		write_sysreg(FIELD_PREP(TTBRx_EL1_ASID_MASK, idx2asid(idx)) |
+			     ttbr1_baddr, ttbr1_el1);
+		isb();
+	}
+
+	write_sysreg(ttbr1, ttbr1_el1);
+}
+
+/*
+ * Boot / kexec path: the previous kernel may have left stale branch
+ * history tagged with ASIDs we are about to reuse.  Run the same poll
+ * once on the current CPU with the reserved TTBR0 installed.
+ */
+void arm64_workaround_1542418_asid_rollover(void)
+{
+	u64 ttbr0;
+
+	if (!IS_ENABLED(CONFIG_ARM64_ERRATUM_1542418))
+		return;
+
+	lockdep_assert_irqs_disabled();
+
+	ttbr0 = read_sysreg(ttbr0_el1);
+	if (system_supports_cnp())
+		cpu_set_reserved_ttbr0();
+
+	__arm64_workaround_1542418_asid_rollover();
+	isb();
+
+	write_sysreg(ttbr0, ttbr0_el1);
+	isb();
 }
 
 static void set_kpti_asid_bits(unsigned long *map)
@@ -252,8 +320,10 @@ void check_and_switch_context(struct mm_struct *mm)
 	}
 
 	cpu = smp_processor_id();
-	if (cpumask_test_and_clear_cpu(cpu, &tlb_flush_pending))
+	if (cpumask_test_and_clear_cpu(cpu, &tlb_flush_pending)) {
+		__arm64_workaround_1542418_asid_rollover();
 		local_flush_tlb_all();
+	}
 
 	atomic64_set(this_cpu_ptr(&active_asids), asid);
 	raw_spin_unlock_irqrestore(&cpu_asid_lock, flags);
