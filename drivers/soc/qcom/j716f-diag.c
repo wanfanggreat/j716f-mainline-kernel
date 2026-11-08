@@ -14,9 +14,11 @@
 
 #define pr_fmt(fmt) "j716f-diag: " fmt
 
+#include <linux/atomic.h>
 #include <linux/compiler.h>
 #include <linux/console.h>
 #include <linux/context_tracking_state.h>
+#include <linux/cpu.h>
 #include <linux/cpuhotplug.h>
 #include <linux/export.h>
 #include <linux/hardirq.h>
@@ -45,8 +47,17 @@
 #define J716F_BC_DUMP_DEPTH	6
 #define J716F_BC_COMM_LEN	12
 
+/*
+ * The generation is written last with release semantics; J716F_BC_GEN_BUSY
+ * marks a slot that is being overwritten.  A reader from another CPU (or
+ * from the panic notifier while the target is still running) therefore
+ * never trusts a half written record.
+ */
+#define J716F_BC_GEN_BUSY	(~0ULL)
+
 struct j716f_bc_rec {
 	u64 ts;
+	u64 gen;
 	unsigned long arg;
 	u32 site;
 	u32 flags;
@@ -56,10 +67,11 @@ struct j716f_bc_rec {
 };
 
 struct j716f_bc_cpu {
-	u32 seq;
+	atomic64_t seq;
 	u32 alert_stage;
 	u32 bt_stage;
-	u32 pad;
+	u32 online;
+	u32 timer_ready;
 	u64 heartbeat;
 	struct j716f_bc_rec ring[J716F_BC_RING];
 };
@@ -109,10 +121,24 @@ static DEFINE_PER_CPU(struct j716f_bt_req, j716f_bt_reqs);
 
 /* Ignore stale hearts for a while after a system resume: hrtimers freeze. */
 static u64 j716f_snap_guard;
+/*
+ * Set from PM_SUSPEND_PREPARE until PM_POST_SUSPEND.  With s2idle the
+ * hrtimers are frozen but the CPUs stay online, so the first timer after
+ * resume would otherwise see every other CPU as stale for the whole sleep
+ * duration and panic before the PM_POST_SUSPEND notifier runs.
+ */
+static bool j716f_suspended;
 
 static void j716f_bt_work_fn(struct work_struct *w)
 {
 	struct j716f_bt_req *req = container_of(w, struct j716f_bt_req, work);
+
+	/*
+	 * The CPU may have gone offline while the work was queued.  Sending
+	 * an IPI to a dead CPU is pointless and arch code may WARN.
+	 */
+	if (!cpu_online(req->cpu))
+		return;
 
 	pr_info("J716F SNAP: requesting NMI backtrace of cpu%d\n", req->cpu);
 	trigger_single_cpu_backtrace(req->cpu);
@@ -187,6 +213,7 @@ static const char *const j716f_bc_names[J716F_BC_MAX] = {
 
 	[J716F_BC_TLB_FLUSH_ENTER]	= "tlb_flush_enter",
 	[J716F_BC_TLB_FLUSH_EXIT]	= "tlb_flush_exit",
+	[J716F_BC_TLB_FLUSH_RET]	= "tlb_flush_ret",
 
 	[J716F_BC_MM_DUP_ENTER]		= "dup_mmap_enter",
 	[J716F_BC_MM_DUP_POST_FLUSH]	= "dup_mmap_post_flush",
@@ -225,12 +252,15 @@ static const char *const j716f_bc_names[J716F_BC_MAX] = {
 	[J716F_BC_FORK_COPY_EXIT]	= "copy_process_exit",
 	[J716F_BC_FORK_WAKE_ENTER]	= "wake_new_task_enter",
 	[J716F_BC_FORK_WAKE_EXIT]	= "wake_new_task_exit",
-	[J716F_BC_PAGE_FREE_LIST_ENTER]	= "free_unref_list_enter",
-	[J716F_BC_PAGE_FREE_LIST_EXIT]	= "free_unref_list_exit",
-	[J716F_BC_PAGE_FREE_PCP_ENTER]	= "free_pcppages_enter",
-	[J716F_BC_PAGE_FREE_PCP_EXIT]	= "free_pcppages_exit",
+	[J716F_BC_PAGE_FREE_LIST_ENTER]	= "free_unref_folios_enter",
+	[J716F_BC_PAGE_FREE_LIST_EXIT]	= "free_unref_folios_exit",
+	[J716F_BC_PAGE_FREE_PCP_ENTER]	= "free_pcppages_bulk_enter",
+	[J716F_BC_PAGE_FREE_PCP_EXIT]	= "free_pcppages_bulk_exit",
 	[J716F_BC_TLB_BATCHED_ENTER]	= "tlb_batched_enter",
 	[J716F_BC_TLB_BATCHED_EXIT]	= "tlb_batched_exit",
+
+	[J716F_BC_IDLE_ENTER]		= "idle_enter",
+	[J716F_BC_IDLE_EXIT]		= "idle_exit",
 };
 
 static const char *j716f_bc_name(u32 site)
@@ -252,14 +282,24 @@ void j716f_bc(enum j716f_bc_site site, unsigned long arg)
 {
 	struct j716f_bc_cpu *c;
 	struct j716f_bc_rec *r;
-	u32 seq;
+	bool nmi = in_nmi();
+	u64 seq;
 
-	preempt_disable();
+	/*
+	 * NMI context already has preemption disabled (nmi_enter() adds the
+	 * NMI offset); touching the preempt count there is unnecessary.  An
+	 * IRQ can also re-enter this function, but its disable/enable pair is
+	 * balanced, and the sequence counter is a per-CPU atomic so the two
+	 * writers cannot lose each other's generation.
+	 */
+	if (!nmi)
+		preempt_disable();
 	c = this_cpu_ptr(&j716f_bc_data);
-	seq = c->seq;
-	c->seq = seq + 1;
+	seq = atomic64_fetch_inc(&c->seq);
 	r = &c->ring[seq & (J716F_BC_RING - 1)];
 
+	/* Tell a remote reader that this slot is being recycled. */
+	WRITE_ONCE(r->gen, J716F_BC_GEN_BUSY);
 	r->arg = arg;
 	r->flags = (irqs_disabled() ? J716F_BC_F_IRQOFF : 0) |
 		   (in_hardirq() ? J716F_BC_F_HARDIRQ : 0) |
@@ -267,40 +307,74 @@ void j716f_bc(enum j716f_bc_site site, unsigned long arg)
 	r->pid = current->pid;
 	strscpy(r->comm, current->comm, sizeof(r->comm));
 	r->site = site;
-	/* Pairs with the READ_ONCE() in the dump. */
+	/* The release stores publish the payload and then the generation. */
 	smp_store_release(&r->ts, local_clock());
+	smp_store_release(&r->gen, seq);
 
-	preempt_enable();
+	if (!nmi)
+		preempt_enable();
 }
 EXPORT_SYMBOL_GPL(j716f_bc);
+
+/*
+ * Copy one record and prove that the generation did not change while we
+ * were reading it.  Returns false for a slot that a writer is recycling,
+ * or for a record that was never completed (ts is the second to last
+ * store, gen is the last one).
+ */
+static bool j716f_bc_read(int cpu, u64 seq, struct j716f_bc_rec *out)
+{
+	struct j716f_bc_cpu *c = per_cpu_ptr(&j716f_bc_data, cpu);
+	struct j716f_bc_rec *r = &c->ring[seq & (J716F_BC_RING - 1)];
+
+	if (smp_load_acquire(&r->gen) != seq)
+		return false;
+
+	out->arg = READ_ONCE(r->arg);
+	out->flags = READ_ONCE(r->flags);
+	out->pid = READ_ONCE(r->pid);
+	out->site = READ_ONCE(r->site);
+	memcpy(out->comm, r->comm, sizeof(out->comm));
+	out->comm[sizeof(out->comm) - 1] = '\0';
+	out->ts = smp_load_acquire(&r->ts);
+
+	/* A writer may have started recycling the slot while we copied. */
+	if (smp_load_acquire(&r->gen) != seq)
+		return false;
+
+	return out->ts != 0;
+}
 
 static void j716f_bc_dump_cpu(int cpu)
 {
 	struct j716f_bc_cpu *c = per_cpu_ptr(&j716f_bc_data, cpu);
-	u32 seq = READ_ONCE(c->seq);
+	u64 seq = atomic64_read(&c->seq);
 	u64 now = local_clock();
+	bool newest = true;
 	int i;
 
 	if (!seq)
 		return;
 
 	for (i = 0; i < J716F_BC_DUMP_DEPTH && i < seq; i++) {
-		u32 s = seq - 1 - i;
-		struct j716f_bc_rec *r = &c->ring[s & (J716F_BC_RING - 1)];
-		u64 ts = smp_load_acquire(&r->ts);
-		u32 flags = r->flags;
+		struct j716f_bc_rec r;
+		u64 s = seq - 1 - i;
 		char fl[4];
 
-		fl[0] = (flags & J716F_BC_F_IRQOFF) ? 'I' : '-';
-		fl[1] = (flags & J716F_BC_F_HARDIRQ) ? 'H' : '-';
-		fl[2] = (flags & J716F_BC_F_NMI) ? 'N' : '-';
+		if (!j716f_bc_read(cpu, s, &r))
+			continue;
+
+		fl[0] = (r.flags & J716F_BC_F_IRQOFF) ? 'I' : '-';
+		fl[1] = (r.flags & J716F_BC_F_HARDIRQ) ? 'H' : '-';
+		fl[2] = (r.flags & J716F_BC_F_NMI) ? 'N' : '-';
 		fl[3] = '\0';
 
-		pr_info("J716F BC cpu%d seq=%u site=%s arg=0x%lx fl=%s pid=%u comm=%s age=%llums%s\n",
-			cpu, s, j716f_bc_name(r->site), r->arg, fl,
-			r->pid, r->comm,
-			ts ? j716f_age(now, ts) / NSEC_PER_MSEC : 0,
-			i == 0 ? " (current)" : "");
+		pr_info("J716F BC cpu%d seq=%llu site=%s arg=0x%lx fl=%s pid=%u comm=%s age=%llums%s\n",
+			cpu, (unsigned long long)s, j716f_bc_name(r.site),
+			r.arg, fl, r.pid, r.comm,
+			j716f_age(now, r.ts) / NSEC_PER_MSEC,
+			newest ? " (current)" : "");
+		newest = false;
 	}
 }
 
@@ -320,32 +394,33 @@ extern int gicv3_j716f_redist_state(int cpu, u32 *waker, u32 *pending, u32 *acti
 extern void gicv3_j716f_dump_redist(int cpu);
 #endif
 
-/* Read the newest record of @cpu without insisting on a stable snapshot. */
-static void j716f_bc_last(int cpu, struct j716f_bc_rec *out, u32 *seq_out)
+/*
+ * Return the newest record that is fully published.  The newest slot may be
+ * busy (the target CPU is writing it right now), in which case the previous
+ * record is still the last reliable position.
+ */
+static void j716f_bc_last(int cpu, struct j716f_bc_rec *out, u64 *seq_out)
 {
 	struct j716f_bc_cpu *c = per_cpu_ptr(&j716f_bc_data, cpu);
-	u32 seq = READ_ONCE(c->seq);
-	struct j716f_bc_rec *r;
+	u64 seq = atomic64_read(&c->seq);
+	u64 i;
 
-	if (!seq) {
-		memset(out, 0, sizeof(*out));
-		*seq_out = 0;
-		return;
+	memset(out, 0, sizeof(*out));
+	*seq_out = 0;
+
+	for (i = 0; i < J716F_BC_RING && i < seq; i++) {
+		u64 s = seq - 1 - i;
+
+		if (j716f_bc_read(cpu, s, out)) {
+			*seq_out = s;
+			return;
+		}
 	}
-	r = &c->ring[(seq - 1) & (J716F_BC_RING - 1)];
-	out->site = READ_ONCE(r->site);
-	out->arg = READ_ONCE(r->arg);
-	out->flags = READ_ONCE(r->flags);
-	out->pid = READ_ONCE(r->pid);
-	memcpy(out->comm, r->comm, sizeof(out->comm));
-	out->comm[sizeof(out->comm) - 1] = '\0';
-	out->ts = smp_load_acquire(&r->ts);
-	*seq_out = seq - 1;
 }
 
 static void j716f_snap_print(u64 now)
 {
-	char buf[512];
+	char buf[1024];
 	int len = 0, cpu;
 
 	len += scnprintf(buf + len, sizeof(buf) - len, "J716F SNAP t=%llus",
@@ -353,7 +428,7 @@ static void j716f_snap_print(u64 now)
 
 	for_each_online_cpu(cpu) {
 		struct j716f_bc_rec r;
-		u32 seq;
+		u64 seq;
 		u64 beat = READ_ONCE(per_cpu(j716f_bc_data, cpu).heartbeat);
 
 		j716f_bc_last(cpu, &r, &seq);
@@ -378,20 +453,27 @@ static void j716f_snap_print(u64 now)
 
 static void j716f_snap_alert(u64 now)
 {
+	unsigned int bt = READ_ONCE(bt_stage);
+	unsigned int ps = READ_ONCE(panic_stage);
 	int cpu;
 
-	if (now < READ_ONCE(j716f_snap_guard))
+	if (READ_ONCE(j716f_suspended) || now < READ_ONCE(j716f_snap_guard))
 		return;
+
+	if (bt > ARRAY_SIZE(j716f_alert_ms))
+		bt = ARRAY_SIZE(j716f_alert_ms);
+	if (ps > ARRAY_SIZE(j716f_alert_ms))
+		ps = ARRAY_SIZE(j716f_alert_ms);
 
 	for_each_online_cpu(cpu) {
 		struct j716f_bc_cpu *c = per_cpu_ptr(&j716f_bc_data, cpu);
 		struct j716f_bc_rec r;
-		u32 seq, flags, stage = 0;
-		u64 beat = READ_ONCE(c->heartbeat);
-		u64 age;
+		u64 seq, beat, age, threshold;
+		u32 flags, stage = 0;
 		int i;
 
-		if (!beat)
+		beat = READ_ONCE(c->heartbeat);
+		if (!beat || !READ_ONCE(c->online))
 			continue;
 
 		age = j716f_age(now, beat);
@@ -442,16 +524,26 @@ static void j716f_snap_alert(u64 now)
 			(flags & J716F_BC_F_NMI) ? 'N' : '-',
 			r.pid, r.comm);
 #endif
-		if (bt_stage && stage >= bt_stage &&
+		if (bt && stage >= bt &&
 		    READ_ONCE(c->bt_stage) < stage) {
 			WRITE_ONCE(c->bt_stage, stage);
 			schedule_work(&per_cpu(j716f_bt_reqs, cpu).work);
 		}
 
-		if (panic_stage && stage >= panic_stage)
+		if (ps && stage >= ps) {
+			/*
+			 * Re-read the heartbeat before resetting the box: a CPU
+			 * that recovered between the read above and here must
+			 * not trigger a panic.
+			 */
+			beat = READ_ONCE(c->heartbeat);
+			threshold = j716f_alert_ms[ps - 1] * NSEC_PER_MSEC;
+			if (!beat || j716f_age(local_clock(), beat) < threshold)
+				continue;
 			panic("j716f: cpu%d heartbeat stopped for %llums (last site %s, comm %s)",
-			      cpu, age / NSEC_PER_MSEC,
+			      cpu, j716f_age(now, beat) / NSEC_PER_MSEC,
 			      j716f_bc_name(r.site), r.comm);
+		}
 	}
 }
 
@@ -479,11 +571,24 @@ static enum hrtimer_restart j716f_snap_fn(struct hrtimer *h)
 static void j716f_snap_start_cpu(void *unused)
 {
 	int cpu = raw_smp_processor_id();
+	struct j716f_bc_cpu *c = per_cpu_ptr(&j716f_bc_data, cpu);
 	struct hrtimer *h = per_cpu_ptr(&j716f_snap_timer, cpu);
 
-	hrtimer_setup(h, j716f_snap_fn, CLOCK_MONOTONIC,
-		      HRTIMER_MODE_REL_PINNED_HARD);
-	WRITE_ONCE(per_cpu(j716f_bc_data, cpu).heartbeat, local_clock());
+	/*
+	 * The timer is set up once per CPU.  On a hotplug round trip it was
+	 * cancelled by the offline callback, so re-initialising it here would
+	 * reinitialise a live object for no reason.
+	 */
+	if (!READ_ONCE(c->timer_ready)) {
+		hrtimer_setup(h, j716f_snap_fn, CLOCK_MONOTONIC,
+			      HRTIMER_MODE_REL_PINNED_HARD);
+		WRITE_ONCE(c->timer_ready, 1);
+	}
+
+	WRITE_ONCE(c->heartbeat, local_clock());
+	WRITE_ONCE(c->alert_stage, 0);
+	WRITE_ONCE(c->bt_stage, 0);
+	WRITE_ONCE(c->online, 1);
 	hrtimer_start(h, ns_to_ktime(J716F_SNAP_PERIOD_NS),
 		      HRTIMER_MODE_REL_PINNED_HARD);
 }
@@ -499,7 +604,19 @@ static int j716f_snap_cpu_online(unsigned int cpu)
 
 static int j716f_snap_cpu_offline(unsigned int cpu)
 {
+	struct j716f_bc_cpu *c = per_cpu_ptr(&j716f_bc_data, cpu);
+
 	hrtimer_cancel(per_cpu_ptr(&j716f_snap_timer, cpu));
+
+	/*
+	 * The CPU is still in cpu_online_mask while the hotplug callbacks
+	 * run.  Clear our own liveness state so the printer does not report
+	 * a CPU that is deliberately going down as wedged.
+	 */
+	WRITE_ONCE(c->online, 0);
+	WRITE_ONCE(c->heartbeat, 0);
+	WRITE_ONCE(c->alert_stage, 0);
+	WRITE_ONCE(c->bt_stage, 0);
 	return 0;
 }
 
@@ -509,18 +626,37 @@ static int j716f_snap_pm_notify(struct notifier_block *nb,
 	int cpu;
 	u64 now;
 
-	if (mode != PM_POST_SUSPEND)
+	switch (mode) {
+	case PM_SUSPEND_PREPARE:
+	case PM_HIBERNATION_PREPARE:
+	case PM_RESTORE_PREPARE:
+		/*
+		 * s2idle keeps the CPUs online and freezes hrtimers; without
+		 * this the first timer after resume would panic on every
+		 * sibling whose heartbeat is as old as the sleep.
+		 */
+		WRITE_ONCE(j716f_suspended, true);
 		return NOTIFY_DONE;
+	case PM_POST_SUSPEND:
+	case PM_POST_HIBERNATION:
+	case PM_POST_RESTORE:
+		break;
+	default:
+		return NOTIFY_DONE;
+	}
 
 	now = local_clock();
 	WRITE_ONCE(j716f_snap_guard, now + 10ULL * NSEC_PER_SEC);
 	for_each_online_cpu(cpu) {
 		struct j716f_bc_cpu *c = per_cpu_ptr(&j716f_bc_data, cpu);
 
+		if (!READ_ONCE(c->online))
+			continue;
 		WRITE_ONCE(c->heartbeat, now);
 		WRITE_ONCE(c->alert_stage, 0);
 		WRITE_ONCE(c->bt_stage, 0);
 	}
+	WRITE_ONCE(j716f_suspended, false);
 	return NOTIFY_DONE;
 }
 
@@ -555,17 +691,22 @@ void j716f_diag_dump(const char *reason)
 	for_each_online_cpu(cpu)
 		j716f_ct_dump_cpu(cpu);
 
+	/*
+	 * Flush the breadcrumbs before reading another CPU's redistributor:
+	 * the GICR frame of a CPU stuck in EL3 or in a collapsed power domain
+	 * is exactly the kind of device read that can wedge the reader too.
+	 * console_flush_on_panic() ignores the console lock so the evidence
+	 * cannot be lost behind a stuck printk owner.
+	 */
+	if (oops_in_progress)
+		console_flush_on_panic(CONSOLE_FLUSH_PENDING);
+
 	/* GIC redistributor state: is the CPU's IRQ interface still awake? */
 #if IS_ENABLED(CONFIG_ARM_GIC_V3)
 	for_each_online_cpu(cpu)
 		gicv3_j716f_dump_redist(cpu);
 #endif
 
-	/*
-	 * Make sure everything above reached the consoles before touching the
-	 * (possibly wedged) RSC: console_flush_on_panic() ignores the console
-	 * lock so the breadcrumbs cannot be lost behind a stuck printk owner.
-	 */
 	if (oops_in_progress)
 		console_flush_on_panic(CONSOLE_FLUSH_PENDING);
 
@@ -600,13 +741,13 @@ static int j716f_diag_show(struct seq_file *m, void *v)
 		struct j716f_bc_rec r;
 		u64 now = local_clock();
 		u64 beat = READ_ONCE(per_cpu(j716f_bc_data, cpu).heartbeat);
-		u32 seq;
+		u64 seq;
 
 		j716f_bc_last(cpu, &r, &seq);
 		if (!seq)
 			continue;
-		seq_printf(m, "cpu%d seq=%u beat=%llums%s site=%s arg=0x%lx fl=%c%c%c pid=%u comm=%s age=%llums\n",
-			   cpu, seq,
+		seq_printf(m, "cpu%d seq=%llu beat=%llums%s site=%s arg=0x%lx fl=%c%c%c pid=%u comm=%s age=%llums\n",
+			   cpu, (unsigned long long)seq,
 			   beat ? j716f_age(now, beat) / NSEC_PER_MSEC : 0,
 			   (!beat || j716f_age(now, beat) > J716F_STALE_NS) ? " STALE" : "",
 			   j716f_bc_name(r.site), r.arg,
@@ -661,27 +802,39 @@ static int __init j716f_diag_init(void)
 	atomic_notifier_chain_register(&panic_notifier_list, &j716f_panic_nb);
 
 	/*
-	 * A 1 Hz pinned hard hrtimer per CPU is the liveness heartbeat: if a
-	 * CPU's timer stops, its interrupts are off / it is in EL3 / the core
-	 * is wedged, and the last breadcrumb names the site.  The printer is
-	 * elected per second so a single stuck CPU cannot blind the stream.
+	 * The backtrace work is per-CPU storage but is queued on whichever CPU
+	 * is printing.  Initialise it for every possible CPU here: a CPU that
+	 * is hot-added later must not schedule an uninitialised work item.
 	 */
-	for_each_online_cpu(cpu) {
+	for_each_possible_cpu(cpu) {
 		struct j716f_bt_req *req = per_cpu_ptr(&j716f_bt_reqs, cpu);
 
 		req->cpu = cpu;
 		INIT_WORK(&req->work, j716f_bt_work_fn);
-		smp_call_function_single(cpu, j716f_snap_start_cpu, NULL, 1);
 	}
 
 	register_pm_notifier(&j716f_snap_pm_nb);
 
-	ret = cpuhp_setup_state_nocalls(CPUHP_AP_ONLINE_DYN,
-					"soc/qcom/j716f-diag:online",
-					j716f_snap_cpu_online,
-					j716f_snap_cpu_offline);
-	if (ret < 0)
+	/*
+	 * A 1 Hz pinned hard hrtimer per CPU is the liveness heartbeat: if a
+	 * CPU's timer stops, its interrupts are off / it is in EL3 / the core
+	 * is wedged, and the last breadcrumb names the site.  The printer is
+	 * elected per second so a single stuck CPU cannot blind the stream.
+	 *
+	 * cpuhp_setup_state() runs the online callback for every CPU that is
+	 * already online and takes the hotplug lock, so a CPU cannot go down
+	 * between the callback registration and the timer start.
+	 */
+	ret = cpuhp_setup_state(CPUHP_AP_ONLINE_DYN,
+				"soc/qcom/j716f-diag:online",
+				j716f_snap_cpu_online,
+				j716f_snap_cpu_offline);
+	if (ret < 0) {
 		pr_warn("could not register the CPU online callback: %d\n", ret);
+		for_each_online_cpu(cpu)
+			smp_call_function_single(cpu, j716f_snap_start_cpu,
+						 NULL, 1);
+	}
 
 	pr_info("breadcrumbs enabled: %d sites, %d records per CPU, %llu ms heartbeat\n",
 		J716F_BC_MAX, J716F_BC_RING,

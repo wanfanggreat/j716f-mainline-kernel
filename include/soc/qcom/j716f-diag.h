@@ -95,6 +95,13 @@ enum j716f_bc_site {
 	/* arch/arm64/include/asm/tlbflush.h */
 	J716F_BC_TLB_FLUSH_ENTER,
 	J716F_BC_TLB_FLUSH_EXIT,
+	/*
+	 * Written by a second breadcrumb immediately after TLB_FLUSH_EXIT.
+	 * If the CPU stops in the exit breadcrumb's preempt_enable() (a
+	 * scheduling point) the RET record is missing and the flush itself
+	 * is exonerated.
+	 */
+	J716F_BC_TLB_FLUSH_RET,
 
 	/* mm teardown, fork/exec and page freeing (M15) */
 	J716F_BC_MM_DUP_ENTER,
@@ -140,6 +147,10 @@ enum j716f_bc_site {
 	J716F_BC_PAGE_FREE_PCP_EXIT,
 	J716F_BC_TLB_BATCHED_ENTER,
 	J716F_BC_TLB_BATCHED_EXIT,
+
+	/* idle loop (M16): a CPU that stops here lost its wakeup */
+	J716F_BC_IDLE_ENTER,
+	J716F_BC_IDLE_EXIT,
 
 	J716F_BC_MAX,
 };

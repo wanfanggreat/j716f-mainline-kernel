@@ -9,6 +9,7 @@
 #include <linux/cpuidle.h>
 #include <linux/suspend.h>
 #include <linux/livepatch.h>
+#include <soc/qcom/j716f-diag.h>
 #include "sched.h"
 #include "smp.h"
 
@@ -308,6 +309,14 @@ static void do_idle(void)
 	while (!need_resched()) {
 
 		/*
+		 * Record the idle transition: a CPU whose last breadcrumb is
+		 * idle_enter stopped in (or on the way into) the idle state
+		 * and lost its wakeup; one stuck on an mm/scheduler site never
+		 * got here.
+		 */
+		j716f_bc(J716F_BC_IDLE_ENTER, 0);
+
+		/*
 		 * Interrupts shouldn't be re-enabled from that point on until
 		 * the CPU sleeping instruction is reached. Otherwise an interrupt
 		 * may fire and queue a timer that would be ignored until the CPU
@@ -354,6 +363,7 @@ static void do_idle(void)
 		} else {
 			cpuidle_idle_call(got_tick);
 		}
+		j716f_bc(J716F_BC_IDLE_EXIT, 0);
 		got_tick = tick_nohz_idle_got_tick();
 		arch_cpu_idle_exit();
 	}

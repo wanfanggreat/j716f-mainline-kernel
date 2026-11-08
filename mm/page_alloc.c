@@ -55,6 +55,7 @@
 #include <linux/cacheinfo.h>
 #include <linux/pgalloc_tag.h>
 #include <asm/div64.h>
+#include <soc/qcom/j716f-diag.h>
 #include "internal.h"
 #include "mm_init.h"
 #include "page_alloc.h"
@@ -1475,6 +1476,8 @@ static void free_pcppages_bulk(struct zone *zone, int count,
 	unsigned int order;
 	struct page *page;
 
+	j716f_bc(J716F_BC_PAGE_FREE_PCP_ENTER, (unsigned long)zone);
+
 	/*
 	 * Ensure proper count is passed which otherwise would stuck in the
 	 * below while (list_empty(list)) loop.
@@ -1516,6 +1519,8 @@ static void free_pcppages_bulk(struct zone *zone, int count,
 			trace_mm_page_pcpu_drain(page, order, mt);
 		} while (count > 0 && !list_empty(list));
 	}
+
+	j716f_bc(J716F_BC_PAGE_FREE_PCP_EXIT, (unsigned long)zone);
 }
 
 /* Split a multi-block free page into its individual pageblocks. */
@@ -3013,6 +3018,8 @@ void free_unref_folios(struct folio_batch *folios)
 	struct zone *locked_zone = NULL;
 	int i, j;
 
+	j716f_bc(J716F_BC_PAGE_FREE_LIST_ENTER, (unsigned long)folios);
+
 	/* Prepare folios for freeing */
 	for (i = 0, j = 0; i < folios->nr; i++) {
 		struct folio *folio = folios->folios[i];
@@ -3096,6 +3103,7 @@ void free_unref_folios(struct folio_batch *folios)
 
 	if (pcp)
 		pcp_spin_unlock(pcp);
+	j716f_bc(J716F_BC_PAGE_FREE_LIST_EXIT, (unsigned long)folios);
 	folio_batch_reinit(folios);
 }
 
