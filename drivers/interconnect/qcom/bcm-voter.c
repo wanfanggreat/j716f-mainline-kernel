@@ -281,6 +281,7 @@ int qcom_icc_bcm_voter_commit(struct bcm_voter *voter)
 	int commit_idx[MAX_VCD + 1];
 	struct tcs_cmd cmds[MAX_BCMS];
 	int ret = 0;
+	int i;
 
 	if (!voter)
 		return 0;
@@ -311,6 +312,17 @@ int qcom_icc_bcm_voter_commit(struct bcm_voter *voter)
 	tcs_list_gen(voter, QCOM_ICC_BUCKET_AMC, cmds, commit_idx);
 	if (!commit_idx[0])
 		goto out;
+
+	/*
+	 * M20-P1: record the aggregated vote that will actually reach the
+	 * TCS, one entry per command, so the panic dump can be matched against
+	 * the raw TCS registers.  This is the post-merge value; the clients
+	 * that produced it are in the VOTE_REQ records written by
+	 * icc_set_bw(), which is why the two must be read together.
+	 */
+	for (i = 0; i < commit_idx[0]; i++)
+		j716f_vote_record(J716F_VOTE_KIND_AGG, cmds[i].addr,
+				   cmds[i].data, cmds[i].wait);
 
 	j716f_bc(J716F_BC_ICC_COMMIT_INVAL, cmds[0].addr);
 	rpmh_invalidate(voter->dev);

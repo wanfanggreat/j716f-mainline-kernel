@@ -201,6 +201,36 @@ enum j716f_bc_site {
 	J716F_BC_PAGE_FREE_RET_SHRINK,
 	J716F_BC_PAGE_FREE_RET_MOVE_LRU,
 
+	/*
+	 * M20-P1: MC0 / RPMh vote provenance.
+	 *
+	 * VOTE_REQ is written by icc_set_bw(), i.e. at the *client* boundary,
+	 * where current->comm still names the real requester (adreno, a UFS
+	 * worker, a cpufreq kthread, ...).  The BCM voter aggregates several
+	 * clients, so the commit thread is not the requester; this record is
+	 * what makes that distinction possible.
+	 *
+	 * VOTE_AGG is written in qcom_icc_bcm_voter_commit() once the
+	 * aggregated MC0 vote is known, i.e. the value that will actually
+	 * reach the TCS.  VOTE_TCS is written in rpmh_rsc_send_data() when
+	 * the TCS is claimed and triggered.
+	 *
+	 * All three are quiet records and run in plain process context.
+	 */
+	J716F_BC_VOTE_REQ,
+	J716F_BC_VOTE_AGG,
+	J716F_BC_VOTE_TCS,
+
+	/*
+	 * M20-P1: RSC completion timeline.  TX_DONE_ENTER/EXIT bracket
+	 * tcs_tx_done(); TX_DONE_TCS is the per-TCS bit it is servicing and
+	 * TX_DONE_STS the raw RSC_DRV_IRQ_STATUS it read.  This is what
+	 * separates "hardware finished" from "Linux reclaimed the TCS".
+	 */
+	J716F_BC_RSC_TX_DONE_ENTER,
+	J716F_BC_RSC_TX_DONE_TCS,
+	J716F_BC_RSC_TX_DONE_EXIT,
+
 	J716F_BC_MAX,
 };
 
@@ -212,10 +242,44 @@ enum j716f_bc_site {
 void j716f_bc(enum j716f_bc_site site, unsigned long arg);
 void j716f_bc_quiet(enum j716f_bc_site site, unsigned long arg);
 void j716f_diag_dump(const char *reason);
+
+/*
+ * M20-P1 vote provenance.  Kept out of the per-CPU breadcrumb ring because a
+ * request on one CPU and the aggregation/commit on another must be readable
+ * in one timeline.
+ */
+enum j716f_vote_kind {
+	J716F_VOTE_KIND_REQ = 1,	/* icc_set_bw(): client request */
+	J716F_VOTE_KIND_AGG,		/* bcm commit: aggregated value */
+	J716F_VOTE_KIND_TCS,		/* rpmh_rsc_send_data(): TCS trigger */
+	J716F_VOTE_KIND_DONE,		/* tcs_tx_done(): hardware completion */
+};
+
+void j716f_vote_record(enum j716f_vote_kind kind, u32 addr, u32 data, u32 aux);
+void j716f_vote_dump(void);
+/*
+ * M20-P1 IRQ accounting.  Cheap enough for the RSC completion handler: one
+ * per-CPU counter plus a timestamp, no lock and no printk.
+ */
+void j716f_irq_enter(int irq);
+void j716f_irq_exit(int irq);
+void j716f_irq_dump(void);
+void j716f_irq_set(int irq);
+void j716f_vote_decode(u32 data, bool *valid, bool *commit, u32 *vote_x,
+		       u32 *vote_y);
 #else
 static inline void j716f_bc(enum j716f_bc_site site, unsigned long arg) { }
 static inline void j716f_bc_quiet(enum j716f_bc_site site, unsigned long arg) { }
 static inline void j716f_diag_dump(const char *reason) { }
+static inline void j716f_vote_record(enum j716f_vote_kind kind, u32 addr,
+				     u32 data, u32 aux) { }
+static inline void j716f_vote_dump(void) { }
+static inline void j716f_irq_enter(int irq) { }
+static inline void j716f_irq_exit(int irq) { }
+static inline void j716f_irq_dump(void) { }
+static inline void j716f_irq_set(int irq) { }
+static inline void j716f_vote_decode(u32 data, bool *valid, bool *commit,
+				     u32 *vote_x, u32 *vote_y) { }
 #endif
 
 #endif /* __SOC_QCOM_J716F_DIAG_H */

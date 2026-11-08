@@ -18,6 +18,8 @@
 #include <linux/of.h>
 #include <linux/overflow.h>
 
+#include <soc/qcom/j716f-diag.h>
+
 #include "internal.h"
 
 #define ICC_DYN_ID_START 100000
@@ -729,6 +731,24 @@ int icc_set_bw(struct icc_path *path, u32 avg_bw, u32 peak_bw)
 
 	old_avg = path->reqs[0].avg_bw;
 	old_peak = path->reqs[0].peak_bw;
+
+	/*
+	 * M20-P1: record the client-side request, not the commit.
+	 *
+	 * The BCM voter merges several clients, so the thread that ends up in
+	 * rpmh_write_batch() is not necessarily the requester.  This is the
+	 * only point where current->comm still names the real one.
+	 *
+	 * Only on an actual change: a no-op set would otherwise fill the ring
+	 * with identical entries and hide the interesting transition.  The
+	 * record happens under icc_bw_lock in plain process context; the ring
+	 * itself is bounded and allocation free.
+	 */
+	if (old_avg != avg_bw || old_peak != peak_bw) {
+		node = path->reqs[path->num_nodes - 1].node;
+		j716f_vote_record(J716F_VOTE_KIND_REQ,
+				   node ? node->id : 0, peak_bw, avg_bw);
+	}
 
 	for (i = 0; i < path->num_nodes; i++) {
 		node = path->reqs[i].node;

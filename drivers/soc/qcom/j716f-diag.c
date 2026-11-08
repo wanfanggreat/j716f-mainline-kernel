@@ -46,6 +46,7 @@
 #include <asm/mmu_context.h>
 
 #include <soc/qcom/j716f-diag.h>
+#include <soc/qcom/tcs.h>
 
 #define J716F_BC_RING		16
 #define J716F_BC_DUMP_DEPTH	6
@@ -82,6 +83,51 @@ struct j716f_bc_cpu {
 
 static DEFINE_PER_CPU(struct j716f_bc_cpu, j716f_bc_data);
 static DEFINE_PER_CPU(struct hrtimer, j716f_snap_timer);
+
+/*
+ * M20-P1 vote provenance ring.
+ *
+ * The BCM voter merges several clients into one MC0 vote, so the thread that
+ * calls rpmh_write_batch() is not necessarily the requester.  This ring keeps
+ * the last N client-side requests (comm/pid/cpu/addr/x/y) and the last N
+ * aggregated commits, both with the same monotonic timestamp base as the
+ * per-CPU breadcrumbs, so a panic dump can answer "who asked for MC0, and
+ * when, relative to the CPUs going stale".
+ *
+ * Deliberately NOT per-CPU: a request on CPU4 for a GPU path and the commit
+ * on CPU0 must be comparable in one timeline.  Writers are serialised by a
+ * spinlock that is only ever taken in plain process context (icc_set_bw and
+ * the BCM commit path), never from IRQ/NMI, so this can never run inside the
+ * crash window it is meant to observe.  No allocation, no printk.
+ */
+#define J716F_VOTE_RING		32
+#define J716F_VOTE_COMM_LEN	16
+
+struct j716f_vote_rec {
+	u64 ts;
+	u32 kind;		/* enum j716f_vote_kind */
+	u32 cpu;
+	u32 pid;
+	u32 addr;		/* BCM/RPMh resource address */
+	u32 data;		/* raw TCS data word (vote_x/vote_y encoded) */
+	u32 aux;		/* kind specific extra (see dump) */
+	u32 pad;
+	char comm[J716F_VOTE_COMM_LEN];
+};
+
+struct j716f_vote_ring {
+	spinlock_t lock;
+	u32 head;
+	u32 count;
+	struct j716f_vote_rec rec[J716F_VOTE_RING];
+};
+
+static struct j716f_vote_ring j716f_votes;
+
+/* Diagnostics must never become a fault source: allow turning it off. */
+static bool vote_trace = true;
+module_param(vote_trace, bool, 0644);
+MODULE_PARM_DESC(vote_trace, "J716F: record MC0/RPMh vote provenance (diagnostic)");
 
 /*
  * A CPU whose snapshot hrtimer has not run for this long is not merely
@@ -356,6 +402,208 @@ void j716f_bc_quiet(enum j716f_bc_site site, unsigned long arg)
 		preempt_enable_no_resched_notrace();
 }
 EXPORT_SYMBOL_GPL(j716f_bc_quiet);
+
+/**
+ * j716f_vote_record - remember one MC0/RPMh vote event
+ * @kind: which boundary produced the event
+ * @addr: BCM/RPMh resource address (0 for a client request)
+ * @data: raw TCS data word, i.e. commit/valid/vote_x/vote_y as encoded
+ * @aux:  kind specific extra value
+ *
+ * Called from icc_set_bw() (client boundary), the BCM commit path and
+ * rpmh_rsc_send_data().  All three run in plain process context with
+ * interrupts enabled, so a spinlock is appropriate; the critical section is
+ * a few stores and one strscpy(), well below anything that could perturb the
+ * timing this is supposed to measure.
+ *
+ * No allocation, no printk, no sleeping call.  Bounded ring: old entries are
+ * overwritten, so memory use is fixed at boot.
+ */
+void j716f_vote_record(enum j716f_vote_kind kind, u32 addr, u32 data, u32 aux)
+{
+	struct j716f_vote_ring *r = &j716f_votes;
+	struct j716f_vote_rec *rec;
+	unsigned long flags;
+	u32 slot;
+
+	if (!READ_ONCE(vote_trace))
+		return;
+
+	spin_lock_irqsave(&r->lock, flags);
+	slot = r->head;
+	rec = &r->rec[slot];
+	rec->ts = j716f_now();
+	rec->kind = kind;
+	rec->cpu = raw_smp_processor_id();
+	rec->pid = current->pid;
+	rec->addr = addr;
+	rec->data = data;
+	rec->aux = aux;
+	/*
+	 * The completion records come from hardirq context.  strscpy() is
+	 * safe there, but it walks current->comm for a name that is always
+	 * the same interrupt-time task, so skip it and keep the IRQ path to a
+	 * handful of stores.
+	 */
+	if (kind != J716F_VOTE_KIND_DONE)
+		strscpy(rec->comm, current->comm, sizeof(rec->comm));
+	else
+		rec->comm[0] = '\0';
+	r->head = (slot + 1) & (J716F_VOTE_RING - 1);
+	if (r->count < J716F_VOTE_RING)
+		r->count++;
+	spin_unlock_irqrestore(&r->lock, flags);
+}
+EXPORT_SYMBOL_GPL(j716f_vote_record);
+
+/**
+ * j716f_vote_decode - decode one BCM TCS data word
+ * @data: raw command data as written into the TCS
+ * @valid: out, command valid bit
+ * @commit: out, commit bit
+ * @vote_x: out, 14-bit vote_x field
+ * @vote_y: out, 14-bit vote_y field
+ *
+ * The encoding is BCM_TCS_CMD() in include/soc/qcom/tcs.h.  Keeping the raw
+ * word in the record and decoding only at dump time means a future encoding
+ * change cannot retroactively corrupt the captured evidence.
+ */
+void j716f_vote_decode(u32 data, bool *valid, bool *commit, u32 *vote_x,
+		       u32 *vote_y)
+{
+	if (valid)
+		*valid = !!(data & BCM_TCS_CMD_VALID_MASK);
+	if (commit)
+		*commit = !!(data & BCM_TCS_CMD_COMMIT_MASK);
+	if (vote_x)
+		*vote_x = (data & BCM_TCS_CMD_VOTE_X_MASK) >> 14;
+	if (vote_y)
+		*vote_y = data & BCM_TCS_CMD_VOTE_Y_MASK;
+}
+EXPORT_SYMBOL_GPL(j716f_vote_decode);
+
+/**
+ * j716f_vote_dump - print the vote provenance ring
+ *
+ * Called from the panic notifier and from /proc/j716f_diag.
+ *
+ * The lock is taken with trylock, not spin_lock: if a CPU wedged while
+ * holding it (exactly the kind of hang this is meant to diagnose), blocking
+ * here would turn the diagnostic into a second, permanent stall and lose
+ * every dump line after it.  On contention the ring cannot be read
+ * consistently, so the dump says so and skips it rather than printing
+ * half-written records.
+ */
+void j716f_vote_dump(void)
+{
+	struct j716f_vote_ring *r = &j716f_votes;
+	struct j716f_vote_rec copy[J716F_VOTE_RING];
+	unsigned long flags;
+	u32 i, count, start;
+	u64 now = j716f_now();
+
+	if (!spin_trylock_irqsave(&r->lock, flags)) {
+		pr_info("J716F VOTE dump: ring lock busy, records skipped\n");
+		return;
+	}
+	count = r->count;
+	start = (r->head - count) & (J716F_VOTE_RING - 1);
+	for (i = 0; i < count; i++)
+		copy[i] = r->rec[(start + i) & (J716F_VOTE_RING - 1)];
+	spin_unlock_irqrestore(&r->lock, flags);
+
+	pr_info("J716F VOTE dump: %u/%u records\n", count, J716F_VOTE_RING);
+	for (i = 0; i < count; i++) {
+		const struct j716f_vote_rec *v = &copy[i];
+		const char *kind = v->kind == J716F_VOTE_KIND_REQ ? "req" :
+				   v->kind == J716F_VOTE_KIND_AGG ? "agg" :
+				   v->kind == J716F_VOTE_KIND_TCS ? "tcs" :
+				   v->kind == J716F_VOTE_KIND_DONE ? "done" : "?";
+
+		pr_info("J716F VOTE %s cpu%u pid=%u comm=%s addr=0x%x data=0x%08x aux=0x%x age=%llums\n",
+			kind, v->cpu, v->pid, v->comm, v->addr, v->data, v->aux,
+			j716f_age(now, v->ts) / NSEC_PER_MSEC);
+	}
+}
+EXPORT_SYMBOL_GPL(j716f_vote_dump);
+
+/*
+ * M20-P1 IRQ accounting for the RSC completion IRQ.
+ *
+ * The question this answers: did the completion IRQ get delivered at all, to
+ * which CPU, and when relative to the vote and to the CPUs going stale.  A
+ * pending GIC line with a zero count here means the line never reached a
+ * handler; a non-zero count with a stop time means it did and then stopped.
+ *
+ * Per-CPU counters only: no lock, no atomic RMW, no printk, safe from
+ * hardirq context.  Reading them from another CPU is a plain load, which is
+ * adequate for a coarse "how many times" answer.
+ */
+struct j716f_irq_stats {
+	u64 last_enter;
+	u64 last_exit;
+	u32 in_handler;
+	u32 pad;
+};
+
+static DEFINE_PER_CPU(struct j716f_irq_stats, j716f_irq_stat);
+static unsigned int j716f_irq_nr;	/* the irq we account for */
+static u32 j716f_irq_count[NR_CPUS];
+
+void j716f_irq_enter(int irq)
+{
+	struct j716f_irq_stats *s = this_cpu_ptr(&j716f_irq_stat);
+
+	if (irq != READ_ONCE(j716f_irq_nr))
+		return;
+	s->last_enter = j716f_now();
+	s->in_handler++;
+}
+
+void j716f_irq_exit(int irq)
+{
+	struct j716f_irq_stats *s = this_cpu_ptr(&j716f_irq_stat);
+	int cpu = raw_smp_processor_id();
+
+	if (irq != READ_ONCE(j716f_irq_nr))
+		return;
+	s->last_exit = j716f_now();
+	if (s->in_handler)
+		s->in_handler--;
+	if (cpu < NR_CPUS)
+		WRITE_ONCE(j716f_irq_count[cpu],
+			   READ_ONCE(j716f_irq_count[cpu]) + 1);
+}
+
+/**
+ * j716f_irq_set - remember which IRQ to account for
+ * @irq: the RSC completion IRQ
+ *
+ * Called once from the RSC probe, in process context.
+ */
+void j716f_irq_set(int irq)
+{
+	WRITE_ONCE(j716f_irq_nr, irq);
+}
+EXPORT_SYMBOL_GPL(j716f_irq_set);
+
+void j716f_irq_dump(void)
+{
+	u64 now = j716f_now();
+	int cpu;
+
+	pr_info("J716F IRQ dump: accounting irq=%u\n", READ_ONCE(j716f_irq_nr));
+	for_each_online_cpu(cpu) {
+		struct j716f_irq_stats *s = per_cpu_ptr(&j716f_irq_stat, cpu);
+
+		pr_info("J716F IRQ cpu%d count=%u in_handler=%u last_enter_age=%llums last_exit_age=%llums\n",
+			cpu, READ_ONCE(j716f_irq_count[cpu]),
+			READ_ONCE(s->in_handler),
+			s->last_enter ? j716f_age(now, s->last_enter) / NSEC_PER_MSEC : 0,
+			s->last_exit ? j716f_age(now, s->last_exit) / NSEC_PER_MSEC : 0);
+	}
+}
+EXPORT_SYMBOL_GPL(j716f_irq_dump);
 
 /**
  * j716f_bc - record one breadcrumb on the current CPU
@@ -844,6 +1092,15 @@ void j716f_diag_dump(const char *reason)
 		j716f_ct_dump_cpu(cpu);
 
 	j716f_asid_dump("dump");
+
+	/*
+	 * M20-P1: vote provenance before any RSC register read.  The ring is
+	 * ordinary memory, so it is safe to print even if the RSC or NoC is
+	 * wedged; it must appear before the register dumps below for exactly
+	 * that reason.
+	 */
+	j716f_vote_dump();
+	j716f_irq_dump();
 
 	/*
 	 * Flush the breadcrumbs before reading another CPU's redistributor:
