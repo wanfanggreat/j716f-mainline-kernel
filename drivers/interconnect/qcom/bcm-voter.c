@@ -315,16 +315,67 @@ int qcom_icc_bcm_voter_commit(struct bcm_voter *voter)
 
 	/*
 	 * M20-P1: record the aggregated vote that will actually reach the
-	 * TCS, one entry per command, so the panic dump can be matched against
-	 * the raw TCS registers.  This is the post-merge value; the clients
-	 * that produced it are in the VOTE_REQ records written by
-	 * icc_set_bw(), which is why the two must be read together.
+	 * TCS, so the panic dump can be matched against the raw TCS
+	 * registers.  This is the post-merge value; the clients that produced
+	 * it are in the VOTE_REQ records written by icc_set_bw(), which is why
+	 * the two must be read together.
+	 *
+	 * M20-P1c fixes three things here:
+	 *
+	 *  - MC0 is located by scanning the whole command list, not by
+	 *    assuming it is cmds[0].  The voter packs BCMs by VCD, so its
+	 *    position moves.
+	 *  - every TCS batch is scanned, not just the first.  tcs_list_gen()
+	 *    splits the list at MAX_RPMH_PAYLOAD, and rpmh_write_batch_txid()
+	 *    sends one TCS per batch, so an MC0 command in batch 1 would
+	 *    otherwise produce no record at all.
+	 *  - only the MC0 command is recorded.  v57 wrote one record per
+	 *    command of every commit, i.e. ~16 records x ~120 commits/s from
+	 *    the DPU alone, which is exactly the high-frequency
+	 *    instrumentation this diagnostic must not add.  The other commands
+	 *    are already printed with their raw registers by the RSC dump.
 	 */
-	for (i = 0; i < commit_idx[0]; i++)
-		j716f_vote_record(J716F_VOTE_KIND_AGG,
-				   j716f_vote_current_txid(), cmds[i].addr,
-				   cmds[i].data, J716F_VOTE_NO_TCS,
-				   ((u32)commit_idx[0] << 16) | (u32)i);
+	{
+		u32 mc0 = j716f_vote_mc0_addr();
+		u32 tx = j716f_vote_current_txid();
+		int batch, base = 0;
+
+		for (batch = 0; batch <= MAX_VCD && commit_idx[batch]; batch++) {
+			int mc0_idx = -1;
+
+			if (mc0) {
+				for (i = 0; i < commit_idx[batch]; i++) {
+					if (cmds[base + i].addr == mc0) {
+						mc0_idx = i;
+						break;
+					}
+				}
+			}
+
+			if (mc0_idx >= 0) {
+				j716f_vote_record(J716F_VOTE_KIND_AGG, tx,
+						   cmds[base + mc0_idx].addr,
+						   cmds[base + mc0_idx].data,
+						   J716F_VOTE_NO_TCS,
+						   ((u32)commit_idx[batch] << 16) |
+						   (u32)mc0_idx |
+						   ((u32)batch << 24));
+
+				/*
+				 * Only now, with this batch's commands known,
+				 * can the triggering client's provenance be
+				 * promoted into a durable MC0 record.  A batch
+				 * without MC0 promotes nothing, so per-frame
+				 * display votes cannot flush the retention
+				 * ring.
+				 */
+				j716f_vote_mc0_commit(tx, (u32)mc0_idx,
+						      cmds[base + mc0_idx].addr,
+						      cmds[base + mc0_idx].data);
+			}
+			base += commit_idx[batch];
+		}
+	}
 
 	j716f_bc(J716F_BC_ICC_COMMIT_INVAL, cmds[0].addr);
 	rpmh_invalidate(voter->dev);

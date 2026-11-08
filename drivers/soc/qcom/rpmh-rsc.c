@@ -478,7 +478,8 @@ static irqreturn_t tcs_tx_done(int irq, void *p)
 	int i;
 	unsigned long irq_status;
 	const struct tcs_request *req;
-	u32 reg, txid;
+	u32 reg;
+	u32 txid;
 
 	j716f_bc(J716F_BC_RSC_IRQ_ENTER, irq);
 	j716f_irq_enter(irq);
@@ -497,7 +498,7 @@ static irqreturn_t tcs_tx_done(int irq, void *p)
 		 * labels it "handler observed", never "hardware finished".
 		 */
 		j716f_vote_record(J716F_VOTE_KIND_DONE,
-				   i < MAX_TCS_NR ? READ_ONCE(drv->txid[i]) : 0,
+				   rpmh_rsc_get_txid(drv, i),
 				   0, irq_status, (u32)i, 0);
 		req = get_req_from_tcs(drv, i);
 		if (WARN_ON(!req))
@@ -527,7 +528,7 @@ skip:
 		 */
 		if (!drv->tcs[ACTIVE_TCS].num_tcs)
 			enable_tcs_irq(drv, i, false);
-		txid = i < MAX_TCS_NR ? READ_ONCE(drv->txid[i]) : 0;
+		txid = rpmh_rsc_get_txid(drv, i);
 		spin_unlock(&drv->lock);
 		/*
 		 * M20-P1a: separate "hardware done" from "software released
@@ -541,6 +542,13 @@ skip:
 		 */
 		j716f_vote_record(J716F_VOTE_KIND_RECLAIM, txid, 0, irq_status,
 				   (u32)i, 0);
+		/*
+		 * M20-P1c: the transaction is over, so release its in-flight
+		 * MC0 entry.  Done here, after the record above, so the
+		 * completion itself is still classified as MC0; anything that
+		 * never reaches this point keeps its provenance for the dump.
+		 */
+		j716f_vote_tx_release(txid);
 		wake_up(&drv->tcs_wait);
 		if (req)
 			rpmh_tx_done(req);
@@ -741,8 +749,7 @@ int rpmh_rsc_send_data(struct rsc_drv *drv, const struct tcs_request *msg)
 	 * drv->lock, so tcs_tx_done() can attribute the completion to the
 	 * request even when other transactions interleave.
 	 */
-	if (tcs_id < MAX_TCS_NR)
-		drv->txid[tcs_id] = msg->j716f_txid;
+	rpmh_rsc_set_txid(drv, tcs_id, msg->j716f_txid);
 	set_bit(tcs_id, drv->tcs_in_use);
 	if (msg->state == RPMH_ACTIVE_ONLY_STATE && tcs->type != ACTIVE_TCS) {
 		/*
@@ -780,13 +787,9 @@ int rpmh_rsc_send_data(struct rsc_drv *drv, const struct tcs_request *msg)
 	 * Between them they bracket the actual trigger, and neither may be
 	 * reported as "hardware started".
 	 */
-	j716f_vote_record(J716F_VOTE_KIND_TCS_PRE, msg->j716f_txid,
-			  msg->cmds[0].addr, msg->cmds[0].data, (u32)tcs_id,
-			  ((u32)msg->num_cmds << 8) | (u32)msg->wait_for_compl);
+	j716f_vote_record_tcs(J716F_VOTE_KIND_TCS_PRE, msg, (u32)tcs_id);
 	__tcs_set_trigger(drv, tcs_id, true);
-	j716f_vote_record(J716F_VOTE_KIND_TCS_POKED, msg->j716f_txid,
-			  msg->cmds[0].addr, msg->cmds[0].data, (u32)tcs_id,
-			  ((u32)msg->num_cmds << 8) | (u32)msg->wait_for_compl);
+	j716f_vote_record_tcs(J716F_VOTE_KIND_TCS_POKED, msg, (u32)tcs_id);
 	j716f_bc(J716F_BC_RSC_SEND_EXIT, tcs_id);
 
 	return 0;

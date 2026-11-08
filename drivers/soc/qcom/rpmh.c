@@ -218,15 +218,16 @@ static int __fill_rpmh_msg(struct rpmh_request *req, enum rpmh_state state,
 	req->msg.cmds = req->cmd;
 	req->msg.num_cmds = n;
 	req->msg.is_read = is_read;
-#ifdef CONFIG_QCOM_J716F_DIAG
 	/*
 	 * M20-P1b: requests built here carry no transaction id.  Only the
 	 * caller that actually knows which client caused the transfer may
 	 * set one (see rpmh_write_batch_txid()); everything else stays 0 so
 	 * the dump reports "unattributable" instead of inventing a link.
+	 *
+	 * M20-P1c: unconditional.  The field is a plain software word, so the
+	 * production build keeps the same layout and needs no #ifdef here.
 	 */
 	req->msg.j716f_txid = 0;
-#endif
 
 	return 0;
 }
@@ -439,14 +440,12 @@ static int rpmh_write_batch_active(const struct device *dev,
 
 		/* Our own reference, the controller owns the initial one */
 		refcount_inc(&rpm_msg->refcnt);
-#ifdef CONFIG_QCOM_J716F_DIAG
 		/*
 		 * M20-P1b: stamp the transaction id onto the request that
 		 * will be triggered, not onto a global.  A request that was
 		 * never stamped stays 0 and is reported as unattributable.
 		 */
 		rpm_msg->msg.j716f_txid = txid;
-#endif
 		rpm_msgs[nr_alloc] = rpm_msg;
 		cmd += n[nr_alloc];
 	}

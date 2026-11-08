@@ -213,20 +213,11 @@ EXPORT_SYMBOL_GPL(j716f_vote_current_txid);
  * of being hard-coded: 0x50000 is what this firmware reports today, but the
  * whole point of the MC0 ring is to keep the records that matter, so the
  * classifier must not silently stop matching if the address changes.
- * 0 means "not resolved yet", and j716f_vote_is_important() treats an
- * unresolved address as important so nothing is dropped before init runs.
+ * 0 means "not resolved", and j716f_vote_is_important() then admits nothing:
+ * keeping everything would let per-frame traffic flush the ring, which is the
+ * v56 failure this replaced.
  */
 static u32 j716f_mc0_addr;
-
-/*
- * Small hash set of transaction ids that have been seen voting on MC0.
- * A ring entry is stored as the txid itself, and 0 means empty; a false hit
- * needs a hash collision with a live id, in which case the only consequence
- * is that one extra transaction's records land in the MC0 ring.  That is the
- * safe direction: it never drops MC0 evidence.
- */
-#define J716F_VOTE_MC0_TX_LEN	64
-static u32 j716f_vote_mc0_tx[J716F_VOTE_MC0_TX_LEN];
 
 /* Diagnostics must never become a fault source: allow turning it off. */
 static bool vote_trace = true;
@@ -507,37 +498,286 @@ void j716f_bc_quiet(enum j716f_bc_site site, unsigned long arg)
 }
 EXPORT_SYMBOL_GPL(j716f_bc_quiet);
 
+/* Takes the ring lock itself; defined below. */
+static void j716f_vote_push(struct j716f_vote_ring *r,
+			    const struct j716f_vote_rec *in);
+
 /*
- * MC0 retention ring admission (M20-P1b).
+ * MC0 retention (M20-P1c).
  *
- * v56 admitted every record with addr == 0, which is all client requests and
- * all completion records - i.e. the busiest, least MC0-specific traffic
- * filled the ring that exists to protect MC0 evidence.
+ * v57 classified records by address and remembered "this txid touched MC0" in
+ * a direct-mapped array indexed by txid & 63.  Two things were wrong:
  *
- * Admission is now based on actual MC0 attribution:
- *   - the record names the MC0 resource address (agg/tcs/pre/poked), or
- *   - the record belongs to a transaction that already showed MC0 (the
- *     REQ for that txid), or
- *   - the record is for a TCS that was observed carrying MC0.
- * Anything else is "unclassified": it stays in the general ring only, and
- * the dump says so.  Unresolved MC0 address admits nothing rather than
- * everything, so a failed Command DB lookup cannot silently turn this back
- * into the v56 behaviour.
+ *   - a later txid hashing to the same slot silently evicted an earlier one,
+ *     so that earlier transaction's DONE/RECLAIM no longer matched and its
+ *     completion evidence never reached the MC0 ring.  The comment claiming
+ *     collisions could only over-collect was simply false;
+ *   - the client REQ record is written before the aggregate exists, so it can
+ *     never carry the MC0 address and always stayed in the general ring, where
+ *     ~120 commits/s wrap it in well under a second.  The one record that
+ *     names the real requester was therefore the one record most likely lost.
+ *
+ * Both are fixed by one small table of MC0 transactions that are still in
+ * flight.  An entry is created when the voter confirms the batch really
+ * contains MC0, carries the original client's provenance, and is only freed
+ * when tcs_tx_done() reclaims the TCS.  Consequences:
+ *
+ *   - a transaction that never completes keeps its entry, so its provenance
+ *     and its trigger survive any amount of later ring traffic - the case the
+ *     whole diagnostic exists for;
+ *   - capacity is explicit (J716F_VOTE_MC0_TX_LEN concurrent MC0
+ *     transactions).  Nothing in flight is ever evicted.  If the table is
+ *     full the transaction is NOT tracked and the overflow counter says so,
+ *     rather than a silent hash collision hiding it;
+ *   - it is not a hash: lookup compares the full 32-bit txid, so there is no
+ *     aliasing at all.
+ *
+ * Locking: mutations take j716f_mc0_tx_lock.  It is a leaf in both callers -
+ * the commit path holds icc_bw_lock/voter->lock mutexes, the completion path
+ * holds no RSC lock (RECLAIM is recorded after drv->lock is dropped).  Lookups
+ * used for ring classification are lockless: a stale "not found" only means a
+ * record stays in the general ring, never that evidence is invented.
  */
+#define J716F_VOTE_MC0_TX_LEN	32
+#define J716F_VOTE_PATH_LEN	20
+
+struct j716f_mc0_tx {
+	u32 txid;		/* 0 = slot free */
+	u32 pending;		/* MC0 triggers issued, decremented on RECLAIM */
+	u32 promoted;		/* REQ_MC0 already emitted for this txid */
+	u32 tcs;		/* last TCS it was triggered on */
+	u32 mc0_idx;		/* MC0's index in the batch, NONE if unknown */
+	u32 addr;
+	u32 data;
+	u32 avg_bw;
+	u32 peak_bw;
+	u32 pid;
+	u32 cpu;
+	u64 req_ts;		/* when the client called icc_set_bw() */
+	u64 trig_ts;		/* when the TCS trigger was written */
+	char comm[J716F_VOTE_COMM_LEN];
+	char path[J716F_VOTE_PATH_LEN];
+};
+
+static struct j716f_mc0_tx j716f_mc0_txs[J716F_VOTE_MC0_TX_LEN];
+static DEFINE_SPINLOCK(j716f_mc0_tx_lock);
+/*
+ * Counters are atomic: the commit path can run on several CPUs through
+ * different voters at once, and a diagnostics counter that silently loses
+ * increments cannot be used to argue "this never happened".
+ */
+static atomic_t j716f_mc0_tx_overflow = ATOMIC_INIT(0);	/* no free slot */
+static atomic_t j716f_vote_agg_unattr = ATOMIC_INIT(0);	/* MC0 commit, no request */
+
+/*
+ * The client request that is currently being committed.
+ *
+ * icc_set_bw() writes it while holding icc_bw_lock and the BCM voter reads it
+ * inside the same lock, so it always describes the commit that is running -
+ * this is a single-slot handoff, not a global "current transaction" that any
+ * unrelated RPMh sender could inherit.  rpmh_write() and the wake/sleep
+ * flushes never touch it.
+ *
+ * If a future commit path ever runs outside icc_bw_lock the txid check below
+ * fails and the entry is marked "provenance unknown" instead of being filled
+ * with somebody else's values.
+ */
+static struct {
+	u32 txid;
+	u32 avg_bw;
+	u32 peak_bw;
+	u32 node_id;
+	u32 pid;
+	u32 cpu;
+	u64 ts;
+	char comm[J716F_VOTE_COMM_LEN];
+	char path[J716F_VOTE_PATH_LEN];
+} j716f_cur_req;
+
+/* Caller holds j716f_mc0_tx_lock. */
+static struct j716f_mc0_tx *j716f_mc0_tx_find(u32 txid)
+{
+	int i;
+
+	if (!txid)
+		return NULL;
+	for (i = 0; i < J716F_VOTE_MC0_TX_LEN; i++)
+		if (j716f_mc0_txs[i].txid == txid)
+			return &j716f_mc0_txs[i];
+	return NULL;
+}
+
+/* Lockless lookup used only to classify a record; see the locking note. */
 static bool j716f_vote_txid_touched_mc0(u32 txid)
 {
+	int i;
+
 	if (!txid)
 		return false;
-	return READ_ONCE(j716f_vote_mc0_tx[txid & (J716F_VOTE_MC0_TX_LEN - 1)]) == txid;
+	for (i = 0; i < J716F_VOTE_MC0_TX_LEN; i++)
+		if (READ_ONCE(j716f_mc0_txs[i].txid) == txid)
+			return true;
+	return false;
 }
 
-static void j716f_vote_mark_txid_mc0(u32 txid)
+/*
+ * Record a client request for later promotion.  Called from icc_set_bw()
+ * under icc_bw_lock, before the voter runs.
+ */
+void j716f_vote_note_request(u32 txid, u32 avg_bw, u32 peak_bw, u32 node_id,
+			     const char *path_name)
 {
-	if (!txid)
+	if (!READ_ONCE(vote_trace) || !txid)
 		return;
-	WRITE_ONCE(j716f_vote_mc0_tx[txid & (J716F_VOTE_MC0_TX_LEN - 1)], txid);
-}
 
+	j716f_cur_req.txid = txid;
+	j716f_cur_req.avg_bw = avg_bw;
+	j716f_cur_req.peak_bw = peak_bw;
+	j716f_cur_req.node_id = node_id;
+	j716f_cur_req.pid = current->pid;
+	j716f_cur_req.cpu = raw_smp_processor_id();
+	j716f_cur_req.ts = j716f_now();
+	strscpy(j716f_cur_req.comm, current->comm, sizeof(j716f_cur_req.comm));
+	strscpy(j716f_cur_req.path, path_name ? path_name : "-",
+		sizeof(j716f_cur_req.path));
+}
+EXPORT_SYMBOL_GPL(j716f_vote_note_request);
+
+/**
+ * j716f_vote_mc0_commit - the batch that is about to be sent contains MC0
+ * @txid: transaction id of the icc_set_bw() call that caused this commit
+ * @idx:  command index carrying MC0 within the batch
+ * @addr: MC0's resource address as it appeared in the batch
+ * @data: the raw vote word the voter produced for MC0
+ *
+ * Called once per commit from qcom_icc_bcm_voter_commit() after it has looked
+ * at every command.  Creates the in-flight entry and emits the promoted
+ * request record, which is the only record that carries the original client's
+ * pid/comm/cpu/bandwidth/timestamp.
+ */
+void j716f_vote_mc0_commit(u32 txid, u32 idx, u32 addr, u32 data)
+{
+	struct j716f_mc0_tx *t;
+	struct j716f_mc0_tx snap;
+	unsigned long flags;
+	bool have_prov, emit;
+
+	if (!READ_ONCE(vote_trace))
+		return;
+
+	if (!txid) {
+		/*
+		 * A commit with no client request behind it (a set that did not
+		 * change any bandwidth still re-runs the voter).  These arrive
+		 * once per frame per CRTC and would flush the MC0 ring, so they
+		 * are counted instead of stored.
+		 */
+		atomic_inc(&j716f_vote_agg_unattr);
+		return;
+	}
+
+	spin_lock_irqsave(&j716f_mc0_tx_lock, flags);
+	t = j716f_mc0_tx_find(txid);
+	/*
+	 * One icc_set_bw() can commit more than once (apply_constraints() runs
+	 * per provider), so an existing entry must keep its outstanding-trigger
+	 * count.  Only the provenance fields are refreshed, and only when the
+	 * handoff still belongs to this transaction; otherwise they are left
+	 * as they are rather than being replaced by another client's values.
+	 */
+	have_prov = j716f_cur_req.txid == txid;
+	if (!t) {
+		int i;
+
+		for (i = 0; i < J716F_VOTE_MC0_TX_LEN; i++) {
+			if (!j716f_mc0_txs[i].txid) {
+				t = &j716f_mc0_txs[i];
+				break;
+			}
+		}
+		if (t) {
+			memset(t, 0, sizeof(*t));
+			t->txid = txid;
+			t->mc0_idx = J716F_VOTE_MC0_NONE;
+			if (have_prov) {
+				t->avg_bw = j716f_cur_req.avg_bw;
+				t->peak_bw = j716f_cur_req.peak_bw;
+				t->pid = j716f_cur_req.pid;
+				t->cpu = j716f_cur_req.cpu;
+				t->req_ts = j716f_cur_req.ts;
+				memcpy(t->comm, j716f_cur_req.comm, sizeof(t->comm));
+				memcpy(t->path, j716f_cur_req.path, sizeof(t->path));
+			}
+		}
+	}
+	if (!t) {
+		/*
+		 * Every slot is held by a transaction that has not completed.
+		 * Refusing to track this one is the honest outcome; the
+		 * alternative would be evicting live evidence.
+		 */
+		atomic_inc(&j716f_mc0_tx_overflow);
+		spin_unlock_irqrestore(&j716f_mc0_tx_lock, flags);
+		return;
+	}
+
+	t->mc0_idx = idx;
+	t->addr = addr;
+	t->data = data;
+	if (have_prov && !t->pid) {
+		t->avg_bw = j716f_cur_req.avg_bw;
+		t->peak_bw = j716f_cur_req.peak_bw;
+		t->pid = j716f_cur_req.pid;
+		t->cpu = j716f_cur_req.cpu;
+		t->req_ts = j716f_cur_req.ts;
+		memcpy(t->comm, j716f_cur_req.comm, sizeof(t->comm));
+		memcpy(t->path, j716f_cur_req.path, sizeof(t->path));
+	}
+
+	/*
+	 * Emit the promoted request exactly once per transaction.  A wide
+	 * icc_set_bw() commits per provider, so without this guard the ring
+	 * would show the same client request several times and a reader would
+	 * count them as separate MC0 events.
+	 */
+	emit = !t->promoted;
+	t->promoted = 1;
+	snap = *t;
+	spin_unlock_irqrestore(&j716f_mc0_tx_lock, flags);
+
+	if (!emit)
+		return;
+
+	/*
+	 * Emit the promoted request outside the table lock: it only needs the
+	 * ring's own lock, and keeping the two apart means neither is ever held
+	 * while the other is taken.
+	 */
+	{
+		struct j716f_vote_rec rec;
+
+		memset(&rec, 0, sizeof(rec));
+		rec.ts = have_prov ? snap.req_ts : j716f_now();
+		rec.kind = J716F_VOTE_KIND_REQ_MC0;
+		rec.cpu = have_prov ? snap.cpu : raw_smp_processor_id();
+		rec.pid = snap.pid;
+		rec.txid = txid;
+		rec.addr = addr;
+		rec.data = data;
+		rec.aux = snap.peak_bw;
+		rec.tcs = J716F_VOTE_NO_TCS;
+		memcpy(rec.comm, snap.comm, sizeof(rec.comm));
+		j716f_vote_push(&j716f_votes_mc0, &rec);
+	}
+}
+EXPORT_SYMBOL_GPL(j716f_vote_mc0_commit);
+
+/*
+ * Ring classification.  Only records that can be tied to MC0 by resource or
+ * by a tracked transaction enter the retention ring.  The MC0 address being
+ * unresolved admits nothing, so a failed Command DB lookup cannot silently
+ * turn this back into "keep everything".
+ */
 static bool j716f_vote_is_important(enum j716f_vote_kind kind, u32 txid,
 				    u32 addr)
 {
@@ -545,31 +785,21 @@ static bool j716f_vote_is_important(enum j716f_vote_kind kind, u32 txid,
 
 	if (!mc0)
 		return false;
-	if (addr == mc0) {
-		j716f_vote_mark_txid_mc0(txid);
-		return true;
-	}
+	if (addr == mc0)
+		return txid != 0;
 	/*
-	 * Only records that can be tied to MC0 by resource or by transaction
-	 * enter the retention ring:
-	 *   - DONE/RECLAIM: the tx already voted on MC0 (the agg/pre/poked
-	 *     records carried the address and marked it);
-	 *   - REQ: normally precedes the agg, so it cannot be classified yet.
-	 *     It is admitted only if the tx was marked by an earlier round,
-	 *     and otherwise stays in the general ring.  That is deliberate:
-	 *     a client request that never reaches MC0 must not displace MC0
-	 *     evidence, and a request that does reach it is already
-	 *     represented by its agg + tcs records.
+	 * DONE/RECLAIM belong to a transaction that was seen carrying MC0;
+	 * REQ never can (it predates the aggregate) and is only promoted
+	 * through REQ_MC0.
 	 */
-	if (kind == J716F_VOTE_KIND_DONE || kind == J716F_VOTE_KIND_RECLAIM ||
-	    kind == J716F_VOTE_KIND_REQ)
+	if (kind == J716F_VOTE_KIND_DONE || kind == J716F_VOTE_KIND_RECLAIM)
 		return j716f_vote_txid_touched_mc0(txid);
 	return false;
 }
 
 /* Copy one record and update the ring bookkeeping; caller holds the lock. */
-static void j716f_vote_push(struct j716f_vote_ring *r,
-			    const struct j716f_vote_rec *in)
+static void j716f_vote_push_locked(struct j716f_vote_ring *r,
+				   const struct j716f_vote_rec *in)
 {
 	u32 slot = r->head;
 
@@ -581,6 +811,17 @@ static void j716f_vote_push(struct j716f_vote_ring *r,
 	else
 		r->overwritten++;
 	r->generation++;
+}
+
+/* Take the ring lock, push, release.  Never called with another lock held. */
+static void j716f_vote_push(struct j716f_vote_ring *r,
+			    const struct j716f_vote_rec *in)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&r->lock, flags);
+	j716f_vote_push_locked(r, in);
+	spin_unlock_irqrestore(&r->lock, flags);
 }
 
 /**
@@ -596,6 +837,12 @@ void j716f_vote_set_mc0(u32 addr)
 	WRITE_ONCE(j716f_mc0_addr, addr);
 }
 EXPORT_SYMBOL_GPL(j716f_vote_set_mc0);
+
+u32 j716f_vote_mc0_addr(void)
+{
+	return READ_ONCE(j716f_mc0_addr);
+}
+EXPORT_SYMBOL_GPL(j716f_vote_mc0_addr);
 
 /**
  * j716f_vote_alloc_txid - allocate a transaction id for one RPMh round trip
@@ -632,9 +879,7 @@ EXPORT_SYMBOL_GPL(j716f_vote_alloc_txid);
 void j716f_vote_record(enum j716f_vote_kind kind, u32 txid, u32 addr, u32 data,
 		       u32 tcs, u32 aux)
 {
-	struct j716f_vote_ring *r;
 	struct j716f_vote_rec rec;
-	unsigned long flags;
 
 	if (!READ_ONCE(vote_trace))
 		return;
@@ -658,18 +903,139 @@ void j716f_vote_record(enum j716f_vote_kind kind, u32 txid, u32 addr, u32 data,
 	if (kind != J716F_VOTE_KIND_DONE && kind != J716F_VOTE_KIND_RECLAIM)
 		strscpy(rec.comm, current->comm, sizeof(rec.comm));
 
-	if (j716f_vote_is_important(kind, txid, addr)) {
-		spin_lock_irqsave(&j716f_votes_mc0.lock, flags);
+	if (j716f_vote_is_important(kind, txid, addr))
 		j716f_vote_push(&j716f_votes_mc0, &rec);
-		spin_unlock_irqrestore(&j716f_votes_mc0.lock, flags);
-	}
 
-	r = &j716f_votes;
-	spin_lock_irqsave(&r->lock, flags);
-	j716f_vote_push(r, &rec);
-	spin_unlock_irqrestore(&r->lock, flags);
+	j716f_vote_push(&j716f_votes, &rec);
 }
 EXPORT_SYMBOL_GPL(j716f_vote_record);
+
+/**
+ * j716f_vote_scan_mc0 - find MC0 anywhere in a TCS batch
+ * @msg: the request that is about to be triggered
+ *
+ * Returns the command index that carries the MC0 resource, or
+ * J716F_VOTE_MC0_NONE.  v57 only ever looked at cmds[0], so an MC0 vote that
+ * the voter packed behind other BCMs produced no trigger record at all and
+ * the ring showed a completed transaction with no visible trigger.
+ *
+ * One pass over at most MAX_RPMH_PAYLOAD (16) entries, no allocation, called
+ * once per batch from rpmh_rsc_send_data().
+ */
+u32 j716f_vote_scan_mc0(const struct tcs_request *msg)
+{
+	u32 mc0 = READ_ONCE(j716f_mc0_addr);
+	u32 i;
+
+	if (!mc0 || !msg || !msg->cmds)
+		return J716F_VOTE_MC0_NONE;
+
+	for (i = 0; i < msg->num_cmds && i < MAX_RPMH_PAYLOAD; i++)
+		if (msg->cmds[i].addr == mc0)
+			return i;
+	return J716F_VOTE_MC0_NONE;
+}
+EXPORT_SYMBOL_GPL(j716f_vote_scan_mc0);
+
+/**
+ * j716f_vote_record_tcs - record one TCS trigger boundary for a batch
+ * @kind: TCS_PRE or TCS_POKED
+ * @msg: the batch being triggered
+ * @tcs: the TCS id it was assigned
+ *
+ * The record is emitted once per batch, not once per command: a batch is one
+ * hardware trigger, so one record is the honest granularity.  It carries the
+ * MC0 command's index, address and data word, so a batch where MC0 sat in the
+ * middle is still recognisable, plus the batch size and whether a response
+ * was requested.
+ *
+ * Also counts the trigger on the in-flight transaction.  It is a counter, not
+ * a flag: one icc_set_bw() can commit several times (apply_constraints() runs
+ * once per provider along the path, and a wide commit splits into more than
+ * one TCS batch), and the entry must not be freed by the first RECLAIM while
+ * a second trigger is still outstanding.
+ */
+void j716f_vote_record_tcs(enum j716f_vote_kind kind,
+			   const struct tcs_request *msg, u32 tcs)
+{
+	struct j716f_mc0_tx *t;
+	unsigned long flags;
+	u32 idx, aux, addr, data;
+
+	if (!READ_ONCE(vote_trace) || !msg)
+		return;
+
+	idx = j716f_vote_scan_mc0(msg);
+	/*
+	 * Batches without MC0 are not recorded at all.  The DPU commits ~120
+	 * batches/s; one trigger record each would wrap the general ring in
+	 * half a second and bury the MC0 evidence this diagnostic exists for.
+	 * Their TCS registers are still printed by the RSC dump.
+	 */
+	if (idx == J716F_VOTE_MC0_NONE)
+		return;
+
+	addr = msg->cmds[idx].addr;
+	data = msg->cmds[idx].data;
+	aux = (msg->num_cmds & 0xffu) |
+	      ((msg->wait_for_compl ? 1u : 0u) << 8) |
+	      (idx << 16);
+
+	j716f_vote_record(kind, msg->j716f_txid, addr, data, tcs, aux);
+
+	if (!msg->j716f_txid)
+		return;
+
+	spin_lock_irqsave(&j716f_mc0_tx_lock, flags);
+	t = j716f_mc0_tx_find(msg->j716f_txid);
+	if (t) {
+		t->tcs = tcs;
+		t->mc0_idx = idx;
+		t->addr = addr;
+		t->data = data;
+		if (kind == J716F_VOTE_KIND_TCS_POKED) {
+			if (t->pending != U32_MAX)
+				t->pending++;
+			t->trig_ts = j716f_now();
+		}
+	}
+	spin_unlock_irqrestore(&j716f_mc0_tx_lock, flags);
+}
+EXPORT_SYMBOL_GPL(j716f_vote_record_tcs);
+
+/**
+ * j716f_vote_tx_release - one MC0 trigger of a transaction was reclaimed
+ * @txid: transaction id read from drv->txid[] by the handler
+ *
+ * Decrements the outstanding-trigger count and frees the entry only when the
+ * last one is reclaimed.  A transaction that never completes therefore keeps
+ * its entry (and its provenance) forever, which is exactly the case a hang
+ * dump must show.
+ *
+ * A RECLAIM for an id that is not tracked is NOT an error and is not counted:
+ * the handler runs for every RPMh transaction, and the overwhelming majority
+ * never touched MC0.  v57 would have had to guess here; this version simply
+ * has nothing to do.
+ */
+void j716f_vote_tx_release(u32 txid)
+{
+	struct j716f_mc0_tx *t;
+	unsigned long flags;
+
+	if (!READ_ONCE(vote_trace) || !txid)
+		return;
+
+	spin_lock_irqsave(&j716f_mc0_tx_lock, flags);
+	t = j716f_mc0_tx_find(txid);
+	if (t) {
+		if (t->pending > 1)
+			t->pending--;
+		else
+			memset(t, 0, sizeof(*t));
+	}
+	spin_unlock_irqrestore(&j716f_mc0_tx_lock, flags);
+}
+EXPORT_SYMBOL_GPL(j716f_vote_tx_release);
 
 /**
  * j716f_vote_decode - decode one BCM TCS data word
@@ -713,6 +1079,7 @@ static const char *j716f_vote_kind_name(u32 kind)
 {
 	switch (kind) {
 	case J716F_VOTE_KIND_REQ:	return "req";
+	case J716F_VOTE_KIND_REQ_MC0:	return "req-mc0";
 	case J716F_VOTE_KIND_AGG:	return "agg";
 	case J716F_VOTE_KIND_TCS_PRE:	return "tcs-pre";
 	case J716F_VOTE_KIND_TCS_POKED:	return "tcs-poked";
@@ -722,94 +1089,209 @@ static const char *j716f_vote_kind_name(u32 kind)
 	}
 }
 
+/*
+ * Ring dump (M20-P1c).
+ *
+ * v57 bracketed the chunks with the ring generation and required
+ * "gen_after - gen_before == off + n".  That test cannot work: the generation
+ * also advances while the previous chunk is being *printed*, so under any
+ * real load it reports "snapshot inconsistent" for a perfectly coherent ring;
+ * and if the advancement happened to equal n it would call a mixed window
+ * coherent.  It measured the wrong thing.
+ *
+ * What actually identifies a record is its own sequence number, which the
+ * writer assigns from a counter that only ever increases.  Each copied slot
+ * must hold exactly the seq we expect for that ring position; a recycled slot
+ * holds a strictly larger one.  So:
+ *
+ *   - a slot whose seq does not match was overwritten -> the printed set is
+ *     NOT the window we started from -> "snapshot inconsistent";
+ *   - a slot that matches is that record, byte for byte, whenever it was
+ *     printed;
+ *   - the generation delta is reported separately as "moved", because a ring
+ *     that advanced but whose slots all still match is a coherent set from a
+ *     sliding window, not a corrupt one.
+ *
+ * The copy is 8 records at a time under trylock, so the stack stays small and
+ * a wedged writer can never block the dump.
+ */
 static void j716f_vote_dump_ring(struct j716f_vote_ring *r, const char *tag,
-				 bool is_mc0, u64 now)
+				 u64 now)
 {
-	/*
-	 * Copy a bounded chunk at a time rather than the whole ring onto the
-	 * stack: at 64 records a full slab is 4 KiB, which the compiler
-	 * rightly rejects for a function that may run in the panic path.
-	 *
-	 * M20-P1b: chunks are bracketed by the ring generation.  v56 released
-	 * the lock between chunks, so a writer could wrap the ring mid-dump
-	 * and the printed lines would silently mix two different time
-	 * windows.  Every chunk now records the generation before and after
-	 * the copy, and the sequence numbers are checked to be consecutive;
-	 * any mismatch marks the whole snapshot inconsistent.
-	 */
 	struct j716f_vote_rec chunk[8];
 	unsigned long flags;
-	u32 i, n, count, start, lost, off;
-	u32 gen_before, gen_after;
+	u32 i, n, count, start, lost, off, gen_start, gen_now, moved;
+	u32 lost_now;
 	bool inconsistent = false;
-	u32 expect_seq = 0;
-	bool have_expect = false;
-
-	(void)is_mc0;
+	bool busy = false;
 
 	if (!spin_trylock_irqsave(&r->lock, flags)) {
-		pr_info("J716F VOTE %s: ring lock busy, records skipped\n", tag);
+		pr_info("J716F VOTE %s: ring lock busy, records skipped (undecidable)\n",
+			tag);
 		return;
 	}
 	count = r->count;
 	lost = r->overwritten;
-	gen_before = r->generation;
-	start = (r->head - count) & (J716F_VOTE_RING - 1);
+	gen_start = r->generation;
+	/*
+	 * The writer assigns seq = count + overwritten, i.e. a global push
+	 * counter, and stores at slot seq & (RING-1).  The oldest record still
+	 * present is therefore seq == overwritten; using the global counter
+	 * (not the masked head) is what makes the per-slot check below exact.
+	 */
+	start = lost;
 	spin_unlock_irqrestore(&r->lock, flags);
-
-	pr_info("J716F VOTE %s: %u/%u records, %u overwritten, gen=%u%s\n",
-		tag, count, J716F_VOTE_RING, lost, gen_before,
-		lost ? " (history truncated)" : "");
 
 	for (off = 0; off < count; off += n) {
 		n = min_t(u32, ARRAY_SIZE(chunk), count - off);
 
 		if (!spin_trylock_irqsave(&r->lock, flags)) {
-			pr_info("J716F VOTE %s: lock busy after %u records, snapshot inconsistent\n",
-				tag, off);
+			pr_info("J716F VOTE %s: lock busy after %u of %u records (undecidable)\n",
+				tag, off, count);
+			busy = true;
 			inconsistent = true;
 			break;
 		}
-		gen_after = r->generation;
-		/* The ring must not have moved by more than the chunk we take. */
-		if (gen_after - gen_before != 0 && gen_after - gen_before != off + n)
-			inconsistent = true;
-		for (i = 0; i < n; i++)
-			chunk[i] = r->rec[(start + off + i) &
-					  (J716F_VOTE_RING - 1)];
-		spin_unlock_irqrestore(&r->lock, flags);
-
-		/*
-		 * seq is a monotonically increasing per-record counter.  If the
-		 * copied records are not consecutive, the window was disturbed.
-		 */
 		for (i = 0; i < n; i++) {
-			if (have_expect && chunk[i].seq != expect_seq)
+			u32 pos = (start + off + i) & (J716F_VOTE_RING - 1);
+
+			chunk[i] = r->rec[pos];
+			/*
+			 * The slot must still hold the record that belongs at
+			 * this sequence number.  Anything else means it was
+			 * recycled between the header read and this copy.
+			 */
+			if (chunk[i].seq != start + off + i)
 				inconsistent = true;
-			expect_seq = chunk[i].seq + 1;
-			have_expect = true;
 		}
+		spin_unlock_irqrestore(&r->lock, flags);
 
 		for (i = 0; i < n; i++) {
 			const struct j716f_vote_rec *v = &chunk[i];
-			const char *cls = v->addr == 0 && !v->txid ? "unattr" :
-					  "tx";
+			const char *cls = !v->txid ? "unattr" : "tx";
+			u32 aux = v->aux;
 
-			pr_info("J716F VOTE %s %-9s tx=%u seq=%u %s cpu%u pid=%u comm=%s addr=0x%x tcs=%d data=0x%08x aux=0x%x age=%llums\n",
-				tag, j716f_vote_kind_name(v->kind), v->txid,
-				v->seq, cls, v->cpu, v->pid, v->comm, v->addr,
-				v->tcs == J716F_VOTE_NO_TCS ? -1 : (int)v->tcs,
-				v->data, v->aux,
-				j716f_age(now, v->ts) / NSEC_PER_MSEC);
+			/*
+			 * TCS records pack the batch layout into aux; spell it
+			 * out so "MC0 was command 5 of 9" cannot be misread as
+			 * "MC0 was the trigger command".
+			 */
+			if (v->kind == J716F_VOTE_KIND_TCS_PRE ||
+			    v->kind == J716F_VOTE_KIND_TCS_POKED)
+				pr_info("J716F VOTE %s %-9s tx=%u seq=%u %s cpu%u pid=%u comm=%s addr=0x%x tcs=%d data=0x%08x cmds=%u mc0=%d wait=%u age=%llums\n",
+					tag, j716f_vote_kind_name(v->kind), v->txid,
+					v->seq, cls, v->cpu, v->pid, v->comm,
+					v->addr,
+					v->tcs == J716F_VOTE_NO_TCS ? -1 : (int)v->tcs,
+					v->data,
+					J716F_VOTE_AUX_NCMDS(aux),
+					J716F_VOTE_AUX_MC0IDX(aux) == J716F_VOTE_MC0_NONE ?
+						-1 : (int)J716F_VOTE_AUX_MC0IDX(aux),
+					J716F_VOTE_AUX_WAIT(aux),
+					j716f_age(now, v->ts) / NSEC_PER_MSEC);
+			else
+				pr_info("J716F VOTE %s %-9s tx=%u seq=%u %s cpu%u pid=%u comm=%s addr=0x%x tcs=%d data=0x%08x aux=0x%x age=%llums\n",
+					tag, j716f_vote_kind_name(v->kind), v->txid,
+					v->seq, cls, v->cpu, v->pid, v->comm,
+					v->addr,
+					v->tcs == J716F_VOTE_NO_TCS ? -1 : (int)v->tcs,
+					v->data, aux,
+					j716f_age(now, v->ts) / NSEC_PER_MSEC);
 		}
 	}
 
+	if (!spin_trylock_irqsave(&r->lock, flags)) {
+		gen_now = gen_start;
+		lost_now = lost;
+		moved = 0;
+		inconsistent = true;
+	} else {
+		gen_now = r->generation;
+		lost_now = r->overwritten;
+		moved = gen_now - gen_start;
+		spin_unlock_irqrestore(&r->lock, flags);
+	}
+
+	pr_info("J716F VOTE %s: %u/%u records, %u overwritten, gen=%u..%u moved=%u lost_during_dump=%u%s%s%s\n",
+		tag, count, J716F_VOTE_RING, lost, gen_start, gen_now, moved,
+		lost_now - lost,
+		lost ? " (history truncated)" : "",
+		moved ? " (window advanced)" : "",
+		busy ? " (ring lock busy)" : "");
+
 	/*
 	 * Say it loudly and last, so it is not missed between record lines.
-	 */
-	if (inconsistent)
-		pr_info("J716F VOTE %s: snapshot inconsistent (records may span two windows)\n",
+	 * A record that failed its seq check is not this window's record, so
+	 * the whole printed set is unusable for causal reasoning.
+	 */	if (inconsistent)
+		pr_info("J716F VOTE %s: snapshot inconsistent (records may span two windows) - undecidable\n",
 			tag);
+}
+
+/*
+ * In-flight MC0 transactions.
+ *
+ * This is the part that survives a hang.  A transaction whose TCS was never
+ * reclaimed keeps its slot, so its client provenance, its trigger time and its
+ * TCS id are still there no matter how much later traffic filled the rings.
+ *
+ * Copied and printed 8 entries at a time: the whole table is ~3 KiB, and this
+ * runs in the panic path where a large stack frame is not acceptable.
+ */
+#define J716F_VOTE_INFLIGHT_CHUNK	8
+
+static void j716f_vote_dump_inflight(u64 now)
+{
+	struct j716f_mc0_tx chunk[J716F_VOTE_INFLIGHT_CHUNK];
+	unsigned long flags;
+	u32 i, off, n, live = 0;
+	u32 overflow = (u32)atomic_read(&j716f_mc0_tx_overflow);
+	u32 unattr = (u32)atomic_read(&j716f_vote_agg_unattr);
+	bool busy = false;
+
+	if (!spin_trylock_irqsave(&j716f_mc0_tx_lock, flags)) {
+		pr_info("J716F VOTE inflight: table lock busy, entries skipped (undecidable)\n");
+		return;
+	}
+	for (i = 0; i < J716F_VOTE_MC0_TX_LEN; i++)
+		if (j716f_mc0_txs[i].txid)
+			live++;
+	spin_unlock_irqrestore(&j716f_mc0_tx_lock, flags);
+
+	pr_info("J716F VOTE inflight: %u/%u slots in use, overflow=%u unattr_commits=%u%s\n",
+		live, J716F_VOTE_MC0_TX_LEN, overflow, unattr,
+		overflow ? " (MC0 batch not tracked: table full)" : "");
+
+	for (off = 0; off < J716F_VOTE_MC0_TX_LEN; off += n) {
+		n = min_t(u32, J716F_VOTE_INFLIGHT_CHUNK,
+			  J716F_VOTE_MC0_TX_LEN - off);
+
+		if (!spin_trylock_irqsave(&j716f_mc0_tx_lock, flags)) {
+			pr_info("J716F VOTE inflight: lock busy after %u entries (undecidable)\n",
+				off);
+			busy = true;
+			break;
+		}
+		memcpy(chunk, &j716f_mc0_txs[off], n * sizeof(chunk[0]));
+		spin_unlock_irqrestore(&j716f_mc0_tx_lock, flags);
+
+		for (i = 0; i < n; i++) {
+			const struct j716f_mc0_tx *t = &chunk[i];
+
+			if (!t->txid)
+				continue;
+			pr_info("J716F VOTE inflight tx=%u pid=%u comm=%s cpu%u path=%s avg=%u peak=%u tcs=%d triggers=%u mc0=%d addr=0x%x data=0x%08x req_age=%llums trig_age=%llums\n",
+				t->txid, t->pid, t->comm, t->cpu, t->path,
+				t->avg_bw, t->peak_bw,
+				t->pending, t->tcs,
+				t->mc0_idx == J716F_VOTE_MC0_NONE ? -1 : (int)t->mc0_idx,
+				t->addr, t->data,
+				t->req_ts ? j716f_age(now, t->req_ts) / NSEC_PER_MSEC : 0,
+				t->trig_ts ? j716f_age(now, t->trig_ts) / NSEC_PER_MSEC : 0);
+		}
+	}
+	if (busy)
+		pr_info("J716F VOTE inflight: snapshot incomplete - undecidable\n");
 }
 
 /**
@@ -818,6 +1300,8 @@ static void j716f_vote_dump_ring(struct j716f_vote_ring *r, const char *tag,
  * The MC0 ring is printed first: it is the one that survives a per-frame
  * vote burst, so it is the set to reason from.  The general ring is printed
  * for context and may be heavily truncated, which the loss count states.
+ * The in-flight table comes last because it is the only source that is not
+ * subject to ring wrap at all.
  */
 void j716f_vote_dump(void)
 {
@@ -826,8 +1310,9 @@ void j716f_vote_dump(void)
 	pr_info("J716F VOTE dump: mc0_addr=0x%x txid_next=%d\n",
 		READ_ONCE(j716f_mc0_addr),
 		atomic_read(&j716f_vote_txid));
-	j716f_vote_dump_ring(&j716f_votes_mc0, "mc0", true, now);
-	j716f_vote_dump_ring(&j716f_votes, "all", false, now);
+	j716f_vote_dump_ring(&j716f_votes_mc0, "mc0", now);
+	j716f_vote_dump_ring(&j716f_votes, "all", now);
+	j716f_vote_dump_inflight(now);
 }
 EXPORT_SYMBOL_GPL(j716f_vote_dump);
 

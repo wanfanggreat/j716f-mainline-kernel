@@ -752,14 +752,36 @@ int icc_set_bw(struct icc_path *path, u32 avg_bw, u32 peak_bw)
 	 *   - a later failure retry: that "apply_constraints(path)" call is a
 	 *     rollback of an already-recorded request, not a new transaction.
 	 * Both get txid 0, which the dump reports as unattributable.
+	 *
+	 * M20-P1c: hand the client's provenance to the voter before it runs.
+	 *
+	 * The promoted MC0 record cannot be written here: at this point nothing
+	 * knows yet whether the batch will contain MC0 (the voter may drop the
+	 * BCM, another client may be the one that keeps it alive, and the
+	 * commit that actually carries MC0 may be triggered by a different
+	 * icc_set_bw()).  So this only stashes the values; the voter promotes
+	 * them into a durable record when it sees MC0 in the batch.
+	 *
+	 * Only on an actual change: a no-op set re-runs the voter without a new
+	 * request, and those commits must not be attributed to anybody.
 	 */
 	txid = 0;
 	if (old_avg != avg_bw || old_peak != peak_bw) {
 		node = path->reqs[path->num_nodes - 1].node;
 		txid = j716f_vote_alloc_txid();
-		j716f_vote_record(J716F_VOTE_KIND_REQ, txid, 0, peak_bw,
-				   J716F_VOTE_NO_TCS,
-				   (node ? (u32)node->id : 0) | (avg_bw << 16));
+		/*
+		 * Stash only when an id was actually handed out; with
+		 * vote_trace=0 txid is 0 and nothing should be promoted later.
+		 */
+		if (txid) {
+			j716f_vote_note_request(txid, avg_bw, peak_bw,
+						node ? (u32)node->id : 0,
+						path->name);
+			j716f_vote_record(J716F_VOTE_KIND_REQ, txid, 0, peak_bw,
+					   J716F_VOTE_NO_TCS,
+					   (node ? (u32)node->id : 0) |
+					   (avg_bw << 16));
+		}
 	}
 	j716f_vote_set_current_txid(txid);
 

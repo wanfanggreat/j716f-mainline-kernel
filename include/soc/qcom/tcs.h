@@ -63,19 +63,22 @@ struct tcs_request {
 	u32 wait_for_compl;
 	u32 num_cmds;
 	struct tcs_cmd *cmds;
-#ifdef CONFIG_QCOM_J716F_DIAG
 	/*
-	 * J716F M20-P1b diagnostic transaction id.  Travels with the request
-	 * itself instead of a global "current transaction", so a completion
-	 * can only ever be attributed to the request that actually carried
-	 * that id.  0 means "not attributable" and must stay that way rather
-	 * than being filled in from whatever ran last.
+	 * J716F diagnostic transaction id.  Travels with the request itself
+	 * instead of a global "current transaction", so a completion can only
+	 * ever be attributed to the request that actually carried that id.  0
+	 * means "not attributable" and must stay that way rather than being
+	 * filled in from whatever ran last.
 	 *
-	 * This does not affect the RPMh wire protocol: the id is never
-	 * programmed into a register.
+	 * M20-P1c: declared unconditionally, even though only the diagnostic
+	 * uses it.  Guarding it forced every reference in rpmh.c,
+	 * rpmh-rsc.c and bcm-voter.c to be guarded too, which v57 got wrong
+	 * for CONFIG_QCOM_J716F_DIAG=n.  The cost is 8 bytes of padding in
+	 * struct tcs_request (24 -> 32 B), which is a stack/embedded
+	 * structure in the RPMh driver: it is not part of the wire protocol,
+	 * not ABI, and never leaves the kernel.
 	 */
 	u32 j716f_txid;
-#endif
 };
 
 #define BCM_TCS_CMD_COMMIT_MASK		BIT(30)

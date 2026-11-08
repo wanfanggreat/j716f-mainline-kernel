@@ -21,18 +21,15 @@ int rpmh_write_async(const struct device *dev, enum rpmh_state state,
 
 int rpmh_write_batch(const struct device *dev, enum rpmh_state state,
 		     const struct tcs_cmd *cmd, u32 *n);
-#ifdef CONFIG_QCOM_J716F_DIAG
+/*
+ * M20-P1c: always a real symbol.  rpmh.c defines it unconditionally (a plain
+ * wrapper that stamps a software-only field), so the previous "static inline
+ * when the diagnostic is off" version collided with that definition and
+ * CONFIG_QCOM_J716F_DIAG=n failed to build.  Callers with no transaction
+ * context pass 0.
+ */
 int rpmh_write_batch_txid(const struct device *dev, enum rpmh_state state,
 			  const struct tcs_cmd *cmd, u32 *n, u32 txid);
-#else
-static inline int rpmh_write_batch_txid(const struct device *dev,
-					enum rpmh_state state,
-					const struct tcs_cmd *cmd, u32 *n,
-					u32 txid)
-{
-	return rpmh_write_batch(dev, state, cmd, n);
-}
-#endif
 
 void rpmh_invalidate(const struct device *dev);
 

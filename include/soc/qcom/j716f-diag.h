@@ -238,11 +238,6 @@ enum j716f_bc_site {
 #define J716F_BC_F_HARDIRQ	BIT(1)
 #define J716F_BC_F_NMI		BIT(2)
 
-#if IS_ENABLED(CONFIG_QCOM_J716F_DIAG)
-void j716f_bc(enum j716f_bc_site site, unsigned long arg);
-void j716f_bc_quiet(enum j716f_bc_site site, unsigned long arg);
-void j716f_diag_dump(const char *reason);
-
 /*
  * M20-P1 vote provenance.  Kept out of the per-CPU breadcrumb ring because a
  * request on one CPU and the aggregation/commit on another must be readable
@@ -253,6 +248,12 @@ void j716f_diag_dump(const char *reason);
  * not prove:
  *
  *   REQ      a client asked for bandwidth.  Not proof that hardware moved.
+ *   REQ_MC0  the client that triggered a commit whose batch contained an MC0
+ *            command.  It is the TRIGGERING client, not the only contributor:
+ *            the aggregated vote also includes every other client's standing
+ *            request on the same BCM, set earlier.  It is emitted at AGG time
+ *            with the original request's timestamp, so it only appears if the
+ *            transaction really reached MC0.
  *   AGG      the BCM voter merged the request into this value.  The thread
  *            here is the commit thread, not the original consumer.
  *   TCS_PRE  the command buffer is programmed; the trigger is about to be
@@ -269,9 +270,15 @@ void j716f_diag_dump(const char *reason);
  * The hardware completion instant is only bounded: it is after TCS (trigger)
  * and at or before DONE (handler).  Treat DONE as "no later than", never as
  * "the moment hardware finished".
+ *
+ * M20-P1c: this enum lives OUTSIDE the CONFIG_QCOM_J716F_DIAG guard.  The
+ * call sites pass J716F_VOTE_KIND_* to j716f_vote_record(), and the no-op
+ * inline used when the option is off still type-checks its arguments, so a
+ * guarded enum made CONFIG_QCOM_J716F_DIAG=n fail to build.
  */
 enum j716f_vote_kind {
 	J716F_VOTE_KIND_REQ = 1,	/* icc_set_bw(): client request */
+	J716F_VOTE_KIND_REQ_MC0,	/* icc_set_bw(): promoted, tx voted MC0 */
 	J716F_VOTE_KIND_AGG,		/* bcm commit: aggregated value */
 	J716F_VOTE_KIND_TCS_PRE,	/* buffer programmed, trigger not yet */
 	J716F_VOTE_KIND_TCS_POKED,	/* trigger register written (no readback) */
@@ -281,12 +288,42 @@ enum j716f_vote_kind {
 
 #define J716F_VOTE_NO_TCS	0xffffffffu
 
+/*
+ * "No MC0 command in this batch".  A TCS can hold up to MAX_CMDS_PER_TCS (16)
+ * commands, so 0xff cannot collide with a real index.
+ */
+#define J716F_VOTE_MC0_NONE	0xffu
+
+/*
+ * aux encoding shared by the TCS_PRE / TCS_POKED records.  It says where in
+ * the batch MC0 sat, so a dump can tell "MC0 was the trigger command" from
+ * "MC0 was command 5 of 9".
+ */
+#define J716F_VOTE_AUX_NCMDS(a)		((a) & 0xffu)
+#define J716F_VOTE_AUX_WAIT(a)		(((a) >> 8) & 1u)
+#define J716F_VOTE_AUX_MC0IDX(a)	(((a) >> 16) & 0xffu)
+
+struct tcs_request;
+
+#if IS_ENABLED(CONFIG_QCOM_J716F_DIAG)
+void j716f_bc(enum j716f_bc_site site, unsigned long arg);
+void j716f_bc_quiet(enum j716f_bc_site site, unsigned long arg);
+void j716f_diag_dump(const char *reason);
+
 void j716f_vote_set_mc0(u32 addr);
+u32 j716f_vote_mc0_addr(void);
 void j716f_vote_set_current_txid(u32 txid);
 u32 j716f_vote_current_txid(void);
 u32 j716f_vote_alloc_txid(void);
+void j716f_vote_note_request(u32 txid, u32 avg_bw, u32 peak_bw, u32 node_id,
+			     const char *path_name);
+void j716f_vote_mc0_commit(u32 txid, u32 idx, u32 addr, u32 data);
 void j716f_vote_record(enum j716f_vote_kind kind, u32 txid, u32 addr, u32 data,
 		       u32 tcs, u32 aux);
+void j716f_vote_record_tcs(enum j716f_vote_kind kind,
+			   const struct tcs_request *msg, u32 tcs);
+u32 j716f_vote_scan_mc0(const struct tcs_request *msg);
+void j716f_vote_tx_release(u32 txid);
 void j716f_vote_dump(void);
 /*
  * M20-P1 IRQ accounting.  Cheap enough for the RSC completion handler: one
@@ -303,11 +340,20 @@ static inline void j716f_bc(enum j716f_bc_site site, unsigned long arg) { }
 static inline void j716f_bc_quiet(enum j716f_bc_site site, unsigned long arg) { }
 static inline void j716f_diag_dump(const char *reason) { }
 static inline void j716f_vote_set_mc0(u32 addr) { }
+static inline u32 j716f_vote_mc0_addr(void) { return 0; }
 static inline void j716f_vote_set_current_txid(u32 txid) { }
 static inline u32 j716f_vote_current_txid(void) { return 0; }
 static inline u32 j716f_vote_alloc_txid(void) { return 0; }
+static inline void j716f_vote_note_request(u32 txid, u32 avg_bw, u32 peak_bw,
+					   u32 node_id, const char *path_name) { }
+static inline void j716f_vote_mc0_commit(u32 txid, u32 idx, u32 addr, u32 data) { }
 static inline void j716f_vote_record(enum j716f_vote_kind kind, u32 txid,
 				     u32 addr, u32 data, u32 tcs, u32 aux) { }
+static inline void j716f_vote_record_tcs(enum j716f_vote_kind kind,
+					 const struct tcs_request *msg, u32 tcs) { }
+static inline u32 j716f_vote_scan_mc0(const struct tcs_request *msg)
+{ return J716F_VOTE_MC0_NONE; }
+static inline void j716f_vote_tx_release(u32 txid) { }
 static inline void j716f_vote_dump(void) { }
 static inline void j716f_irq_enter(int irq) { }
 static inline void j716f_irq_exit(int irq) { }
