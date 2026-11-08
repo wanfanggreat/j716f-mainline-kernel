@@ -143,6 +143,13 @@ enum j716f_bc_site {
 	J716F_BC_FORK_WAKE_EXIT,
 	J716F_BC_PAGE_FREE_LIST_ENTER,
 	J716F_BC_PAGE_FREE_LIST_EXIT,
+	/*
+	 * Written immediately after the exit breadcrumb.  If the exit record
+	 * is the last one and this RET is missing, the CPU stopped in the
+	 * exit breadcrumb's preempt_enable() (a scheduling point) or in the
+	 * first instructions after the record, not in free_unref_folios().
+	 */
+	J716F_BC_PAGE_FREE_LIST_RET,
 	J716F_BC_PAGE_FREE_PCP_ENTER,
 	J716F_BC_PAGE_FREE_PCP_EXIT,
 	J716F_BC_TLB_BATCHED_ENTER,
@@ -155,6 +162,10 @@ enum j716f_bc_site {
 	/* Cortex-A77 1542418 ASID rollover workaround (M17) */
 	J716F_BC_A77_ASID_WORKAROUND_ENTER,
 	J716F_BC_A77_ASID_WORKAROUND_EXIT,
+
+	/* preemption path (M18): did the exit breadcrumb enter __schedule? */
+	J716F_BC_PREEMPT_SCHED_ENTER,
+	J716F_BC_PREEMPT_SCHED_EXIT,
 
 	J716F_BC_MAX,
 };

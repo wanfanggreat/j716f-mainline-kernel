@@ -81,6 +81,8 @@
 #include <asm/switch_to.h>
 #include <asm/tlb.h>
 
+#include <soc/qcom/j716f-diag.h>
+
 #define CREATE_TRACE_POINTS
 #include <linux/sched/rseq_api.h>
 #include <trace/events/sched.h>
@@ -7459,9 +7461,17 @@ static void __sched notrace preempt_schedule_common(void)
 		 * which can also be traced by the function tracer.
 		 */
 		preempt_disable_notrace();
+		/*
+		 * The free_unref_folios() exit breadcrumb (and any other exit
+		 * breadcrumb) can reach here from preempt_enable().  If the
+		 * CPU stops in __schedule(), ENTER is the last record and
+		 * EXIT is missing.
+		 */
+		j716f_bc(J716F_BC_PREEMPT_SCHED_ENTER, 0);
 		preempt_latency_start(1);
 		__schedule(SM_PREEMPT);
 		preempt_latency_stop(1);
+		j716f_bc(J716F_BC_PREEMPT_SCHED_EXIT, 0);
 		preempt_enable_no_resched_notrace();
 
 		/*

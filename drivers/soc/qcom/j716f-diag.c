@@ -272,6 +272,7 @@ static const char *const j716f_bc_names[J716F_BC_MAX] = {
 	[J716F_BC_FORK_WAKE_EXIT]	= "wake_new_task_exit",
 	[J716F_BC_PAGE_FREE_LIST_ENTER]	= "free_unref_folios_enter",
 	[J716F_BC_PAGE_FREE_LIST_EXIT]	= "free_unref_folios_exit",
+	[J716F_BC_PAGE_FREE_LIST_RET]	= "free_unref_folios_ret",
 	[J716F_BC_PAGE_FREE_PCP_ENTER]	= "free_pcppages_bulk_enter",
 	[J716F_BC_PAGE_FREE_PCP_EXIT]	= "free_pcppages_bulk_exit",
 	[J716F_BC_TLB_BATCHED_ENTER]	= "tlb_batched_enter",
@@ -281,6 +282,8 @@ static const char *const j716f_bc_names[J716F_BC_MAX] = {
 	[J716F_BC_IDLE_EXIT]		= "idle_exit",
 	[J716F_BC_A77_ASID_WORKAROUND_ENTER] = "a77_asid_wa_enter",
 	[J716F_BC_A77_ASID_WORKAROUND_EXIT]  = "a77_asid_wa_exit",
+	[J716F_BC_PREEMPT_SCHED_ENTER]	= "preempt_sched_enter",
+	[J716F_BC_PREEMPT_SCHED_EXIT]	= "preempt_sched_exit",
 };
 
 static const char *j716f_bc_name(u32 site)

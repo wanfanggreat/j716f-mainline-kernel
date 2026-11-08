@@ -3104,6 +3104,12 @@ void free_unref_folios(struct folio_batch *folios)
 	if (pcp)
 		pcp_spin_unlock(pcp);
 	j716f_bc(J716F_BC_PAGE_FREE_LIST_EXIT, (unsigned long)folios);
+	/*
+	 * A second record immediately after the exit: if a freeze stops in
+	 * the exit breadcrumb's preempt_enable(), this RET is missing and the
+	 * page-free path itself is exonerated.
+	 */
+	j716f_bc(J716F_BC_PAGE_FREE_LIST_RET, (unsigned long)folios);
 	folio_batch_reinit(folios);
 }
 
