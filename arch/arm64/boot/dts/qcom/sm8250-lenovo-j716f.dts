@@ -1200,16 +1200,22 @@
 	phy-names = "usb2-phy";
 	usb-role-switch;
 
-	ports {
-		#address-cells = <1>;
-		#size-cells = <0>;
+	/*
+	 * Vendor firmware does not use the PM8150B Type-C CC engine for
+	 * role detection on this board.  The port ID pin is wired to TLMM
+	 * GPIO91 (low = host) and the external VBUS boost enable to PM8150
+	 * GPIO9.  Model that with the generic GPIO connector so Linux
+	 * follows the same path instead of waiting for a TCPM CC partner.
+	 */
+	connector {
+		compatible = "gpio-usb-b-connector", "usb-b-connector";
 
-		port@0 {
-			reg = <0>;
+		id-gpios = <&tlmm 91 GPIO_ACTIVE_HIGH>;
+		vbus-gpios = <&pm8150_gpios 10 GPIO_ACTIVE_HIGH>;
+		vbus-supply = <&j716f_usb_vbus>;
 
-			usb_2_dwc3_hs_out: endpoint {
-			};
-		};
+		pinctrl-names = "default";
+		pinctrl-0 = <&usb2_vbus_det_default>;
 	};
 };
 
@@ -1217,44 +1223,14 @@
 	status = "okay";
 };
 
+/*
+ * The PM8150B Type-C engine is not used for this port: the board's ID and
+ * VBUS-boost signals are plain GPIOs handled by the connector node under
+ * &usb_2_dwc3.  Keep the PMIC block disabled so TCPM cannot take over the
+ * DWC3 role switch.
+ */
 &pm8150b_typec {
-	vdd-pdphy-supply = <&vreg_l2a_3p1>;
-	status = "okay";
-
-	connector {
-		compatible = "usb-c-connector";
-
-		op-sink-microwatt = <10000000>;
-		power-role = "dual";
-		data-role = "dual";
-		self-powered;
-
-		vbus-supply = <&j716f_usb_vbus>;
-
-		source-pdos = <PDO_FIXED(5000, 1500,
-					 PDO_FIXED_DUAL_ROLE |
-					 PDO_FIXED_USB_COMM |
-					 PDO_FIXED_DATA_SWAP)>;
-
-		sink-pdos = <PDO_FIXED(5000, 3000,
-				       PDO_FIXED_DUAL_ROLE |
-				       PDO_FIXED_USB_COMM |
-				       PDO_FIXED_DATA_SWAP)
-				       PDO_VAR(5000, 12000, 5000)>;
-
-		ports {
-			#address-cells = <1>;
-			#size-cells = <0>;
-
-			port@0 {
-				reg = <0>;
-
-				pm8150b_hs_in: endpoint {
-					remote-endpoint = <&usb_2_dwc3_hs_out>;
-				};
-			};
-		};
-	};
+	status = "disabled";
 };
 
 &pm8150b_vbus {
