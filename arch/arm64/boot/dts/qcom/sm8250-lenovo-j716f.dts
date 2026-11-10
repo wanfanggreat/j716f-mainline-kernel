@@ -1128,8 +1128,8 @@
 &usb_1_dwc3 {
 	dr_mode = "otg";
 	maximum-speed = "high-speed";
-	phys = <&usb_1_hsphy>;
-	phy-names = "usb2-phy";
+	phys = <&usb_1_hsphy>, <&usb_1_qmpphy QMP_USB43DP_USB3_PHY>;
+	phy-names = "usb2-phy", "usb3-phy";
 	usb-role-switch;
 };
 
@@ -1151,8 +1151,7 @@
 	vdda-phy-supply = <&vreg_l9a_1p2>;
 	vdda-pll-supply = <&vreg_l18a_0p9>;
 
-	/* USB 2.0 only; the Type-C role switch lives in the PMIC. */
-	status = "disabled";
+	status = "okay";
 };
 
 &pm8150b_typec {
