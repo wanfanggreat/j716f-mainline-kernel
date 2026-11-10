@@ -197,6 +197,22 @@
 	};
 };
 
+/*
+ * Candidate K1 of the v60 platform audit: the vendor tree keeps
+ * 0x80b00000 + 0x5700000 (87 MiB) out of the allocator and ends that
+ * range exactly where the TrustZone carveout ends -- 0x86200000, i.e.
+ * qseecom@82400000 + 0x3e00000 ("TZApps Reserved" in the XBL EFI
+ * memory map, "secapp-region" in the vendor DT).  The imported upstream
+ * value stops 4 MiB short and leaves [0x85e00000, 0x86200000)
+ * allocatable by Linux.  Restore the vendor extent; this is the only
+ * variable the validation round changes.
+ *
+ * See docs/project/V60-PLATFORM-AUDIT.md, candidate K1.
+ */
+&removed_mem {
+	reg = <0x0 0x80b00000 0x0 0x5700000>;
+};
+
 &adsp {
 	firmware-name = "qcom/sm8250/LENOVO/J716F/adsp.mbn";
 	status = "okay";
