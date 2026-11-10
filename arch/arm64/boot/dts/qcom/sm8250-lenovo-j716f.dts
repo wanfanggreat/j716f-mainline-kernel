@@ -137,10 +137,11 @@
 	};
 
 	/*
-	 * The USB-C port is wired to the first DWC3 controller (a600000)
-	 * on this board.  Vendor firmware drives PM8150 GPIO9 high to enable
-	 * the external 5 V boost when the port is in host mode; the boost is
-	 * powered from the always-on battery rail, not the PM8150B OTG block.
+	 * ZUI wires the USB-C port to USB0 (a600000) and uses the PM8150B
+	 * SMB5/PD-PHY Type-C path for role and VBUS.  PM8150 GPIO9 and the
+	 * extcon_usb1 node in the vendor DT belong to the separate USB1
+	 * (a800000) port, not to the external USB-C connector.  Keep this
+	 * fixed regulator only as a documented spare for USB1 bring-up.
 	 */
 	j716f_usb_vbus: regulator-usb-vbus {
 		compatible = "regulator-fixed";
@@ -154,6 +155,7 @@
 		vin-supply = <&vph_pwr>;
 		pinctrl-names = "default";
 		pinctrl-0 = <&usb2_vbus_boost_default>;
+		status = "disabled";
 	};
 
 	qca6390-pmu {
@@ -1151,11 +1153,11 @@
 };
 
 /*
- * USB0 (a600000) is the controller wired to the USB-C port.  Vendor
- * firmware switches this same controller between peripheral and host;
- * the port ID is TLMM GPIO91 (low = host) and the external VBUS boost
- * enable is PM8150 GPIO9.  Model that with the generic GPIO connector
- * instead of the PM8150B Type-C CC engine.
+ * ZUI drives USB0 (a600000) as the USB-C controller: the same DWC3 core
+ * is peripheral with the Mac cable and host with the mouse, while USB1
+ * (a800000) stays unused.  Its vendor DT attaches the PD-PHY extcon to
+ * USB0 and the GPIO91-based extcon_usb1 to USB1.  Mainline models the
+ * same USB0 path with TCPM and the PM8150B Type-C connector below.
  */
 &usb_1 {
 	qcom,select-utmi-as-pipe-clk;
@@ -1168,17 +1170,10 @@
 	phys = <&usb_1_hsphy>;
 	phy-names = "usb2-phy";
 	usb-role-switch;
+};
 
-	connector {
-		compatible = "gpio-usb-b-connector", "usb-b-connector";
-
-		id-gpios = <&tlmm 91 GPIO_ACTIVE_HIGH>;
-		vbus-gpios = <&pm8150_gpios 10 GPIO_ACTIVE_HIGH>;
-		vbus-supply = <&j716f_usb_vbus>;
-
-		pinctrl-names = "default";
-		pinctrl-0 = <&usb2_vbus_det_default>;
-	};
+&usb_1_dwc3_hs_out {
+	remote-endpoint = <&pm8150b_hs_in>;
 };
 
 &usb_1_hsphy {
@@ -1209,13 +1204,49 @@
 };
 
 /*
- * The PM8150B Type-C engine is not used for this port: the board's ID and
- * VBUS-boost signals are plain GPIOs handled by the connector node under
- * &usb_1_dwc3.  Keep the PMIC block disabled so TCPM cannot take over the
- * DWC3 role switch.
+ * ZUI's SMB5 + qpnp-pdphy pair owns the USB-C role and VBUS.  Mainline's
+ * equivalent is the PM8150B Type-C engine: TCPM drives the USB0 role
+ * switch through the connector graph and enables the PM8150B OTG boost
+ * as a source.  This is the USB-C path; USB1's GPIO extcon is unrelated.
  */
 &pm8150b_typec {
-	status = "disabled";
+	vdd-pdphy-supply = <&vreg_l2a_3p1>;
+	status = "okay";
+
+	connector {
+		compatible = "usb-c-connector";
+
+		op-sink-microwatt = <10000000>;
+		power-role = "dual";
+		data-role = "dual";
+		self-powered;
+
+		vbus-supply = <&pm8150b_vbus>;
+
+		source-pdos = <PDO_FIXED(5000, 1500,
+					 PDO_FIXED_DUAL_ROLE |
+					 PDO_FIXED_USB_COMM |
+					 PDO_FIXED_DATA_SWAP)>;
+
+		sink-pdos = <PDO_FIXED(5000, 3000,
+				       PDO_FIXED_DUAL_ROLE |
+				       PDO_FIXED_USB_COMM |
+				       PDO_FIXED_DATA_SWAP)
+				       PDO_VAR(5000, 12000, 5000)>;
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@0 {
+				reg = <0>;
+
+				pm8150b_hs_in: endpoint {
+					remote-endpoint = <&usb_1_dwc3_hs_out>;
+				};
+			};
+		};
+	};
 };
 
 &pm8150b_vbus {
