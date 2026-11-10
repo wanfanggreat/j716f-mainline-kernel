@@ -27,6 +27,9 @@
 #define OTG_USBIN_COLLAPSE_FAULT_EN	BIT(4)
 #define DCDC_FSW_SEL			0x50
 #define DCDC_FSW_800KHZ			0x0b
+#define DCDC_ENG_SDCDC_CFG5		0xC4
+#define ENG_SDCDC_BAT_HPWR_MASK		GENMASK(7, 6)
+#define BOOST_MODE_THRESH_3P6_V		0xC0
 
 #define PM4125_VBOOST_EN		0x50
 #define PM4125_VBOOST_SEL		0x52
@@ -184,8 +187,18 @@ static int qcom_usb_vbus_regulator_probe(struct platform_device *pdev)
 	 * before enabling OTG.  PM8150B powers up at a different frequency;
 	 * select the same value the vendor charger uses for host mode.
 	 */
-	if (data == &pm8150b_data)
+	if (data == &pm8150b_data) {
 		regmap_write(regmap, base + DCDC_FSW_SEL, DCDC_FSW_800KHZ);
+
+		/*
+		 * Downstream SMB5 selects the 3.6 V battery boost threshold in
+		 * DCDC_ENG_SDCDC_CFG5.  PM8150B powers up with a different
+		 * threshold, which keeps the OTG boost from regulating.
+		 */
+		regmap_update_bits(regmap, base + DCDC_ENG_SDCDC_CFG5,
+				   ENG_SDCDC_BAT_HPWR_MASK,
+				   BOOST_MODE_THRESH_3P6_V);
+	}
 
 	/*
 	 * PM8150B powers up with DIS_OTG_ON_TLIM set.  The downstream SMB5
