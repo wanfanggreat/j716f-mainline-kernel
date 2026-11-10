@@ -19,7 +19,6 @@
 #define OTG_CURRENT_LIMIT_MASK		GENMASK(2, 0)
 #define OTG_CFG				0x53
 #define OTG_EN_SRC_CFG			BIT(1)
-#define OTG_DIS_OTG_ON_TLIM		BIT(5)
 
 #define PM4125_VBOOST_EN		0x50
 #define PM4125_VBOOST_SEL		0x52
@@ -31,7 +30,6 @@ struct qcom_usb_vbus_reg_data {
 	u16 cmd_otg;
 	u16 otg_cfg;
 	u8  otg_en_src_cfg;
-	u8  otg_dis_tlim_mask;
 	u16 csel_reg;
 	u8 csel_mask;
 	const unsigned int *curr_table;
@@ -63,7 +61,6 @@ static const struct qcom_usb_vbus_reg_data pm8150b_data = {
 	.cmd_otg = CMD_OTG,
 	.otg_cfg = OTG_CFG,
 	.otg_en_src_cfg = OTG_EN_SRC_CFG,
-	.otg_dis_tlim_mask = OTG_DIS_OTG_ON_TLIM,
 	.csel_reg = OTG_CURRENT_LIMIT_CFG,
 	.csel_mask = OTG_CURRENT_LIMIT_MASK,
 	.curr_table = curr_table,
@@ -162,15 +159,6 @@ static int qcom_usb_vbus_regulator_probe(struct platform_device *pdev)
 
 	/* Disable HW logic for VBUS enable */
 	regmap_update_bits(regmap, base + data->otg_cfg, data->otg_en_src_cfg, 0);
-
-	/*
-	 * PM8150B powers up with DIS_OTG_ON_TLIM set.  The downstream SMB5
-	 * charger clears this before enabling the boost; without it the OTG
-	 * command bit is set but no 5 V appears on the connector.
-	 */
-	if (data->otg_dis_tlim_mask)
-		regmap_update_bits(regmap, base + data->otg_cfg,
-				   data->otg_dis_tlim_mask, 0);
 
 	return 0;
 }
