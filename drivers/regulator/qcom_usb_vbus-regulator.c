@@ -25,6 +25,8 @@
 #define OTG_FAULT_CONDITION_CFG		0x56
 #define OTG_USBIN_MID_COMP_FAULT_EN	BIT(5)
 #define OTG_USBIN_COLLAPSE_FAULT_EN	BIT(4)
+#define DCDC_FSW_SEL			0x50
+#define DCDC_FSW_800KHZ			0x0b
 
 #define PM4125_VBOOST_EN		0x50
 #define PM4125_VBOOST_SEL		0x52
@@ -176,6 +178,14 @@ static int qcom_usb_vbus_regulator_probe(struct platform_device *pdev)
 
 	/* Disable HW logic for VBUS enable */
 	regmap_update_bits(regmap, base + data->otg_cfg, data->otg_en_src_cfg, 0);
+
+	/*
+	 * Downstream SMB5 sets the charger switching frequency to 800 kHz
+	 * before enabling OTG.  PM8150B powers up at a different frequency;
+	 * select the same value the vendor charger uses for host mode.
+	 */
+	if (data == &pm8150b_data)
+		regmap_write(regmap, base + DCDC_FSW_SEL, DCDC_FSW_800KHZ);
 
 	/*
 	 * PM8150B powers up with DIS_OTG_ON_TLIM set.  The downstream SMB5
