@@ -1199,6 +1199,18 @@
 	phys = <&usb_2_hsphy>;
 	phy-names = "usb2-phy";
 	usb-role-switch;
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+
+			usb_2_dwc3_hs_out: endpoint {
+			};
+		};
+	};
 };
 
 &usb_2_hsphy {
@@ -1229,6 +1241,19 @@
 				       PDO_FIXED_USB_COMM |
 				       PDO_FIXED_DATA_SWAP)
 				       PDO_VAR(5000, 12000, 5000)>;
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@0 {
+				reg = <0>;
+
+				pm8150b_hs_in: endpoint {
+					remote-endpoint = <&usb_2_dwc3_hs_out>;
+				};
+			};
+		};
 	};
 };
 
