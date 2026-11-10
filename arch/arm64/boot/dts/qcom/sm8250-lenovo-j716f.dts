@@ -136,6 +136,25 @@
 		vin-supply = <&vph_pwr>;
 	};
 
+	/*
+	 * The USB-C port is wired to the second DWC3 controller (a800000)
+	 * on this board.  Vendor firmware drives PM8150 GPIO9 high to enable
+	 * the external VBUS boost when the port is in host mode.
+	 */
+	j716f_usb_vbus: regulator-usb-vbus {
+		compatible = "regulator-fixed";
+
+		regulator-name = "j716f_usb_vbus";
+		regulator-min-microvolt = <5000000>;
+		regulator-max-microvolt = <5000000>;
+		enable-active-high;
+
+		gpios = <&pm8150_gpios 9 GPIO_ACTIVE_HIGH>;
+		vin-supply = <&pm8150b_vbus>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&usb2_vbus_boost_default>;
+	};
+
 	qca6390-pmu {
 		compatible = "qcom,qca6390-pmu";
 
@@ -918,6 +937,21 @@
 		input-enable;
 		power-source = <1>;
 	};
+
+	usb2_vbus_boost_default: usb2-vbus-boost-default-state {
+		pins = "gpio9";
+		function = "normal";
+		output-low;
+		power-source = <1>;
+	};
+
+	usb2_vbus_det_default: usb2-vbus-det-default-state {
+		pins = "gpio10";
+		function = "normal";
+		input-enable;
+		bias-pull-down;
+		power-source = <1>;
+	};
 };
 
 &pon {
@@ -1115,26 +1149,21 @@
 	status = "okay";
 };
 
+/*
+ * USB0 (a600000) is the peripheral-only path used for the USB NCM debug
+ * link.  It stays in peripheral mode so it cannot fight the Type-C role
+ * switch used by the host port.
+ */
 &usb_1 {
-	/*
-	 * The board wires the USB-C connector to the PM8150B Type-C block
-	 * and only brings out USB 2.0.  Select the UTMI pipe clock so DWC3
-	 * does not depend on the QMP combo PHY.
-	 */
 	qcom,select-utmi-as-pipe-clk;
 	status = "okay";
 };
 
 &usb_1_dwc3 {
-	dr_mode = "otg";
+	dr_mode = "peripheral";
 	maximum-speed = "high-speed";
-	phys = <&usb_1_hsphy>, <&usb_1_qmpphy QMP_USB43DP_USB3_PHY>;
-	phy-names = "usb2-phy", "usb3-phy";
-	usb-role-switch;
-};
-
-&usb_1_dwc3_hs_out {
-	remote-endpoint = <&pm8150b_hs_in>;
+	phys = <&usb_1_hsphy>;
+	phy-names = "usb2-phy";
 };
 
 &usb_1_hsphy {
@@ -1154,6 +1183,28 @@
 	status = "okay";
 };
 
+/*
+ * USB1 (a800000) is the controller wired to the USB-C port.  Vendor
+ * firmware selects it for the host role and uses the PM8150B Type-C
+ * block plus PM8150 GPIO9 for VBUS; mirror that here.
+ */
+&usb_2 {
+	qcom,select-utmi-as-pipe-clk;
+	status = "okay";
+};
+
+&usb_2_dwc3 {
+	dr_mode = "otg";
+	maximum-speed = "high-speed";
+	phys = <&usb_2_hsphy>;
+	phy-names = "usb2-phy";
+	usb-role-switch;
+};
+
+&usb_2_hsphy {
+	status = "okay";
+};
+
 &pm8150b_typec {
 	vdd-pdphy-supply = <&vreg_l2a_3p1>;
 	status = "okay";
@@ -1166,7 +1217,7 @@
 		data-role = "dual";
 		self-powered;
 
-		vbus-supply = <&pm8150b_vbus>;
+		vbus-supply = <&j716f_usb_vbus>;
 
 		source-pdos = <PDO_FIXED(5000, 1500,
 					 PDO_FIXED_DUAL_ROLE |
@@ -1178,19 +1229,6 @@
 				       PDO_FIXED_USB_COMM |
 				       PDO_FIXED_DATA_SWAP)
 				       PDO_VAR(5000, 12000, 5000)>;
-
-		ports {
-			#address-cells = <1>;
-			#size-cells = <0>;
-
-			port@0 {
-				reg = <0>;
-
-				pm8150b_hs_in: endpoint {
-					remote-endpoint = <&usb_1_dwc3_hs_out>;
-				};
-			};
-		};
 	};
 };
 
