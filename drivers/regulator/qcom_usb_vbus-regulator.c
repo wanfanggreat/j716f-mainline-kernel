@@ -20,6 +20,8 @@
 #define OTG_CFG				0x53
 #define OTG_EN_SRC_CFG			BIT(1)
 #define OTG_DIS_OTG_ON_TLIM		BIT(5)
+#define OTG_ENG_OTG_CFG			0xC0
+#define OTG_ENG_BUCKBOOST_HALT1_8_MODE	BIT(0)
 
 #define PM4125_VBOOST_EN		0x50
 #define PM4125_VBOOST_SEL		0x52
@@ -34,6 +36,8 @@ struct qcom_usb_vbus_reg_data {
 	u8  otg_dis_tlim_mask;
 	u16 csel_reg;
 	u8 csel_mask;
+	u16 otg_eng_cfg;
+	u8 otg_eng_halt_mask;
 	const unsigned int *curr_table;
 	unsigned int n_current_limits;
 	u16 vsel_reg;
@@ -66,6 +70,8 @@ static const struct qcom_usb_vbus_reg_data pm8150b_data = {
 	.otg_dis_tlim_mask = OTG_DIS_OTG_ON_TLIM,
 	.csel_reg = OTG_CURRENT_LIMIT_CFG,
 	.csel_mask = OTG_CURRENT_LIMIT_MASK,
+	.otg_eng_cfg = OTG_ENG_OTG_CFG,
+	.otg_eng_halt_mask = OTG_ENG_BUCKBOOST_HALT1_8_MODE,
 	.curr_table = curr_table,
 	.n_current_limits = ARRAY_SIZE(curr_table),
 	.ops = &qcom_usb_vbus_reg_ops,
@@ -171,6 +177,16 @@ static int qcom_usb_vbus_regulator_probe(struct platform_device *pdev)
 	if (data->otg_dis_tlim_mask)
 		regmap_update_bits(regmap, base + data->otg_cfg,
 				   data->otg_dis_tlim_mask, 0);
+
+	/*
+	 * The downstream SMB5 charger selects the buckboost halt-1/8 mode
+	 * before enabling OTG.  PM8150B powers up with this bit clear and the
+	 * boost does not start reliably without it.
+	 */
+	if (data->otg_eng_cfg)
+		regmap_update_bits(regmap, base + data->otg_eng_cfg,
+				   data->otg_eng_halt_mask,
+				   data->otg_eng_halt_mask);
 
 	return 0;
 }
