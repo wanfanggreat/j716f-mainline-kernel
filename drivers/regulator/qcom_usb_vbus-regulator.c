@@ -22,6 +22,9 @@
 #define OTG_DIS_OTG_ON_TLIM		BIT(5)
 #define OTG_ENG_OTG_CFG			0xC0
 #define OTG_ENG_BUCKBOOST_HALT1_8_MODE	BIT(0)
+#define OTG_FAULT_CONDITION_CFG		0x56
+#define OTG_USBIN_MID_COMP_FAULT_EN	BIT(5)
+#define OTG_USBIN_COLLAPSE_FAULT_EN	BIT(4)
 
 #define PM4125_VBOOST_EN		0x50
 #define PM4125_VBOOST_SEL		0x52
@@ -38,6 +41,8 @@ struct qcom_usb_vbus_reg_data {
 	u8 csel_mask;
 	u16 otg_eng_cfg;
 	u8 otg_eng_halt_mask;
+	u16 otg_fault_cfg;
+	u8 otg_fault_mask;
 	const unsigned int *curr_table;
 	unsigned int n_current_limits;
 	u16 vsel_reg;
@@ -72,6 +77,9 @@ static const struct qcom_usb_vbus_reg_data pm8150b_data = {
 	.csel_mask = OTG_CURRENT_LIMIT_MASK,
 	.otg_eng_cfg = OTG_ENG_OTG_CFG,
 	.otg_eng_halt_mask = OTG_ENG_BUCKBOOST_HALT1_8_MODE,
+	.otg_fault_cfg = OTG_FAULT_CONDITION_CFG,
+	.otg_fault_mask = OTG_USBIN_MID_COMP_FAULT_EN |
+			 OTG_USBIN_COLLAPSE_FAULT_EN,
 	.curr_table = curr_table,
 	.n_current_limits = ARRAY_SIZE(curr_table),
 	.ops = &qcom_usb_vbus_reg_ops,
@@ -187,6 +195,15 @@ static int qcom_usb_vbus_regulator_probe(struct platform_device *pdev)
 		regmap_update_bits(regmap, base + data->otg_eng_cfg,
 				   data->otg_eng_halt_mask,
 				   data->otg_eng_halt_mask);
+
+	/*
+	 * The downstream SMB5 charger disables the USBIN mid-comp and collapse
+	 * fault responses while acting as a Type-C source.  PM8150B powers up
+	 * with both enabled; leaving them enabled keeps the OTG boost off.
+	 */
+	if (data->otg_fault_cfg)
+		regmap_update_bits(regmap, base + data->otg_fault_cfg,
+				   data->otg_fault_mask, 0);
 
 	return 0;
 }
