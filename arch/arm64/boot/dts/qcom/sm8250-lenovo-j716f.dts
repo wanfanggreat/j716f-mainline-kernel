@@ -137,9 +137,10 @@
 	};
 
 	/*
-	 * The USB-C port is wired to the second DWC3 controller (a800000)
+	 * The USB-C port is wired to the first DWC3 controller (a600000)
 	 * on this board.  Vendor firmware drives PM8150 GPIO9 high to enable
-	 * the external VBUS boost when the port is in host mode.
+	 * the external 5 V boost when the port is in host mode; the boost is
+	 * powered from the always-on battery rail, not the PM8150B OTG block.
 	 */
 	j716f_usb_vbus: regulator-usb-vbus {
 		compatible = "regulator-fixed";
@@ -150,7 +151,7 @@
 		enable-active-high;
 
 		gpios = <&pm8150_gpios 9 GPIO_ACTIVE_HIGH>;
-		vin-supply = <&pm8150b_vbus>;
+		vin-supply = <&vph_pwr>;
 		pinctrl-names = "default";
 		pinctrl-0 = <&usb2_vbus_boost_default>;
 	};
@@ -1150,9 +1151,11 @@
 };
 
 /*
- * USB0 (a600000) is the peripheral-only path used for the USB NCM debug
- * link.  It stays in peripheral mode so it cannot fight the Type-C role
- * switch used by the host port.
+ * USB0 (a600000) is the controller wired to the USB-C port.  Vendor
+ * firmware switches this same controller between peripheral and host;
+ * the port ID is TLMM GPIO91 (low = host) and the external VBUS boost
+ * enable is PM8150 GPIO9.  Model that with the generic GPIO connector
+ * instead of the PM8150B Type-C CC engine.
  */
 &usb_1 {
 	qcom,select-utmi-as-pipe-clk;
@@ -1160,10 +1163,22 @@
 };
 
 &usb_1_dwc3 {
-	dr_mode = "peripheral";
+	dr_mode = "otg";
 	maximum-speed = "high-speed";
 	phys = <&usb_1_hsphy>;
 	phy-names = "usb2-phy";
+	usb-role-switch;
+
+	connector {
+		compatible = "gpio-usb-b-connector", "usb-b-connector";
+
+		id-gpios = <&tlmm 91 GPIO_ACTIVE_HIGH>;
+		vbus-gpios = <&pm8150_gpios 10 GPIO_ACTIVE_HIGH>;
+		vbus-supply = <&j716f_usb_vbus>;
+
+		pinctrl-names = "default";
+		pinctrl-0 = <&usb2_vbus_det_default>;
+	};
 };
 
 &usb_1_hsphy {
@@ -1180,53 +1195,23 @@
 	vdda-phy-supply = <&vreg_l9a_1p2>;
 	vdda-pll-supply = <&vreg_l18a_0p9>;
 
-	status = "okay";
+	/* USB0 is used at high speed for the USB-C port. */
+	status = "disabled";
 };
 
-/*
- * USB1 (a800000) is the controller wired to the USB-C port.  Vendor
- * firmware selects it for the host role and uses the PM8150B Type-C
- * block plus PM8150 GPIO9 for VBUS; mirror that here.
- */
+/* USB1 (a800000) is not wired to the external USB-C port. */
 &usb_2 {
-	qcom,select-utmi-as-pipe-clk;
-	status = "okay";
-};
-
-&usb_2_dwc3 {
-	dr_mode = "otg";
-	maximum-speed = "high-speed";
-	phys = <&usb_2_hsphy>;
-	phy-names = "usb2-phy";
-	usb-role-switch;
-
-	/*
-	 * Vendor firmware does not use the PM8150B Type-C CC engine for
-	 * role detection on this board.  The port ID pin is wired to TLMM
-	 * GPIO91 (low = host) and the external VBUS boost enable to PM8150
-	 * GPIO9.  Model that with the generic GPIO connector so Linux
-	 * follows the same path instead of waiting for a TCPM CC partner.
-	 */
-	connector {
-		compatible = "gpio-usb-b-connector", "usb-b-connector";
-
-		id-gpios = <&tlmm 91 GPIO_ACTIVE_HIGH>;
-		vbus-gpios = <&pm8150_gpios 10 GPIO_ACTIVE_HIGH>;
-		vbus-supply = <&j716f_usb_vbus>;
-
-		pinctrl-names = "default";
-		pinctrl-0 = <&usb2_vbus_det_default>;
-	};
+	status = "disabled";
 };
 
 &usb_2_hsphy {
-	status = "okay";
+	status = "disabled";
 };
 
 /*
  * The PM8150B Type-C engine is not used for this port: the board's ID and
  * VBUS-boost signals are plain GPIOs handled by the connector node under
- * &usb_2_dwc3.  Keep the PMIC block disabled so TCPM cannot take over the
+ * &usb_1_dwc3.  Keep the PMIC block disabled so TCPM cannot take over the
  * DWC3 role switch.
  */
 &pm8150b_typec {
