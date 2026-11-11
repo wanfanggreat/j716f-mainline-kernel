@@ -155,7 +155,8 @@
 		vin-supply = <&vph_pwr>;
 		pinctrl-names = "default";
 		pinctrl-0 = <&usb2_vbus_boost_default>;
-		status = "disabled";
+		regulator-always-on;
+		status = "okay";
 	};
 
 	qca6390-pmu {
@@ -1165,12 +1166,10 @@
 };
 
 &usb_1_dwc3 {
-	dr_mode = "otg";
+	dr_mode = "host";
 	maximum-speed = "high-speed";
 	phys = <&usb_1_hsphy>;
 	phy-names = "usb2-phy";
-	usb-role-switch;
-	role-switch-default-mode = "host";
 };
 
 &usb_1_dwc3_hs_out {
@@ -1215,7 +1214,7 @@
  */
 &pm8150b_typec {
 	vdd-pdphy-supply = <&vreg_l2a_3p1>;
-	status = "okay";
+	status = "disabled";
 
 	connector {
 		compatible = "usb-c-connector";
@@ -1256,6 +1255,7 @@
 &pm8150b_vbus {
 	regulator-min-microamp = <500000>;
 	regulator-max-microamp = <3000000>;
+	regulator-always-on;
 	status = "okay";
 };
 
