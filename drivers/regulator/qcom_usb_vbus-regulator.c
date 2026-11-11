@@ -240,10 +240,59 @@ static int qcom_usb_vbus_regulator_probe(struct platform_device *pdev)
 	if (data == &pm8150b_data) {
 		regmap_update_bits(regmap, 0x1544, 0x1f, 0x04);
 		regmap_update_bits(regmap, 0x1560, 0x20, 0x20);
+		device_create_file(dev, &dev_attr_typec_cfg);
 	}
 
 	return 0;
 }
+
+/*
+ * J716F experiment helper: apply an arbitrary PM8150B register update from
+ * sysfs so the Type-C bisect can be done at runtime instead of one flash per
+ * variant.  Write "reg mask val" in hex, e.g. "1544 1f 04".
+ */
+static ssize_t typec_cfg_store(struct device *dev,
+			       struct device_attribute *attr,
+			       const char *buf, size_t count)
+{
+	struct regmap *regmap = dev_get_regmap(dev->parent, NULL);
+	unsigned int reg, mask, val;
+	int rc;
+
+	if (!regmap)
+		return -ENODEV;
+	if (sscanf(buf, "%x %x %x", &reg, &mask, &val) != 3)
+		return -EINVAL;
+	rc = regmap_update_bits(regmap, reg, mask, val);
+	if (rc)
+		return rc;
+	dev_info(dev, "typec_cfg: reg 0x%04x mask 0x%02x val 0x%02x\n",
+		 reg, mask, val);
+	return count;
+}
+
+static ssize_t typec_cfg_show(struct device *dev,
+			      struct device_attribute *attr, char *buf)
+{
+	struct regmap *regmap = dev_get_regmap(dev->parent, NULL);
+	static const unsigned int regs[] = { 0x1140, 0x1150, 0x1153, 0x1156,
+					     0x1544, 0x1546, 0x154c, 0x1550,
+					     0x1560, 0x1570, 0x1508, 0x1509 };
+	ssize_t len = 0;
+	unsigned int i, v;
+
+	if (!regmap)
+		return -ENODEV;
+	for (i = 0; i < ARRAY_SIZE(regs); i++) {
+		if (regmap_read(regmap, regs[i], &v))
+			continue;
+		len += sysfs_emit_at(buf, len, "%04x=%02x%s", regs[i], v,
+				     (i + 1) % 4 ? " " : "\n");
+	}
+	return len;
+}
+
+static DEVICE_ATTR_RW(typec_cfg);
 
 static const struct of_device_id qcom_usb_vbus_regulator_match[] = {
 	{ .compatible = "qcom,pm8150b-vbus-reg", .data = &pm8150b_data },
