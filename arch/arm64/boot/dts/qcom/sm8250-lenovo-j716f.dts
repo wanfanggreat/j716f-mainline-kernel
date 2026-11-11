@@ -1170,6 +1170,7 @@
 	phys = <&usb_1_hsphy>;
 	phy-names = "usb2-phy";
 	usb-role-switch;
+	role-switch-default-mode = "host";
 };
 
 &usb_1_dwc3_hs_out {
