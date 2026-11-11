@@ -228,6 +228,20 @@ static int qcom_usb_vbus_regulator_probe(struct platform_device *pdev)
 		regmap_update_bits(regmap, base + data->otg_fault_cfg,
 				   data->otg_fault_mask, 0);
 
+	/*
+	 * J716F: mainline has no PM8150B charger/Type-C driver, so the Type-C
+	 * block keeps the bootloader state (sink-only, Rd) and a USB-C
+	 * peripheral never sees a host.  Configure source mode (Rp) and the
+	 * source-mode CC comparator threshold:
+	 *   0x1544 mask 0x1f val 0x04  EN_SRC_ONLY
+	 *   0x1560 mask 0x20 val 0x20  SEL_SRC_UPPER_REF (CC threshold 1.6 V)
+	 * Both follow downstream smb5_configure_typec()/smblib_set_prop_typec_power_role().
+	 */
+	if (data == &pm8150b_data) {
+		regmap_update_bits(regmap, 0x1544, 0x1f, 0x04);
+		regmap_update_bits(regmap, 0x1560, 0x20, 0x20);
+	}
+
 	return 0;
 }
 
