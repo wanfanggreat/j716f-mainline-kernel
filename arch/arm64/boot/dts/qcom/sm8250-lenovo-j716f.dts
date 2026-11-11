@@ -1181,6 +1181,9 @@
 	vdda18-supply = <&vreg_l12a_1p8>;
 	vdda33-supply = <&vreg_l2a_3p1>;
 
+	/* ZUI 15 applies value 0x83 to HS PHY parameter override X1 (0x70). */
+	qcom,param-override-seq = <0x83 0x70>;
+
 	status = "okay";
 };
 

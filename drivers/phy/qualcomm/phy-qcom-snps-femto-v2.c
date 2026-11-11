@@ -121,6 +121,8 @@ struct phy_override_seq {
  * @phy_initialized: if PHY has been initialized correctly
  * @mode: contains the current mode the PHY is in
  * @update_seq_cfg: tuning parameters for phy init
+ * @param_override_seq: raw value/offset pairs applied after PHY reset
+ * @param_override_seq_cnt: number of u32 entries in @param_override_seq
  */
 struct qcom_snps_hsphy {
 	struct device *dev;
@@ -136,6 +138,8 @@ struct qcom_snps_hsphy {
 	bool phy_initialized;
 	enum phy_mode mode;
 	struct phy_override_seq update_seq_cfg[NUM_HSPHY_TUNING_PARAMS];
+	u32 *param_override_seq;
+	int param_override_seq_cnt;
 };
 
 static int qcom_snps_hsphy_clk_init(struct qcom_snps_hsphy *hsphy)
@@ -433,6 +437,10 @@ static int qcom_snps_hsphy_init(struct phy *phy)
 	qcom_snps_hsphy_write_mask(hsphy->base, USB2_PHY_USB_PHY_HS_PHY_CTRL1,
 					VBUSVLDEXT0, VBUSVLDEXT0);
 
+	for (i = 0; i < hsphy->param_override_seq_cnt; i += 2)
+		writel_relaxed(hsphy->param_override_seq[i],
+			       hsphy->base + hsphy->param_override_seq[i + 1]);
+
 	for (i = 0; i < ARRAY_SIZE(hsphy->update_seq_cfg); i++) {
 		if (hsphy->update_seq_cfg[i].need_update)
 			qcom_snps_hsphy_write_mask(hsphy->base,
@@ -561,6 +569,33 @@ static void qcom_snps_hsphy_read_override_param_seq(struct device *dev)
 	}
 }
 
+static int qcom_snps_hsphy_read_raw_override_seq(struct device *dev)
+{
+	struct qcom_snps_hsphy *hsphy = dev_get_drvdata(dev);
+	int cnt, ret;
+
+	cnt = of_property_count_u32_elems(dev->of_node, "qcom,param-override-seq");
+	if (cnt <= 0)
+		return 0;
+
+	if (cnt % 2) {
+		dev_err(dev, "qcom,param-override-seq must contain value/offset pairs\n");
+		return -EINVAL;
+	}
+
+	hsphy->param_override_seq = devm_kcalloc(dev, cnt, sizeof(u32), GFP_KERNEL);
+	if (!hsphy->param_override_seq)
+		return -ENOMEM;
+
+	ret = of_property_read_u32_array(dev->of_node, "qcom,param-override-seq",
+					 hsphy->param_override_seq, cnt);
+	if (ret)
+		return ret;
+
+	hsphy->param_override_seq_cnt = cnt;
+	return 0;
+}
+
 static int qcom_snps_hsphy_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -629,6 +664,12 @@ static int qcom_snps_hsphy_probe(struct platform_device *pdev)
 	dev_set_drvdata(dev, hsphy);
 	phy_set_drvdata(generic_phy, hsphy);
 	qcom_snps_hsphy_read_override_param_seq(dev);
+
+	ret = qcom_snps_hsphy_read_raw_override_seq(dev);
+	if (ret) {
+		pm_runtime_put_noidle(dev);
+		return ret;
+	}
 
 	phy_provider = devm_of_phy_provider_register(dev, of_phy_simple_xlate);
 	if (IS_ERR(phy_provider)) {
