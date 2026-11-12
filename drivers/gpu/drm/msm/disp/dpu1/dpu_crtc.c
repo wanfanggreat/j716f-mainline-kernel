@@ -100,7 +100,7 @@ MODULE_PARM_DESC(pcc_white_min_g, "J716F: PCC green gain at min backlight, Q10")
 module_param(pcc_white_min_b, uint, 0644);
 MODULE_PARM_DESC(pcc_white_min_b, "J716F: PCC blue gain at min backlight, Q10");
 
-static bool pcc_default_enable = true;
+static bool pcc_default_enable = false;
 module_param(pcc_default_enable, bool, 0644);
 MODULE_PARM_DESC(pcc_default_enable,
 		 "J716F: apply the default PCC white-point trim");
