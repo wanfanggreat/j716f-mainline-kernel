@@ -36,6 +36,18 @@
 #define GC_C1_INDEX_OFF 0x10
 #define GC_C2_INDEX_OFF 0x18
 
+/* DSPP_IGC lives in the DSPP Top block (vendor DT qcom,sde-dspp-top-off) */
+#define DPU_DSPP_TOP_OFF 0x1300
+#define IGC_OPMODE_OFF 0x0
+#define IGC_C0_OFF 0x0
+#define IGC_C1_OFF 0x4
+#define IGC_C2_OFF 0x8
+#define IGC_DATA_MASK (BIT(12) - 1)
+#define IGC_DSPP_SEL_MASK_MAX (BIT(4) - 1)
+#define IGC_DSPP_SEL_MASK(n) 	((IGC_DSPP_SEL_MASK_MAX & ~(1 << (n))) << 28)
+#define IGC_INDEX_UPDATE BIT(25)
+#define IGC_EN BIT(0)
+
 static void dpu_setup_dspp_pcc(struct dpu_hw_dspp *ctx,
 		struct dpu_hw_pcc_cfg *cfg)
 {
@@ -115,6 +127,50 @@ static void dpu_setup_dspp_gc(struct dpu_hw_dspp *ctx,
 	DPU_REG_WRITE(&ctx->hw, base, reg);
 }
 
+static void dpu_setup_dspp_igc(struct dpu_hw_dspp *ctx,
+		struct dpu_hw_igc_lut *igc_lut)
+{
+	u32 sel, val;
+	int i;
+
+	if (!ctx)
+		return;
+
+	if (!ctx->hw_top.blk_addr) {
+		DRM_ERROR("invalid ctx %p igc top base\n", ctx);
+		return;
+	}
+
+	if (!igc_lut) {
+		DPU_REG_WRITE(&ctx->hw_top, IGC_OPMODE_OFF, 0);
+		return;
+	}
+
+	sel = IGC_DSPP_SEL_MASK(ctx->idx - DSPP_0);
+
+	/* The LUT data register auto-increments; one index-update per channel. */
+	for (i = 0; i < DPU_IGC_LUT_SIZE; i++) {
+		val = (igc_lut->c0[i] & IGC_DATA_MASK) | sel;
+		if (i == 0)
+			val |= IGC_INDEX_UPDATE;
+		DPU_REG_WRITE(&ctx->hw_top, IGC_C0_OFF, val);
+	}
+	for (i = 0; i < DPU_IGC_LUT_SIZE; i++) {
+		val = (igc_lut->c1[i] & IGC_DATA_MASK) | sel;
+		if (i == 0)
+			val |= IGC_INDEX_UPDATE;
+		DPU_REG_WRITE(&ctx->hw_top, IGC_C1_OFF, val);
+	}
+	for (i = 0; i < DPU_IGC_LUT_SIZE; i++) {
+		val = (igc_lut->c2[i] & IGC_DATA_MASK) | sel;
+		if (i == 0)
+			val |= IGC_INDEX_UPDATE;
+		DPU_REG_WRITE(&ctx->hw_top, IGC_C2_OFF, val);
+	}
+
+	DPU_REG_WRITE(&ctx->hw_top, IGC_OPMODE_OFF, IGC_EN);
+}
+
 /**
  * dpu_hw_dspp_init() - Initializes the DSPP hw driver object.
  * should be called once before accessing every DSPP.
@@ -138,6 +194,8 @@ struct dpu_hw_dspp *dpu_hw_dspp_init(struct drm_device *dev,
 
 	c->hw.blk_addr = addr + cfg->base;
 	c->hw.log_mask = DPU_DBG_MASK_DSPP;
+	c->hw_top.blk_addr = addr + DPU_DSPP_TOP_OFF;
+	c->hw_top.log_mask = DPU_DBG_MASK_DSPP;
 
 	/* Assign ops */
 	c->idx = cfg->id;
@@ -146,6 +204,7 @@ struct dpu_hw_dspp *dpu_hw_dspp_init(struct drm_device *dev,
 		c->ops.setup_pcc = dpu_setup_dspp_pcc;
 	if (c->cap->sblk->gc.base)
 		c->ops.setup_gc = dpu_setup_dspp_gc;
+	c->ops.setup_igc = dpu_setup_dspp_igc;
 
 	return c;
 }

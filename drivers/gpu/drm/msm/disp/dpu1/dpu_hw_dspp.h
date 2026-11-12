@@ -52,6 +52,23 @@ struct dpu_hw_gc_lut {
 	__u32 c2[PGC_TBL_LEN];
 };
 
+#define DPU_IGC_LUT_SIZE 256
+
+/**
+ * struct dpu_hw_igc_lut - IGC (inverse gamma) LUT, 12-bit values
+ * @c0: color0 component lut
+ * @c1: color1 component lut
+ * @c2: color2 component lut
+ *
+ * The IGC block lives in the DSPP Top register block (vendor DT:
+ * qcom,sde-dspp-top-off = 0x1300), not in the DSPP block itself.
+ */
+struct dpu_hw_igc_lut {
+	__u32 c0[DPU_IGC_LUT_SIZE];
+	__u32 c1[DPU_IGC_LUT_SIZE];
+	__u32 c2[DPU_IGC_LUT_SIZE];
+};
+
 /**
  * struct dpu_hw_dspp_ops - interface to the dspp hardware driver functions
  * Caller must call the init function to get the dspp context for each dspp
@@ -72,6 +89,13 @@ struct dpu_hw_dspp_ops {
 	 */
 	void (*setup_gc)(struct dpu_hw_dspp *ctx, struct dpu_hw_gc_lut *gc_lut);
 
+	/**
+	 * setup_igc - setup dspp igc
+	 * @ctx: Pointer to dspp context
+	 * @igc_lut: Pointer to lut content
+	 */
+	void (*setup_igc)(struct dpu_hw_dspp *ctx,
+			  struct dpu_hw_igc_lut *igc_lut);
 };
 
 /**
@@ -85,6 +109,7 @@ struct dpu_hw_dspp_ops {
 struct dpu_hw_dspp {
 	struct dpu_hw_blk base;
 	struct dpu_hw_blk_reg_map hw;
+	struct dpu_hw_blk_reg_map hw_top;
 
 	/* dspp */
 	int idx;

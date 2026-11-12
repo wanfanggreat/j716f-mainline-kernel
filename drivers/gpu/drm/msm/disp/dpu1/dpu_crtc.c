@@ -967,6 +967,23 @@ static void _dpu_crtc_get_gc_lut(struct drm_crtc_state *state,
 	gc_lut->flags = 0;
 }
 
+static void _dpu_crtc_get_igc_lut(struct drm_crtc_state *state,
+		struct dpu_hw_igc_lut *igc_lut)
+{
+	struct drm_color_lut *lut;
+	int i;
+
+	lut = (struct drm_color_lut *)state->degamma_lut->data;
+	if (!lut)
+		return;
+
+	for (i = 0; i < DPU_IGC_LUT_SIZE; i++) {
+		igc_lut->c0[i] = drm_color_lut_extract(lut[i].green, 12);
+		igc_lut->c1[i] = drm_color_lut_extract(lut[i].blue, 12);
+		igc_lut->c2[i] = drm_color_lut_extract(lut[i].red, 12);
+	}
+}
+
 static void _dpu_crtc_setup_cp_blocks(struct drm_crtc *crtc)
 {
 	struct drm_crtc_state *state = crtc->state;
@@ -974,6 +991,7 @@ static void _dpu_crtc_setup_cp_blocks(struct drm_crtc *crtc)
 	struct dpu_crtc_mixer *mixer = cstate->mixers;
 	struct dpu_hw_pcc_cfg cfg;
 	struct dpu_hw_gc_lut *gc_lut;
+	struct dpu_hw_igc_lut *igc_lut;
 	struct dpu_hw_ctl *ctl;
 	struct dpu_hw_dspp *dspp;
 	int i;
@@ -995,6 +1013,22 @@ static void _dpu_crtc_setup_cp_blocks(struct drm_crtc *crtc)
 
 		if (!dspp)
 			continue;
+
+		if (dspp->ops.setup_igc) {
+			if (!state->degamma_lut) {
+				dspp->ops.setup_igc(dspp, NULL);
+			} else {
+				igc_lut = kzalloc_obj(*igc_lut);
+				if (!igc_lut)
+					continue;
+				_dpu_crtc_get_igc_lut(state, igc_lut);
+				dspp->ops.setup_igc(dspp, igc_lut);
+				kfree(igc_lut);
+			}
+
+			ctl->ops.update_pending_flush_dspp(ctl,
+				mixer[i].hw_dspp->idx, DPU_DSPP_IGC);
+		}
 
 		if (dspp->ops.setup_pcc) {
 			if (state->ctm) {
@@ -2089,9 +2123,10 @@ struct drm_crtc *dpu_crtc_init(struct drm_device *dev, struct drm_plane *plane,
 
 		if (dspp->sblk->gc.base) {
 			drm_mode_crtc_set_gamma_size(crtc, DPU_GAMMA_LUT_SIZE);
-			drm_crtc_enable_color_mgmt(crtc, 0, true, DPU_GAMMA_LUT_SIZE);
+			drm_crtc_enable_color_mgmt(crtc, DPU_IGC_LUT_SIZE,
+						   true, DPU_GAMMA_LUT_SIZE);
 		} else {
-			drm_crtc_enable_color_mgmt(crtc, 0, true, 0);
+			drm_crtc_enable_color_mgmt(crtc, DPU_IGC_LUT_SIZE, true, 0);
 		}
 	}
 
