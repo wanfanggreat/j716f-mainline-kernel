@@ -1080,7 +1080,7 @@ static void _dpu_crtc_setup_cp_blocks(struct drm_crtc *crtc)
 	 * parameter write shows up immediately.
 	 */
 	if (!state->color_mgmt_changed && !drm_atomic_crtc_needs_modeset(state) &&
-	    !default_pcc)
+	    !default_pcc && !dpu_gc_default_active())
 		return;
 
 	for (i = 0; i < cstate->num_mixers; i++) {
