@@ -112,7 +112,7 @@ module_param(gc_default_enable, bool, 0644);
 MODULE_PARM_DESC(gc_default_enable,
 		 "J716F: use the optional default gamma table from firmware");
 
-static bool dpu_gc_default_loaded;
+static bool dpu_gc_default_loaded = true;
 static bool dpu_gc_fw_requested;
 
 static bool dpu_gc_default_active(void)
@@ -1076,13 +1076,10 @@ static void _dpu_crtc_setup_cp_blocks(struct drm_crtc *crtc)
 	bool default_pcc = dpu_default_pcc_active();
 
 	/*
-	 * J716F: the default PCC has to be rewritten on every commit so a
-	 * parameter write shows up immediately.
+	 * J716F: always rewrite the CP blocks.  The default GC and the PCC
+	 * trim are driven by module parameters and must show up on the next
+	 * commit without a modeset.
 	 */
-	if (!state->color_mgmt_changed && !drm_atomic_crtc_needs_modeset(state) &&
-	    !default_pcc && !dpu_gc_default_active())
-		return;
-
 	for (i = 0; i < cstate->num_mixers; i++) {
 		ctl = mixer[i].lm_ctl;
 		dspp = mixer[i].hw_dspp;
