@@ -12,6 +12,7 @@
 #include <linux/ktime.h>
 #include <linux/bits.h>
 #include <linux/backlight.h>
+#include <linux/firmware.h>
 
 #include <drm/drm_atomic.h>
 #include <drm/drm_blend.h>
@@ -98,8 +99,83 @@ MODULE_PARM_DESC(pcc_white_min_g, "J716F: PCC green gain at min backlight, Q10")
 module_param(pcc_white_min_b, uint, 0644);
 MODULE_PARM_DESC(pcc_white_min_b, "J716F: PCC blue gain at min backlight, Q10");
 
+static bool pcc_default_enable = true;
+module_param(pcc_default_enable, bool, 0644);
+MODULE_PARM_DESC(pcc_default_enable,
+		 "J716F: apply the default PCC white-point trim");
+
+#define DPU_GC_DEFAULT_FW	"j716f/rm69380_gc.bin"
+
+static bool gc_default_enable = true;
+module_param(gc_default_enable, bool, 0644);
+MODULE_PARM_DESC(gc_default_enable,
+		 "J716F: use the optional default gamma table from firmware");
+
+static u16 dpu_gc_default_lut[DPU_GAMMA_LUT_SIZE][3];
+static bool dpu_gc_default_loaded;
+static bool dpu_gc_fw_requested;
+
+static bool dpu_gc_default_active(void)
+{
+	return gc_default_enable && dpu_gc_default_loaded;
+}
+
+static void dpu_gc_default_fw_cb(const struct firmware *fw, void *context)
+{
+	size_t want = DPU_GAMMA_LUT_SIZE * 3 * sizeof(u16);
+	int i, j;
+
+	if (!fw) {
+		pr_info("J716F gc: no %s, GC stays bypassed\n",
+			DPU_GC_DEFAULT_FW);
+		return;
+	}
+
+	if (fw->size != want) {
+		pr_warn("J716F gc: %s is %zu bytes, want %zu\n",
+			DPU_GC_DEFAULT_FW, fw->size, want);
+		release_firmware(fw);
+		return;
+	}
+
+	for (i = 0; i < DPU_GAMMA_LUT_SIZE; i++) {
+		for (j = 0; j < 3; j++) {
+			__le16 v;
+
+			memcpy(&v, fw->data + (i * 3 + j) * sizeof(v),
+			       sizeof(v));
+			dpu_gc_default_lut[i][j] =
+				min_t(u16, le16_to_cpu(v), 1023);
+		}
+	}
+
+	dpu_gc_default_loaded = true;
+	pr_info("J716F gc: default gamma table loaded\n");
+	release_firmware(fw);
+}
+
+static void dpu_gc_fill_default(struct dpu_hw_gc_lut *gc_lut)
+{
+	int i;
+
+	/* Same packing as _dpu_crtc_get_gc_lut(): c0 green, c1 blue, c2 red. */
+	for (i = 0; i < PGC_TBL_LEN; i++) {
+		gc_lut->c0[i] = dpu_gc_default_lut[i * 2][1] |
+				(dpu_gc_default_lut[i * 2 + 1][1] << 16);
+		gc_lut->c1[i] = dpu_gc_default_lut[i * 2][2] |
+				(dpu_gc_default_lut[i * 2 + 1][2] << 16);
+		gc_lut->c2[i] = dpu_gc_default_lut[i * 2][0] |
+				(dpu_gc_default_lut[i * 2 + 1][0] << 16);
+	}
+
+	gc_lut->flags = 0;
+}
+
 static inline bool dpu_default_pcc_active(void)
 {
+	if (!pcc_default_enable)
+		return false;
+
 	return pcc_white_r != 1024 || pcc_white_g != 1024 || pcc_white_b != 1024 ||
 	       pcc_white_min_r != 1024 || pcc_white_min_g != 1024 ||
 	       pcc_white_min_b != 1024;
@@ -1071,15 +1147,22 @@ static void _dpu_crtc_setup_cp_blocks(struct drm_crtc *crtc)
 		}
 
 		if (dspp->ops.setup_gc) {
-			if (!state->gamma_lut) {
-				dspp->ops.setup_gc(dspp, NULL);
-			} else {
+			if (state->gamma_lut) {
 				gc_lut = kzalloc_obj(*gc_lut);
 				if (!gc_lut)
 					continue;
 				_dpu_crtc_get_gc_lut(state, gc_lut);
 				dspp->ops.setup_gc(dspp, gc_lut);
 				kfree(gc_lut);
+			} else if (dpu_gc_default_active()) {
+				gc_lut = kzalloc_obj(*gc_lut);
+				if (!gc_lut)
+					continue;
+				dpu_gc_fill_default(gc_lut);
+				dspp->ops.setup_gc(dspp, gc_lut);
+				kfree(gc_lut);
+			} else {
+				dspp->ops.setup_gc(dspp, NULL);
 			}
 
 			/* stage config flush mask */
@@ -2117,6 +2200,22 @@ struct drm_crtc *dpu_crtc_init(struct drm_device *dev, struct drm_plane *plane,
 	 * trim can follow the panel's brightness-dependent white point.
 	 */
 	schedule_delayed_work(&dpu_pcc_bl_work, 5 * HZ);
+
+	/*
+	 * Optional default gamma table.  One request for the whole driver:
+	 * every CRTC shares the same panel and therefore the same curve.
+	 */
+	if (!dpu_gc_fw_requested) {
+		dpu_gc_fw_requested = true;
+		ret = request_firmware_nowait(THIS_MODULE, true,
+					      DPU_GC_DEFAULT_FW, dev->dev,
+					      GFP_KERNEL, NULL,
+					      dpu_gc_default_fw_cb);
+		if (ret)
+			pr_warn("J716F gc: cannot request %s: %d
+",
+				DPU_GC_DEFAULT_FW, ret);
+	}
 
 	if (dpu_kms->catalog->dspp_count) {
 		const struct dpu_dspp_cfg *dspp = &dpu_kms->catalog->dspp[0];
