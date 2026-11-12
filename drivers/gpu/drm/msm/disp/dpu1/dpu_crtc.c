@@ -1712,7 +1712,8 @@ static struct msm_display_topology dpu_crtc_get_topology(
 	 * block, and without it hw_dspp stays NULL and the PCC writes are
 	 * simply skipped (v37: parameters accepted, registers stayed 0).
 	 */
-	if (crtc_state->ctm || crtc_state->gamma_lut || dpu_default_pcc_active())
+	if (crtc_state->ctm || crtc_state->gamma_lut ||
+	    dpu_default_pcc_active() || dpu_gc_default_active())
 		topology.num_dspp = topology.num_lm;
 
 	return topology;
