@@ -2212,8 +2212,7 @@ struct drm_crtc *dpu_crtc_init(struct drm_device *dev, struct drm_plane *plane,
 					      GFP_KERNEL, NULL,
 					      dpu_gc_default_fw_cb);
 		if (ret)
-			pr_warn("J716F gc: cannot request %s: %d
-",
+			pr_warn("J716F gc: cannot request %s: %d\n",
 				DPU_GC_DEFAULT_FW, ret);
 	}
 
