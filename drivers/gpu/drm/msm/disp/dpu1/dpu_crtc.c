@@ -31,6 +31,7 @@
 #include "dpu_hw_lm.h"
 #include "dpu_hw_ctl.h"
 #include "dpu_hw_dspp.h"
+#include "dpu_gc_default.h"
 #include "dpu_crtc.h"
 #include "dpu_plane.h"
 #include "dpu_encoder.h"
@@ -111,7 +112,6 @@ module_param(gc_default_enable, bool, 0644);
 MODULE_PARM_DESC(gc_default_enable,
 		 "J716F: use the optional default gamma table from firmware");
 
-static u16 dpu_gc_default_lut[DPU_GAMMA_LUT_SIZE][3];
 static bool dpu_gc_default_loaded;
 static bool dpu_gc_fw_requested;
 
@@ -2205,6 +2205,8 @@ struct drm_crtc *dpu_crtc_init(struct drm_device *dev, struct drm_plane *plane,
 	 * Optional default gamma table.  One request for the whole driver:
 	 * every CRTC shares the same panel and therefore the same curve.
 	 */
+	/* The built-in table is the measured fit; firmware can override it. */
+	dpu_gc_default_loaded = true;
 	if (!dpu_gc_fw_requested) {
 		dpu_gc_fw_requested = true;
 		ret = request_firmware_nowait(THIS_MODULE, true,
