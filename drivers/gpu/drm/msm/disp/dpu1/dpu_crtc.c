@@ -1147,6 +1147,16 @@ static void _dpu_crtc_setup_cp_blocks(struct drm_crtc *crtc)
 		}
 
 		if (dspp->ops.setup_gc) {
+			static bool gc_logged;
+
+			if (!gc_logged) {
+				gc_logged = true;
+				pr_info("J716F gc: gamma=%px loaded=%d enable=%d active=%d t0=%u t68=%u\n",
+					state->gamma_lut, dpu_gc_default_loaded,
+					gc_default_enable, dpu_gc_default_active(),
+					dpu_gc_default_lut[0][0],
+					dpu_gc_default_lut[68][0]);
+			}
 			if (state->gamma_lut) {
 				gc_lut = kzalloc_obj(*gc_lut);
 				if (!gc_lut)
