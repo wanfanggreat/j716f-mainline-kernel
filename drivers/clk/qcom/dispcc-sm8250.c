@@ -5,6 +5,7 @@
 
 #include <linux/clk-provider.h>
 #include <linux/module.h>
+#include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
 #include <linux/regmap.h>
@@ -553,19 +554,21 @@ static const struct freq_tbl ftbl_disp_cc_mdss_mdp_clk_src[] = {
 	{ }
 };
 
+static struct clk_init_data disp_cc_mdss_mdp_clk_src_init = {
+	.name = "disp_cc_mdss_mdp_clk_src",
+	.parent_data = disp_cc_parent_data_5,
+	.num_parents = ARRAY_SIZE(disp_cc_parent_data_5),
+	.flags = CLK_SET_RATE_PARENT,
+	.ops = &clk_rcg2_shared_ops,
+};
+
 static struct clk_rcg2 disp_cc_mdss_mdp_clk_src = {
 	.cmd_rcgr = 0x20c8,
 	.mnd_width = 0,
 	.hid_width = 5,
 	.parent_map = disp_cc_parent_map_5,
 	.freq_tbl = ftbl_disp_cc_mdss_mdp_clk_src,
-	.clkr.hw.init = &(const struct clk_init_data) {
-		.name = "disp_cc_mdss_mdp_clk_src",
-		.parent_data = disp_cc_parent_data_5,
-		.num_parents = ARRAY_SIZE(disp_cc_parent_data_5),
-		.flags = CLK_SET_RATE_PARENT,
-		.ops = &clk_rcg2_shared_ops,
-	},
+	.clkr.hw.init = &disp_cc_mdss_mdp_clk_src_init,
 };
 
 static struct clk_rcg2 disp_cc_mdss_pclk0_clk_src = {
@@ -1255,6 +1258,11 @@ static int disp_cc_sm8250_probe(struct platform_device *pdev)
 {
 	struct regmap *regmap;
 	int ret;
+
+	/* Keep the J716F bootloader scanout clock intact until DRM takes over. */
+	if (of_machine_is_compatible("lenovo,j716f"))
+		disp_cc_mdss_mdp_clk_src_init.ops =
+			&clk_rcg2_shared_no_init_park_ops;
 
 	ret = devm_pm_runtime_enable(&pdev->dev);
 	if (ret)

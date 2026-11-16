@@ -7,6 +7,7 @@
 
 #include <dt-bindings/arm/qcom,ids.h>
 #include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/phy/phy.h>
 #include <dt-bindings/regulator/qcom,rpmh-regulator.h>
 #include <dt-bindings/sound/qcom,q6afe.h>
 #include <dt-bindings/sound/qcom,q6asm.h>
@@ -1174,6 +1175,7 @@
 
 		vddio-supply = <&vreg_l14a_1p88>;
 		avdd-supply = <&panel_avdd>;
+		enable-gpios = <&tlmm 60 GPIO_ACTIVE_HIGH>;
 		reset-gpios = <&tlmm 75 GPIO_ACTIVE_LOW>;
 
 		ports {
@@ -1208,6 +1210,7 @@
 	status = "okay";
 
 	vdds-supply = <&vreg_l5a_0p88>;
+	phy-type = <PHY_TYPE_DPHY>;
 };
 
 &mdss_dsi1 {
@@ -1217,6 +1220,9 @@
 
 	qcom,dual-dsi-mode;
 	qcom,sync-dual-dsi;
+
+	/* DSI1 is the slave, so it takes DSI0's PHY clocks. */
+	assigned-clock-parents = <&mdss_dsi0_phy 0>, <&mdss_dsi0_phy 1>;
 };
 
 &mdss_dsi1_out {
@@ -1228,6 +1234,7 @@
 	status = "okay";
 
 	vdds-supply = <&vreg_l5a_0p88>;
+	phy-type = <PHY_TYPE_DPHY>;
 };
 
 /*

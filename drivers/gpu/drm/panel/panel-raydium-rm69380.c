@@ -7,6 +7,7 @@
 #include <linux/backlight.h>
 #include <linux/delay.h>
 #include <linux/gpio/consumer.h>
+#include <linux/minmax.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/of_device.h>
@@ -20,11 +21,16 @@
 #include <drm/drm_panel.h>
 #include <drm/drm_probe_helper.h>
 
+/* User-selected floor, sampled from the running J716F panel (362/2047). */
+#define RM69380_MIN_BRIGHTNESS 362
+#define RM69380_MAX_BRIGHTNESS 2047
+
 struct rm69380_panel {
 	struct drm_panel panel;
 	struct mipi_dsi_device *dsi[2];
 	struct regulator_bulk_data supplies[2];
 	struct gpio_desc *reset_gpio;
+	struct gpio_desc *enable_gpio;
 	/* Last brightness written; see rm69380_bl_get_brightness(). */
 	u16 brightness;
 };
@@ -120,10 +126,10 @@ static int rm69380_on(struct rm69380_panel *ctx)
 
 	/*
 	 * Set the initial brightness, as the vendor sequence does:
-	 *     39 01 00 00 00 00 03 51 07 ff
-	 * i.e. DCS 0x51 (set_display_brightness) with the 16-bit value 0x07ff
-	 * = 2047 = max. Written as a raw sequence because only the 8-bit
-	 * _multi helper exists (mipi_dsi_dcs_set_display_brightness_multi).
+	 *     DCS 0x51 (set_display_brightness) with a 16-bit value.
+	 * Start at the selected floor instead of flashing maximum brightness.
+	 * Written as a raw sequence because only the 8-bit _multi helper exists
+	 * (mipi_dsi_dcs_set_display_brightness_multi).
 	 *
 	 * The generated driver omitted this, and nothing else sets it either:
 	 * backlight_update_status() only runs on a sysfs write or on
@@ -134,7 +140,8 @@ static int rm69380_on(struct rm69380_panel *ctx)
 	 * (panel-novatek-nt36523.c: mipi_dsi_dcs_set_display_brightness(dsi, 18)).
 	 */
 	rm69380_dual_write_seq(&dsi_ctx, c1, MIPI_DCS_SET_DISPLAY_BRIGHTNESS,
-			       0x07, 0xff);
+			       RM69380_MIN_BRIGHTNESS >> 8,
+			       RM69380_MIN_BRIGHTNESS & 0xff);
 
 	rm69380_dual_exit_sleep(&dsi_ctx, c1);
 	mipi_dsi_msleep(&dsi_ctx, 20);
@@ -188,10 +195,20 @@ static int rm69380_prepare(struct drm_panel *panel)
 		return ret;
 	}
 
+	if (ctx->enable_gpio) {
+		ret = gpiod_direction_output(ctx->enable_gpio, 1);
+		if (ret < 0) {
+			regulator_bulk_disable(ARRAY_SIZE(ctx->supplies),
+					       ctx->supplies);
+			return ret;
+		}
+	}
+
 	rm69380_reset(ctx);
 
 	ret = rm69380_on(ctx);
 	if (ret < 0) {
+		gpiod_set_value_cansleep(ctx->enable_gpio, 0);
 		gpiod_set_value_cansleep(ctx->reset_gpio, 1);
 		regulator_bulk_disable(ARRAY_SIZE(ctx->supplies), ctx->supplies);
 	}
@@ -205,6 +222,7 @@ static int rm69380_unprepare(struct drm_panel *panel)
 
 	rm69380_off(ctx);
 
+	gpiod_set_value_cansleep(ctx->enable_gpio, 0);
 	gpiod_set_value_cansleep(ctx->reset_gpio, 1);
 	regulator_bulk_disable(ARRAY_SIZE(ctx->supplies), ctx->supplies);
 
@@ -272,6 +290,13 @@ static int rm69380_bl_update_status(struct backlight_device *bl)
 		return -ENODEV;
 
 	/*
+	 * Keep active brightness at the chosen floor, including slider zero.
+	 * Explicit blanking/suspend still sends zero through the normal API.
+	 */
+	if (!backlight_is_blank(bl))
+		brightness = max_t(u16, brightness, RM69380_MIN_BRIGHTNESS);
+
+	/*
 	 * In MSM bonded sync mode a command on DSI_0 returns success without
 	 * transmitting. DSI_1 triggers the same payload on both controllers,
 	 * so brightness must follow the dual-link initialization sequence.
@@ -334,8 +359,8 @@ rm69380_create_backlight(struct mipi_dsi_device *dsi)
 	struct device *dev = &dsi->dev;
 	const struct backlight_properties props = {
 		.type = BACKLIGHT_RAW,
-		.brightness = 511,
-		.max_brightness = 2047,
+		.brightness = RM69380_MIN_BRIGHTNESS,
+		.max_brightness = RM69380_MAX_BRIGHTNESS,
 	};
 
 	return devm_backlight_device_register(dev, dev_name(dev), dev, dsi,
@@ -367,6 +392,11 @@ static int rm69380_probe(struct mipi_dsi_device *dsi)
 	if (IS_ERR(ctx->reset_gpio))
 		return dev_err_probe(dev, PTR_ERR(ctx->reset_gpio),
 				     "Failed to get reset-gpios\n");
+
+	ctx->enable_gpio = devm_gpiod_get_optional(dev, "enable", GPIOD_ASIS);
+	if (IS_ERR(ctx->enable_gpio))
+		return dev_err_probe(dev, PTR_ERR(ctx->enable_gpio),
+				     "Failed to get enable-gpios\n");
 
 	dsi_sec = of_graph_get_remote_node(dsi->dev.of_node, 1, -1);
 

@@ -8,6 +8,7 @@
 #include <linux/clk.h>
 #include <linux/clk-provider.h>
 #include <linux/iopoll.h>
+#include <linux/of.h>
 
 #include "dsi_phy.h"
 #include "dsi.xml.h"
@@ -413,7 +414,8 @@ static void dsi_pll_disable_pll_bias(struct dsi_pll_7nm *pll)
 	} /* else: == 0 */
 
 	data = readl(pll->phy->base + REG_DSI_7nm_PHY_CMN_CTRL_0);
-	data &= ~DSI_7nm_PHY_CMN_CTRL_0_PLL_SHUTDOWNB;
+	data &= ~(DSI_7nm_PHY_CMN_CTRL_0_DIGTOP_PWRDN_B |
+		  DSI_7nm_PHY_CMN_CTRL_0_PLL_SHUTDOWNB);
 	writel(0, pll->phy->pll_base + REG_DSI_7nm_PHY_PLL_SYSTEM_MUXES);
 	writel(data, pll->phy->base + REG_DSI_7nm_PHY_CMN_CTRL_0);
 	spin_unlock_irqrestore(&pll->pll_enable_lock, flags);
@@ -433,7 +435,8 @@ static void dsi_pll_enable_pll_bias(struct dsi_pll_7nm *pll)
 	}
 
 	data = readl(pll->phy->base + REG_DSI_7nm_PHY_CMN_CTRL_0);
-	data |= DSI_7nm_PHY_CMN_CTRL_0_PLL_SHUTDOWNB;
+	data |= DSI_7nm_PHY_CMN_CTRL_0_DIGTOP_PWRDN_B |
+		DSI_7nm_PHY_CMN_CTRL_0_PLL_SHUTDOWNB;
 	writel(data, pll->phy->base + REG_DSI_7nm_PHY_CMN_CTRL_0);
 
 	writel(0xc0, pll->phy->pll_base + REG_DSI_7nm_PHY_PLL_SYSTEM_MUXES);
@@ -1143,6 +1146,9 @@ static int dsi_7nm_phy_enable(struct msm_dsi_phy *phy,
 	data = DSI_7nm_PHY_CMN_CTRL_0_DIGTOP_PWRDN_B |
 	       DSI_7nm_PHY_CMN_CTRL_0_PLL_SHUTDOWNB;
 	writel(data, base + REG_DSI_7nm_PHY_CMN_CTRL_0);
+	if (of_machine_is_compatible("lenovo,j716f"))
+		writel(0xc0, pll->phy->pll_base +
+			    REG_DSI_7nm_PHY_PLL_SYSTEM_MUXES);
 	spin_unlock_irqrestore(&pll->pll_enable_lock, flags);
 
 	/* Assert PLL core reset */
@@ -1284,6 +1290,10 @@ static void dsi_7nm_phy_disable(struct msm_dsi_phy *phy)
 	data &= ~0x1F;
 	writel(data, base + REG_DSI_7nm_PHY_CMN_CTRL_0);
 	writel(0, base + REG_DSI_7nm_PHY_CMN_LANE_CTRL0);
+
+	if (of_machine_is_compatible("lenovo,j716f"))
+		writel(0, pll->phy->pll_base +
+			    REG_DSI_7nm_PHY_PLL_SYSTEM_MUXES);
 
 	spin_lock_irqsave(&pll->pll_enable_lock, flags);
 	pll->pll_enable_cnt = 0;
