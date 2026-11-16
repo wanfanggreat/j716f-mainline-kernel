@@ -225,23 +225,21 @@ static int rm69380_on(struct rm69380_panel *ctx)
 	rm69380_dual_tear_on(&dsi_ctx, c1, MIPI_DSI_DCS_TEAR_MODE_VBLANK);
 
 	/*
-	 * Set the initial brightness, as the vendor sequence does:
-	 *     DCS 0x51 (set_display_brightness) with a 16-bit value.
-	 * Start at the selected floor instead of flashing maximum brightness.
-	 * Written as a raw sequence because only the 8-bit _multi helper exists
+	 * Vendor init sends DCS 0x51 with 0x07ff (maximum) before 0x11/0x29.
+	 * The backlight core applies the user level right after panel enable,
+	 * so keep the vendor value here: the panel's first DBV may be part of
+	 * its OTP/gamma bring-up.  Written as a raw sequence because only the
+	 * 8-bit _multi helper exists
 	 * (mipi_dsi_dcs_set_display_brightness_multi).
 	 *
 	 * The generated driver omitted this, and nothing else sets it either:
 	 * backlight_update_status() only runs on a sysfs write or on
 	 * register/resume, so the panel came up with its brightness register
 	 * at 0 and the AMOLED stayed black even though the DSI link was
-	 * streaming correctly. The mainline-verified SM8250 panel driver sets
-	 * an initial brightness in its enable path too
-	 * (panel-novatek-nt36523.c: mipi_dsi_dcs_set_display_brightness(dsi, 18)).
+	 * streaming correctly.
 	 */
 	rm69380_dual_write_seq(&dsi_ctx, c1, MIPI_DCS_SET_DISPLAY_BRIGHTNESS,
-			       RM69380_MIN_BRIGHTNESS >> 8,
-			       RM69380_MIN_BRIGHTNESS & 0xff);
+			       0x07, 0xff);
 
 	rm69380_dual_exit_sleep(&dsi_ctx, c1);
 	mipi_dsi_msleep(&dsi_ctx, 20);
