@@ -593,12 +593,15 @@
 		 * then vdd/lab/ibb before releasing reset; without this rail the
 		 * mainline panel driver never reproduces that sequence.
 		 *
-		 * Vendor constraints from the stock DTB: 3.104-3.304 V, HPM.
+		 * Vendor constraints from the stock DTB: 3.104-3.304 V, with
+		 * qcom,init-voltage = 3.104 V.  The mainline RPMh regulator
+		 * picked 3.296 V from the range; pin min=max to the vendor
+		 * initial value for the power A/B.
 		 */
 		vreg_l11d_3p1: ldoc11 {
 			regulator-name = "vreg_l11d_3p1";
 			regulator-min-microvolt = <3104000>;
-			regulator-max-microvolt = <3304000>;
+			regulator-max-microvolt = <3104000>;
 			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
 			regulator-allow-set-load;
 			regulator-allowed-modes = <RPMH_REGULATOR_MODE_LPM
