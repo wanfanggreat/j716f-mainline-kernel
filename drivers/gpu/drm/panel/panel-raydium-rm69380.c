@@ -21,8 +21,12 @@
 #include <drm/drm_panel.h>
 #include <drm/drm_probe_helper.h>
 
-/* User-selected floor, sampled from the running J716F panel (362/2047). */
-#define RM69380_MIN_BRIGHTNESS 362
+/*
+ * LOS24's minimum brightness is 6 nits -> framework backlight 25/255 ->
+ * panel DBV 25 * 2047 / 255 = 200.  Use the same floor so the Linux slider
+ * starts where LOS24/ZUI starts instead of the previous 362 floor.
+ */
+#define RM69380_MIN_BRIGHTNESS 200
 #define RM69380_MAX_BRIGHTNESS 2047
 
 /*
