@@ -25,12 +25,27 @@
 #define RM69380_MIN_BRIGHTNESS 362
 #define RM69380_MAX_BRIGHTNESS 2047
 
+/*
+ * Vendor panel power order (downstream dsi_panel_power_on):
+ *   vddio -> 20 ms -> vdd -> lab -> ibb -> 20 ms -> pinctrl -> reset.
+ * The mainline driver only has vddio/vdd/avdd; lab/ibb are not modelled yet,
+ * so this is the closest reproducible subset.
+ */
+#define RM69380_SUPPLY_VDDIO	0
+#define RM69380_SUPPLY_VDD	1
+#define RM69380_SUPPLY_AVDD	2
+#define RM69380_SUPPLY_COUNT	3
+#define RM69380_POWER_ON_DELAY_US	20000
+#define RM69380_POWER_CYCLE_DELAY_MS	50
+
 struct rm69380_panel {
 	struct drm_panel panel;
 	struct mipi_dsi_device *dsi[2];
-	struct regulator_bulk_data supplies[2];
+	struct regulator_bulk_data supplies[RM69380_SUPPLY_COUNT];
 	struct gpio_desc *reset_gpio;
 	struct gpio_desc *enable_gpio;
+	/* First bring-up forces a vendor-like vdd/avdd power cycle. */
+	bool power_cycled;
 	/* Last brightness written; see rm69380_bl_get_brightness(). */
 	u16 brightness;
 };
@@ -49,6 +64,91 @@ static void rm69380_reset(struct rm69380_panel *ctx)
 	usleep_range(10000, 11000);
 	gpiod_set_value_cansleep(ctx->reset_gpio, 0);
 	msleep(30);
+}
+
+/*
+ * Enable the panel rails in the vendor order.  VDDIO is shared with the
+ * touch controller on this board and usually stays on; VDD (PM8150A L11)
+ * and AVDD are the rails the mainline driver used to leave untouched.
+ */
+static int rm69380_power_rails(struct rm69380_panel *ctx)
+{
+	int ret;
+
+	ret = regulator_enable(ctx->supplies[RM69380_SUPPLY_VDDIO].consumer);
+	if (ret)
+		return ret;
+	usleep_range(RM69380_POWER_ON_DELAY_US,
+		     RM69380_POWER_ON_DELAY_US + 1000);
+
+	ret = regulator_enable(ctx->supplies[RM69380_SUPPLY_VDD].consumer);
+	if (ret)
+		goto err_vddio;
+
+	ret = regulator_enable(ctx->supplies[RM69380_SUPPLY_AVDD].consumer);
+	if (ret)
+		goto err_vdd;
+
+	usleep_range(RM69380_POWER_ON_DELAY_US,
+		     RM69380_POWER_ON_DELAY_US + 1000);
+
+	return 0;
+
+err_vdd:
+	(void)regulator_disable(ctx->supplies[RM69380_SUPPLY_VDD].consumer);
+err_vddio:
+	(void)regulator_disable(ctx->supplies[RM69380_SUPPLY_VDDIO].consumer);
+	return ret;
+}
+
+/*
+ * On the first prepare the bootloader may have left VDD/AVDD enabled, so a
+ * plain enable would only bump refcounts and never power-cycle the panel.
+ * Enable once (so the consumer refs exist), then drop VDD/AVDD and redo the
+ * vendor order.  VDDIO is deliberately not dropped: it is shared with the
+ * touch controller and cannot be switched off by this driver.
+ */
+static int rm69380_power_on(struct rm69380_panel *ctx)
+{
+	int ret;
+
+	ret = rm69380_power_rails(ctx);
+	if (ret)
+		return ret;
+
+	if (ctx->power_cycled)
+		return 0;
+
+	(void)regulator_disable(ctx->supplies[RM69380_SUPPLY_AVDD].consumer);
+	(void)regulator_disable(ctx->supplies[RM69380_SUPPLY_VDD].consumer);
+	msleep(RM69380_POWER_CYCLE_DELAY_MS);
+
+	ret = regulator_enable(ctx->supplies[RM69380_SUPPLY_VDD].consumer);
+	if (ret)
+		goto err_vddio;
+
+	ret = regulator_enable(ctx->supplies[RM69380_SUPPLY_AVDD].consumer);
+	if (ret)
+		goto err_vdd;
+
+	usleep_range(RM69380_POWER_ON_DELAY_US,
+		     RM69380_POWER_ON_DELAY_US + 1000);
+	ctx->power_cycled = true;
+
+	return 0;
+
+err_vdd:
+	(void)regulator_disable(ctx->supplies[RM69380_SUPPLY_VDD].consumer);
+err_vddio:
+	(void)regulator_disable(ctx->supplies[RM69380_SUPPLY_VDDIO].consumer);
+	return ret;
+}
+
+static void rm69380_power_off(struct rm69380_panel *ctx)
+{
+	(void)regulator_disable(ctx->supplies[RM69380_SUPPLY_AVDD].consumer);
+	(void)regulator_disable(ctx->supplies[RM69380_SUPPLY_VDD].consumer);
+	(void)regulator_disable(ctx->supplies[RM69380_SUPPLY_VDDIO].consumer);
 }
 
 /*
@@ -188,7 +288,7 @@ static int rm69380_prepare(struct drm_panel *panel)
 	struct rm69380_panel *ctx = to_rm69380_panel(panel);
 	int ret;
 
-	ret = regulator_bulk_enable(ARRAY_SIZE(ctx->supplies), ctx->supplies);
+	ret = rm69380_power_on(ctx);
 	if (ret < 0) {
 		dev_err(&ctx->dsi[0]->dev,
 			"failed to enable regulators: %d\n", ret);
@@ -198,8 +298,7 @@ static int rm69380_prepare(struct drm_panel *panel)
 	if (ctx->enable_gpio) {
 		ret = gpiod_direction_output(ctx->enable_gpio, 1);
 		if (ret < 0) {
-			regulator_bulk_disable(ARRAY_SIZE(ctx->supplies),
-					       ctx->supplies);
+			rm69380_power_off(ctx);
 			return ret;
 		}
 	}
@@ -210,7 +309,7 @@ static int rm69380_prepare(struct drm_panel *panel)
 	if (ret < 0) {
 		gpiod_set_value_cansleep(ctx->enable_gpio, 0);
 		gpiod_set_value_cansleep(ctx->reset_gpio, 1);
-		regulator_bulk_disable(ARRAY_SIZE(ctx->supplies), ctx->supplies);
+		rm69380_power_off(ctx);
 	}
 
 	return ret;
@@ -224,7 +323,7 @@ static int rm69380_unprepare(struct drm_panel *panel)
 
 	gpiod_set_value_cansleep(ctx->enable_gpio, 0);
 	gpiod_set_value_cansleep(ctx->reset_gpio, 1);
-	regulator_bulk_disable(ARRAY_SIZE(ctx->supplies), ctx->supplies);
+	rm69380_power_off(ctx);
 
 	return 0;
 }
@@ -381,8 +480,9 @@ static int rm69380_probe(struct mipi_dsi_device *dsi)
 	if (IS_ERR(ctx))
 		return PTR_ERR(ctx);
 
-	ctx->supplies[0].supply = "vddio";
-	ctx->supplies[1].supply = "avdd";
+	ctx->supplies[RM69380_SUPPLY_VDDIO].supply = "vddio";
+	ctx->supplies[RM69380_SUPPLY_VDD].supply = "vdd";
+	ctx->supplies[RM69380_SUPPLY_AVDD].supply = "avdd";
 	ret = devm_regulator_bulk_get(dev, ARRAY_SIZE(ctx->supplies),
 				      ctx->supplies);
 	if (ret < 0)

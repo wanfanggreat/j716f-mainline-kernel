@@ -585,6 +585,25 @@
 			regulator-max-microvolt = <3312000>;
 			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
 		};
+
+		/*
+		 * PM8150A LDO11 is the panel's "vdd" rail in the vendor DT
+		 * (pm8150a_l11 -> qcom,dsi-display-primary:vdd-supply).  The
+		 * vendor panel power-up order enables vddio first, waits 20 ms,
+		 * then vdd/lab/ibb before releasing reset; without this rail the
+		 * mainline panel driver never reproduces that sequence.
+		 *
+		 * Vendor constraints from the stock DTB: 3.104-3.304 V, HPM.
+		 */
+		vreg_l11d_3p1: ldoc11 {
+			regulator-name = "vreg_l11d_3p1";
+			regulator-min-microvolt = <3104000>;
+			regulator-max-microvolt = <3304000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+			regulator-allow-set-load;
+			regulator-allowed-modes = <RPMH_REGULATOR_MODE_LPM
+						   RPMH_REGULATOR_MODE_HPM>;
+		};
 	};
 };
 
@@ -1174,6 +1193,7 @@
 		reg = <0>;
 
 		vddio-supply = <&vreg_l14a_1p88>;
+		vdd-supply = <&vreg_l11d_3p1>;
 		avdd-supply = <&panel_avdd>;
 		enable-gpios = <&tlmm 60 GPIO_ACTIVE_HIGH>;
 		reset-gpios = <&tlmm 75 GPIO_ACTIVE_LOW>;
