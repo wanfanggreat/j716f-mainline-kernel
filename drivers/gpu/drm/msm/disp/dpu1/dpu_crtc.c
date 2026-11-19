@@ -14,6 +14,7 @@
 
 #include <drm/drm_atomic.h>
 #include <drm/drm_blend.h>
+#include <drm/drm_color_mgmt.h>
 #include <drm/drm_crtc.h>
 #include <drm/drm_flip_work.h>
 #include <drm/drm_framebuffer.h>
@@ -41,8 +42,29 @@
 /* timeout in ms waiting for frame done */
 #define DPU_CRTC_FRAME_DONE_TIMEOUT_MS	60
 
-#define	CONVERT_S3_15(val) \
-	(((((u64)val) & ~BIT_ULL(63)) >> 17) & GENMASK_ULL(17, 0))
+/* PCC stores DRM's sign-magnitude CTM coefficients in signed 18-bit Q3.15. */
+static u32 dpu_crtc_s31_32_to_s3_15(u64 val)
+{
+	return drm_color_ctm_s31_32_to_qm_n(val, 3, 15) & GENMASK(17, 0);
+}
+
+/*
+ * Lenovo J716F: at the panel minimum brightness the RM69380 loses saturation
+ * relative to ZUI 15, which keeps the panel at a high DBV and dims digitally.
+ * This is the least-squares fit from the six colour bars at DBV233/k=0.26 to
+ * ZUI 45/255, with each row normalised so white stays neutral.
+ */
+static struct dpu_hw_pcc_cfg j716f_pcc_default = {
+	.r = { .r = 34954, .g = 261869, .b = 260230 },
+	.g = { .r = 157,   .g = 34950,  .b = 259804 },
+	.b = { .r = 261544, .g = 260283, .b = 35229 },
+};
+
+static bool pcc_default_enable = true;
+module_param(pcc_default_enable, bool, 0644);
+MODULE_PARM_DESC(pcc_default_enable,
+		 "J716F: apply the calibrated low-brightness PCC matrix");
+
 
 static struct dpu_kms *_dpu_crtc_get_kms(struct drm_crtc *crtc)
 {
@@ -802,17 +824,17 @@ static void _dpu_crtc_get_pcc_coeff(struct drm_crtc_state *state,
 	if (!ctm)
 		return;
 
-	cfg->r.r = CONVERT_S3_15(ctm->matrix[0]);
-	cfg->g.r = CONVERT_S3_15(ctm->matrix[1]);
-	cfg->b.r = CONVERT_S3_15(ctm->matrix[2]);
+	cfg->r.r = dpu_crtc_s31_32_to_s3_15(ctm->matrix[0]);
+	cfg->r.g = dpu_crtc_s31_32_to_s3_15(ctm->matrix[1]);
+	cfg->r.b = dpu_crtc_s31_32_to_s3_15(ctm->matrix[2]);
 
-	cfg->r.g = CONVERT_S3_15(ctm->matrix[3]);
-	cfg->g.g = CONVERT_S3_15(ctm->matrix[4]);
-	cfg->b.g = CONVERT_S3_15(ctm->matrix[5]);
+	cfg->g.r = dpu_crtc_s31_32_to_s3_15(ctm->matrix[3]);
+	cfg->g.g = dpu_crtc_s31_32_to_s3_15(ctm->matrix[4]);
+	cfg->g.b = dpu_crtc_s31_32_to_s3_15(ctm->matrix[5]);
 
-	cfg->r.b = CONVERT_S3_15(ctm->matrix[6]);
-	cfg->g.b = CONVERT_S3_15(ctm->matrix[7]);
-	cfg->b.b = CONVERT_S3_15(ctm->matrix[8]);
+	cfg->b.r = dpu_crtc_s31_32_to_s3_15(ctm->matrix[6]);
+	cfg->b.g = dpu_crtc_s31_32_to_s3_15(ctm->matrix[7]);
+	cfg->b.b = dpu_crtc_s31_32_to_s3_15(ctm->matrix[8]);
 }
 
 static void _dpu_crtc_get_gc_lut(struct drm_crtc_state *state,
@@ -867,11 +889,13 @@ static void _dpu_crtc_setup_cp_blocks(struct drm_crtc *crtc)
 			continue;
 
 		if (dspp->ops.setup_pcc) {
-			if (!state->ctm) {
-				dspp->ops.setup_pcc(dspp, NULL);
-			} else {
+			if (state->ctm) {
 				_dpu_crtc_get_pcc_coeff(state, &cfg);
 				dspp->ops.setup_pcc(dspp, &cfg);
+			} else if (pcc_default_enable) {
+				dspp->ops.setup_pcc(dspp, &j716f_pcc_default);
+			} else {
+				dspp->ops.setup_pcc(dspp, NULL);
 			}
 
 			/* stage config flush mask */
