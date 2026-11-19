@@ -51,13 +51,14 @@ static u32 dpu_crtc_s31_32_to_s3_15(u64 val)
 /*
  * Lenovo J716F: at the panel minimum brightness the RM69380 loses saturation
  * relative to ZUI 15, which keeps the panel at a high DBV and dims digitally.
- * This is the least-squares fit from the six colour bars at DBV233/k=0.26 to
- * ZUI 45/255, with each row normalised so white stays neutral.
+ * This is the least-squares fit from the six colour bars after the userspace
+ * sRGB gamma + 10% white trim (DBV233/k=0.26) to ZUI 45/255, with each row
+ * normalised so white stays neutral.
  */
 static struct dpu_hw_pcc_cfg j716f_pcc_default = {
-	.r = { .r = 34954, .g = 261869, .b = 260230 },
-	.g = { .r = 157,   .g = 34950,  .b = 259804 },
-	.b = { .r = 261544, .g = 260283, .b = 35229 },
+	.r = { .r = 34781, .g = 261626, .b = 260650 },
+	.g = { .r = 121,   .g = 34129,  .b = 260663 },
+	.b = { .r = 261757, .g = 260201, .b = 35098 },
 };
 
 static bool pcc_default_enable = true;
