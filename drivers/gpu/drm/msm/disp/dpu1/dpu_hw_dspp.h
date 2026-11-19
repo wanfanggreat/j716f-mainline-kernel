@@ -8,17 +8,40 @@
 struct dpu_hw_dspp;
 
 /**
- * struct dpu_hw_pcc_coeff - PCC coefficient structure for each color
- *                            component.
- * @r: red coefficient.
- * @g: green coefficient.
- * @b: blue coefficient.
+ * struct dpu_hw_pcc_coeff - PCC coefficient structure for one output component
+ * @c: constant coefficient.
+ * @r: red linear coefficient.
+ * @g: green linear coefficient.
+ * @b: blue linear coefficient.
+ * @rg: red*green cross coefficient.
+ * @rb: red*blue cross coefficient.
+ * @gb: green*blue cross coefficient.
+ * @rgb: red*green*blue cross coefficient.
+ * @rr: red*red second order coefficient.
+ * @gg: green*green second order coefficient.
+ * @bb: blue*blue second order coefficient.
+ *
+ * The v4 register layout (11 groups of three 32 bit lanes, offsets 0x04
+ * through 0x84) is verified from the vendor v4 writer.  The linear terms use
+ * the S3.15 encoding described in dpu_crtc.c.  The bit width, signedness and
+ * fixed-point scaling of the v4 constant, cross and second order terms are
+ * still unverified: the 0x3ffff mask in the v1.7 vendor writer covers only
+ * the v1.7 coefficient fields and does not establish the v4 second order
+ * term width.
  */
 
 struct dpu_hw_pcc_coeff {
+	__u32 c;
 	__u32 r;
 	__u32 g;
 	__u32 b;
+	__u32 rg;
+	__u32 rb;
+	__u32 gb;
+	__u32 rgb;
+	__u32 rr;
+	__u32 gg;
+	__u32 bb;
 };
 
 /**

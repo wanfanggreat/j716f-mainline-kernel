@@ -425,6 +425,20 @@ static const struct dpu_dspp_sub_blks sdm845_dspp_sblk = {
 		.len = 0x40, .version = 0x10008},
 };
 
+/*
+ * SM8250 reuses the sdm845 DSPP offsets and also reports PCC version
+ * 0x40000, so the version number alone cannot select the v4 writer.  Opt in
+ * explicitly here and leave every other user of sdm845_dspp_sblk on the
+ * existing 3x3 writer.
+ */
+static const struct dpu_dspp_sub_blks sm8250_dspp_sblk = {
+	.pcc = {.name = "pcc", .base = 0x1700,
+		.len = 0x90, .version = 0x40000},
+	.gc = {.name = "gc", .base = 0x17c0,
+		.len = 0x40, .version = 0x10008},
+	.pcc_v4_full = true,
+};
+
 static const struct dpu_dspp_sub_blks sm8750_dspp_sblk = {
 	.pcc = {.name = "pcc", .base = 0x1700,
 		.len = 0x90, .version = 0x60000},

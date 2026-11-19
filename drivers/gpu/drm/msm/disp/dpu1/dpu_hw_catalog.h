@@ -331,10 +331,13 @@ struct dpu_lm_sub_blks {
  * struct dpu_dspp_sub_blks: Information of DSPP block
  * @pcc: pixel color correction block
  * @gc: gamma correction block
+ * @pcc_v4_full: PCC block implements the v4 8 terms per output layout
+ *               (33 coefficients plus an enable bit)
  */
 struct dpu_dspp_sub_blks {
 	struct dpu_pp_blk pcc;
 	struct dpu_pp_blk gc;
+	bool pcc_v4_full;
 };
 
 struct dpu_pingpong_sub_blks {

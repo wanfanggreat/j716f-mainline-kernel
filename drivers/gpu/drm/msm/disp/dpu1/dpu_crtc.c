@@ -11,6 +11,7 @@
 #include <linux/debugfs.h>
 #include <linux/ktime.h>
 #include <linux/bits.h>
+#include <linux/of.h>
 
 #include <drm/drm_atomic.h>
 #include <drm/drm_blend.h>
@@ -65,6 +66,22 @@ static bool pcc_default_enable = true;
 module_param(pcc_default_enable, bool, 0644);
 MODULE_PARM_DESC(pcc_default_enable,
 		 "J716F: apply the calibrated low-brightness PCC matrix");
+
+/*
+ * J716F PCC v4 probe: add a small positive output-R * RG term on top of the
+ * fit2 matrix, so a red+green input pair should raise output R.  The probe is
+ * deliberately not a calibration: the cross term scaling is unconfirmed and
+ * white will move too.  Its only job is to show that the term reaches the
+ * panel.  0x400 is a raw experimental code; if the cross terms use the same
+ * S3.15 scale as the linear terms it is 1/32, i.e. about 8 output codes at
+ * full R=G.  Marked for measurement on hardware.
+ */
+#define J716F_PCC_PROBE_R_RG 0x400
+
+static bool pcc_probe_rg_enable;
+module_param(pcc_probe_rg_enable, bool, 0644);
+MODULE_PARM_DESC(pcc_probe_rg_enable,
+		 "J716F: add the PCC v4 output-R RG cross term on the internal panel (default off)");
 
 
 static struct dpu_kms *_dpu_crtc_get_kms(struct drm_crtc *crtc)
@@ -838,6 +855,62 @@ static void _dpu_crtc_get_pcc_coeff(struct drm_crtc_state *state,
 	cfg->b.b = dpu_crtc_s31_32_to_s3_15(ctm->matrix[8]);
 }
 
+/*
+ * The J716F probe is only meaningful on this board's internal DSI panel.
+ * Look at the encoders attached to this CRTC's new state: a display can have
+ * a DSI encoder somewhere but not drive this CRTC, and other machines may
+ * have DSI outputs of their own.
+ */
+static bool _dpu_crtc_pcc_probe_target(struct drm_device *dev,
+				       struct drm_crtc_state *state)
+{
+	struct drm_encoder *encoder;
+
+	if (!of_machine_is_compatible("lenovo,j716f"))
+		return false;
+
+	drm_for_each_encoder_mask(encoder, dev, state->encoder_mask) {
+		if (encoder->encoder_type == DRM_MODE_ENCODER_DSI)
+			return true;
+	}
+
+	return false;
+}
+
+/*
+ * Build the PCC configuration for one CRTC commit.
+ *
+ * Priority is the user CTM, then the board fit2 matrix, then bypass.  The
+ * probe only modifies the board matrix, so a user CTM always wins.  A bypass
+ * commit clears the PCC enable bit; the next enable rewrites all coefficients
+ * before setting it, which is what makes the probe reversible.
+ *
+ * Returns true when PCC must be enabled, false to bypass it.
+ */
+static bool _dpu_crtc_pcc_config(struct drm_crtc_state *state, bool v4_full,
+				 bool internal_panel, bool default_enable,
+				 bool probe_enable,
+				 struct dpu_hw_pcc_cfg *cfg)
+{
+	/* Leave every v4-only term zero for the CTM and plain fit2 cases. */
+	memset(cfg, 0, sizeof(*cfg));
+
+	if (state->ctm) {
+		_dpu_crtc_get_pcc_coeff(state, cfg);
+		return true;
+	}
+
+	if (!default_enable)
+		return false;
+
+	*cfg = j716f_pcc_default;
+
+	if (probe_enable && v4_full && internal_panel)
+		cfg->r.rg = J716F_PCC_PROBE_R_RG;
+
+	return true;
+}
+
 static void _dpu_crtc_get_gc_lut(struct drm_crtc_state *state,
 		struct dpu_hw_gc_lut *gc_lut)
 {
@@ -876,11 +949,24 @@ static void _dpu_crtc_setup_cp_blocks(struct drm_crtc *crtc)
 	struct dpu_hw_gc_lut *gc_lut;
 	struct dpu_hw_ctl *ctl;
 	struct dpu_hw_dspp *dspp;
+	bool pcc_default, pcc_probe, internal_panel;
 	int i;
 
 
 	if (!state->color_mgmt_changed && !drm_atomic_crtc_needs_modeset(state))
 		return;
+
+	/*
+	 * Snapshot the colour policy once per commit, before the mixer loop,
+	 * so both halves program the same PCC configuration.  Writing the
+	 * module parameters only changes these variables; nothing reaches the
+	 * hardware until the next colour commit or modeset runs this function
+	 * again.
+	 */
+	pcc_default = pcc_default_enable;
+	pcc_probe = pcc_probe_rg_enable;
+	internal_panel = pcc_probe && pcc_default && !state->ctm &&
+			 _dpu_crtc_pcc_probe_target(crtc->dev, state);
 
 	for (i = 0; i < cstate->num_mixers; i++) {
 		ctl = mixer[i].lm_ctl;
@@ -890,14 +976,13 @@ static void _dpu_crtc_setup_cp_blocks(struct drm_crtc *crtc)
 			continue;
 
 		if (dspp->ops.setup_pcc) {
-			if (state->ctm) {
-				_dpu_crtc_get_pcc_coeff(state, &cfg);
+			if (_dpu_crtc_pcc_config(state,
+						 dspp->cap->sblk->pcc_v4_full,
+						 internal_panel, pcc_default,
+						 pcc_probe, &cfg))
 				dspp->ops.setup_pcc(dspp, &cfg);
-			} else if (pcc_default_enable) {
-				dspp->ops.setup_pcc(dspp, &j716f_pcc_default);
-			} else {
+			else
 				dspp->ops.setup_pcc(dspp, NULL);
-			}
 
 			/* stage config flush mask */
 			ctl->ops.update_pending_flush_dspp(ctl,

@@ -24,6 +24,30 @@
 #define PCC_BLUE_G_OFF 0x24
 #define PCC_BLUE_B_OFF 0x30
 
+/*
+ * PCC v4 (SM8250, DSPP PCC version 0x40000) coefficient groups.  Each group
+ * holds one coefficient for the three output components, four bytes apart:
+ * output R at the group offset, output G at +0x4 and output B at +0x8.
+ *
+ * Taken from the vendor display driver, sde_hw_color_proc_common_v4.h
+ * (PCC_C_OFF, PCC_R_OFF, ..., PCC_BB_OFF) and cross-checked against the
+ * register packing in sde_hw_reg_dma_v1_color_proc.c, which writes 33
+ * consecutive words starting at PCC_C_OFF.  The last coefficient is
+ * PCC_BB_OFF + 0x8 = 0x84, inside the 0x90 byte PCC block.
+ */
+#define PCC_C_OFF 0x04
+#define PCC_R_OFF 0x10
+#define PCC_G_OFF 0x1c
+#define PCC_B_OFF 0x28
+#define PCC_RG_OFF 0x34
+#define PCC_RB_OFF 0x40
+#define PCC_GB_OFF 0x4c
+#define PCC_RGB_OFF 0x58
+#define PCC_RR_OFF 0x64
+#define PCC_GG_OFF 0x70
+#define PCC_BB_OFF 0x7c
+#define PCC_LANE_STRIDE 0x04
+
 /* DSPP_GC */
 #define GC_EN BIT(0)
 #define GC_DIS 0
@@ -71,6 +95,66 @@ static void dpu_setup_dspp_pcc(struct dpu_hw_dspp *ctx,
 	DPU_REG_WRITE(&ctx->hw, base + PCC_BLUE_R_OFF, cfg->b.r);
 	DPU_REG_WRITE(&ctx->hw, base + PCC_BLUE_G_OFF, cfg->b.g);
 	DPU_REG_WRITE(&ctx->hw, base + PCC_BLUE_B_OFF, cfg->b.b);
+
+	DPU_REG_WRITE(&ctx->hw, base, PCC_EN);
+}
+
+/*
+ * Program one output component (lane 0 = R, 1 = G, 2 = B) of the PCC v4
+ * coefficient block.  The order below is ascending by address; the vendor
+ * AHB writer programs the second order terms first, but both paths end with
+ * the same 33 values before the enable bit is set.
+ */
+static void dpu_setup_dspp_pcc_v4_lane(struct dpu_hw_dspp *ctx, u32 base,
+				       u32 lane,
+				       const struct dpu_hw_pcc_coeff *coeff)
+{
+	u32 off = base + lane * PCC_LANE_STRIDE;
+
+	DPU_REG_WRITE(&ctx->hw, off + PCC_C_OFF, coeff->c);
+	DPU_REG_WRITE(&ctx->hw, off + PCC_R_OFF, coeff->r);
+	DPU_REG_WRITE(&ctx->hw, off + PCC_G_OFF, coeff->g);
+	DPU_REG_WRITE(&ctx->hw, off + PCC_B_OFF, coeff->b);
+	DPU_REG_WRITE(&ctx->hw, off + PCC_RG_OFF, coeff->rg);
+	DPU_REG_WRITE(&ctx->hw, off + PCC_RB_OFF, coeff->rb);
+	DPU_REG_WRITE(&ctx->hw, off + PCC_GB_OFF, coeff->gb);
+	DPU_REG_WRITE(&ctx->hw, off + PCC_RGB_OFF, coeff->rgb);
+	DPU_REG_WRITE(&ctx->hw, off + PCC_RR_OFF, coeff->rr);
+	DPU_REG_WRITE(&ctx->hw, off + PCC_GG_OFF, coeff->gg);
+	DPU_REG_WRITE(&ctx->hw, off + PCC_BB_OFF, coeff->bb);
+}
+
+static void dpu_setup_dspp_pcc_v4(struct dpu_hw_dspp *ctx,
+				  struct dpu_hw_pcc_cfg *cfg)
+{
+	u32 base;
+
+	if (!ctx) {
+		DRM_ERROR("invalid ctx %p\n", ctx);
+		return;
+	}
+
+	base = ctx->cap->sblk->pcc.base;
+
+	if (!base) {
+		DRM_ERROR("invalid ctx %p pcc base 0x%x\n", ctx, base);
+		return;
+	}
+
+	if (!cfg) {
+		DRM_DEBUG_DRIVER("disable pcc feature\n");
+		DPU_REG_WRITE(&ctx->hw, base, PCC_DIS);
+		return;
+	}
+
+	/*
+	 * Always write all 33 coefficients: the block has no per-term update
+	 * mask, so a partial update would leave the previous commit's cross
+	 * and second order terms in place.
+	 */
+	dpu_setup_dspp_pcc_v4_lane(ctx, base, 0, &cfg->r);
+	dpu_setup_dspp_pcc_v4_lane(ctx, base, 1, &cfg->g);
+	dpu_setup_dspp_pcc_v4_lane(ctx, base, 2, &cfg->b);
 
 	DPU_REG_WRITE(&ctx->hw, base, PCC_EN);
 }
@@ -142,8 +226,12 @@ struct dpu_hw_dspp *dpu_hw_dspp_init(struct drm_device *dev,
 	/* Assign ops */
 	c->idx = cfg->id;
 	c->cap = cfg;
-	if (c->cap->sblk->pcc.base)
-		c->ops.setup_pcc = dpu_setup_dspp_pcc;
+	if (c->cap->sblk->pcc.base) {
+		if (c->cap->sblk->pcc_v4_full)
+			c->ops.setup_pcc = dpu_setup_dspp_pcc_v4;
+		else
+			c->ops.setup_pcc = dpu_setup_dspp_pcc;
+	}
 	if (c->cap->sblk->gc.base)
 		c->ops.setup_gc = dpu_setup_dspp_gc;
 
