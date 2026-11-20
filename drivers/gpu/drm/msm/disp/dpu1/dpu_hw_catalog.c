@@ -430,12 +430,20 @@ static const struct dpu_dspp_sub_blks sdm845_dspp_sblk = {
  * 0x40000, so the version number alone cannot select the v4 writer.  Opt in
  * explicitly here and leave every other user of sdm845_dspp_sblk on the
  * existing 3x3 writer.
+ *
+ * The 3D gamut block sits at 0x1000 (vendor qcom,sde-dspp-gamut =
+ * <0x1000 0x40002>).  The IGC data ports are shared in DSPP Top at
+ * MDSS+0x1300, i.e. MDP+0x300; each DSPP still has its own opmode/enable
+ * register at +0x0.
  */
 static const struct dpu_dspp_sub_blks sm8250_dspp_sblk = {
 	.pcc = {.name = "pcc", .base = 0x1700,
 		.len = 0x90, .version = 0x40000},
 	.gc = {.name = "gc", .base = 0x17c0,
 		.len = 0x40, .version = 0x10008},
+	.gamut = {.name = "gamut", .base = 0x1000,
+		.len = 0xa0, .version = 0x40002},
+	.igc_lut_base = 0x300,
 	.pcc_v4_full = true,
 };
 

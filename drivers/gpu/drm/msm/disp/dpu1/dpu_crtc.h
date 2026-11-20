@@ -152,6 +152,10 @@ struct dpu_crtc_frame_event {
  * @phandle: Pointer to power handler
  * @cur_perf      : current performance committed to clock/bandwidth driver
  * @crc_source    : CRC source
+ * @cp_programmed : colour-processing blocks hold the current CP signature
+ * @cp_needs_replay : force a full CP replay on the next commit (after disable
+ *                  or a resource change)
+ * @cp_param_sig  : signature of the module-parameter driven default policy
  */
 struct dpu_crtc {
 	struct drm_crtc base;
@@ -183,6 +187,20 @@ struct dpu_crtc {
 	struct dpu_core_perf_params cur_perf;
 
 	struct dpu_crtc_smmu_state_data smmu_state;
+
+	/*
+	 * The DSPP colour blocks are programmed from the atomic state rather
+	 * than unconditionally on every commit.  cp_signature covers the
+	 * userspace blobs plus the default-policy module parameters;
+	 * cp_needs_replay is set whenever the hardware may have lost the
+	 * programming (CRTC disable, resource re-assignment, power collapse).
+	 */
+	bool cp_programmed;
+	bool cp_needs_replay;
+	u64 cp_signature;
+
+	/* Private 3D gamut blob property (0x9a70-byte vendor payload) */
+	struct drm_property *gamut_lut_property;
 };
 
 #define to_dpu_crtc(x) container_of(x, struct dpu_crtc, base)
@@ -204,6 +222,7 @@ struct dpu_crtc {
  * @hw_ctls       : List of active ctl paths
  * @crc_source    : CRC source
  * @crc_frame_skip_count: Number of frames skipped before getting CRC
+ * @gamut_lut     : optional 3D gamut payload (private blob)
  */
 struct dpu_crtc_state {
 	struct drm_crtc_state base;
@@ -225,6 +244,13 @@ struct dpu_crtc_state {
 
 	enum dpu_crtc_crc_source crc_source;
 	int crc_frame_skip_count;
+
+	/*
+	 * Optional 3D gamut payload.  drm_atomic_state knows nothing about
+	 * this private blob, so the CRTC hooks take and drop the reference
+	 * explicitly.
+	 */
+	struct drm_property_blob *gamut_lut;
 };
 
 #define to_dpu_crtc_state(x) \

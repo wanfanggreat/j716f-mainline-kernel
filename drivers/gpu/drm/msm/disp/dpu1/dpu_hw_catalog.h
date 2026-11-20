@@ -78,10 +78,14 @@ enum {
  * DSPP sub-blocks
  * @DPU_DSPP_PCC             Panel color correction block
  * @DPU_DSPP_GC              Gamma correction block
+ * @DPU_DSPP_IGC             Inverse gamma correction block
+ * @DPU_DSPP_GAMUT           3D gamut block
  */
 enum {
 	DPU_DSPP_PCC = 0x1,
 	DPU_DSPP_GC,
+	DPU_DSPP_IGC,
+	DPU_DSPP_GAMUT,
 	DPU_DSPP_MAX
 };
 
@@ -331,12 +335,17 @@ struct dpu_lm_sub_blks {
  * struct dpu_dspp_sub_blks: Information of DSPP block
  * @pcc: pixel color correction block
  * @gc: gamma correction block
+ * @gamut: 3D gamut block
+ * @igc_lut_base: shared IGC LUT data ports relative to the MDP resource,
+ *                or 0 if this SoC has no verified mapping
  * @pcc_v4_full: PCC block implements the v4 8 terms per output layout
  *               (33 coefficients plus an enable bit)
  */
 struct dpu_dspp_sub_blks {
 	struct dpu_pp_blk pcc;
 	struct dpu_pp_blk gc;
+	struct dpu_pp_blk gamut;
+	u32 igc_lut_base;
 	bool pcc_v4_full;
 };
 

@@ -75,6 +75,38 @@ struct dpu_hw_gc_lut {
 	__u32 c2[PGC_TBL_LEN];
 };
 
+#define DPU_IGC_LUT_SIZE 256
+
+/**
+ * struct dpu_hw_igc_lut - IGC (inverse gamma) LUT, 12-bit values
+ * @c0: color0 component lut
+ * @c1: color1 component lut
+ * @c2: color2 component lut
+ *
+ * The table data ports are shared in DSPP Top.  Each DSPP has its own
+ * IGC enable register, so the data ports are serialised across commits.
+ */
+struct dpu_hw_igc_lut {
+	__u32 c0[DPU_IGC_LUT_SIZE];
+	__u32 c1[DPU_IGC_LUT_SIZE];
+	__u32 c2[DPU_IGC_LUT_SIZE];
+};
+
+#define DPU_GAMUT_LUT_SIZE	0x9a70
+
+/**
+ * struct dpu_hw_gamut_lut - packed 3D gamut payload
+ * @data: 0x9a70-byte blob: flags/mode/1D tables/4 interleaved banks
+ * @len: blob length, must be DPU_GAMUT_LUT_SIZE
+ *
+ * The layout is the vendor SDM 0x9a70 payload; userspace builds it from
+ * the panel's QDCM FT3 table.  The kernel validates the size and mode.
+ */
+struct dpu_hw_gamut_lut {
+	const void *data;
+	__u32 len;
+};
+
 /**
  * struct dpu_hw_dspp_ops - interface to the dspp hardware driver functions
  * Caller must call the init function to get the dspp context for each dspp
@@ -95,12 +127,29 @@ struct dpu_hw_dspp_ops {
 	 */
 	void (*setup_gc)(struct dpu_hw_dspp *ctx, struct dpu_hw_gc_lut *gc_lut);
 
+	/**
+	 * setup_igc - setup dspp igc
+	 * @ctx: Pointer to dspp context
+	 * @igc_lut: Pointer to lut content, NULL disables the block
+	 */
+	void (*setup_igc)(struct dpu_hw_dspp *ctx,
+			  struct dpu_hw_igc_lut *igc_lut);
+
+	/**
+	 * setup_gamut - setup the 3D gamut block
+	 * @ctx: Pointer to dspp context
+	 * @gamut_lut: packed vendor payload or NULL to disable
+	 */
+	void (*setup_gamut)(struct dpu_hw_dspp *ctx,
+			    const struct dpu_hw_gamut_lut *gamut_lut);
+
 };
 
 /**
  * struct dpu_hw_dspp - dspp description
  * @base: Hardware block base structure
  * @hw: Block hardware details
+ * @hw_top: Shared IGC LUT data ports (DSPP Top block)
  * @idx: DSPP index
  * @cap: Pointer to layer_cfg
  * @ops: Pointer to operations possible for this DSPP
@@ -108,6 +157,7 @@ struct dpu_hw_dspp_ops {
 struct dpu_hw_dspp {
 	struct dpu_hw_blk base;
 	struct dpu_hw_blk_reg_map hw;
+	struct dpu_hw_blk_reg_map hw_top;
 
 	/* dspp */
 	int idx;

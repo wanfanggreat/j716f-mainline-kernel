@@ -1024,13 +1024,13 @@ static void _dpu_crtc_get_pcc_coeff(struct drm_crtc_state *state,
 }
 
 /*
- * The J716F probe is only meaningful on this board's internal DSI panel.
- * Look at the encoders attached to this CRTC's new state: a display can have
- * a DSI encoder somewhere but not drive this CRTC, and other machines may
- * have DSI outputs of their own.
+ * The J716F colour defaults are only meaningful on this board's internal DSI
+ * panel.  Look at the encoders attached to this CRTC's new state: a display
+ * can have a DSI encoder somewhere but not drive this CRTC, and other
+ * machines may have DSI outputs of their own.
  */
-static bool _dpu_crtc_pcc_probe_target(struct drm_device *dev,
-				       struct drm_crtc_state *state)
+static bool _dpu_crtc_internal_panel(struct drm_device *dev,
+				     struct drm_crtc_state *state)
 {
 	struct drm_encoder *encoder;
 
@@ -1049,10 +1049,10 @@ static bool _dpu_crtc_pcc_probe_target(struct drm_device *dev,
  * Build the PCC configuration for one CRTC commit.
  *
  * Priority is the user CTM, then the runtime v4 profile, then the board fit2
- * matrix, then bypass.  The runtime profile and the probe only apply to the
- * internal v4 panel, and a user CTM always wins.  A bypass commit clears the
- * PCC enable bit; the next enable rewrites all coefficients before setting
- * it, which is what makes the profile and probe reversible.
+ * matrix, then bypass.  The runtime profile, the board matrix and the probe
+ * only apply to the internal panel, and a user CTM always wins.  A bypass
+ * commit clears the PCC enable bit; the next enable rewrites all coefficients
+ * before setting it, which is what makes the profile and probe reversible.
  *
  * Returns true when PCC must be enabled, false to bypass it.
  */
@@ -1075,7 +1075,7 @@ static bool _dpu_crtc_pcc_config(struct drm_crtc_state *state, bool v4_full,
 		return true;
 	}
 
-	if (!default_enable)
+	if (!default_enable || !internal_panel)
 		return false;
 
 	*cfg = j716f_pcc_default;
@@ -1084,6 +1084,28 @@ static bool _dpu_crtc_pcc_config(struct drm_crtc_state *state, bool v4_full,
 		cfg->r.rg = J716F_PCC_PROBE_R_RG;
 
 	return true;
+}
+
+static void _dpu_crtc_get_igc_lut(struct drm_crtc_state *state,
+		struct dpu_hw_igc_lut *igc_lut)
+{
+	struct drm_color_lut *lut;
+	int i;
+
+	lut = (struct drm_color_lut *)state->degamma_lut->data;
+	if (!lut)
+		return;
+
+	/*
+	 * The hardware IGC table ports use the same c0/c1/c2 lane order as
+	 * GC.  DRM's DEGAMMA_LUT is stored in RGB order, so keep the mapping
+	 * in one place and do not reorder the blob in userspace.
+	 */
+	for (i = 0; i < DPU_IGC_LUT_SIZE; i++) {
+		igc_lut->c0[i] = drm_color_lut_extract(lut[i].green, 12);
+		igc_lut->c1[i] = drm_color_lut_extract(lut[i].blue, 12);
+		igc_lut->c2[i] = drm_color_lut_extract(lut[i].red, 12);
+	}
 }
 
 static void _dpu_crtc_get_gc_lut(struct drm_crtc_state *state,
@@ -1115,42 +1137,128 @@ static void _dpu_crtc_get_gc_lut(struct drm_crtc_state *state,
 	gc_lut->flags = 0;
 }
 
+static u64 dpu_cp_signature(struct drm_crtc_state *state,
+			    struct dpu_crtc_state *cstate)
+{
+	u64 sig = 0;
+
+	sig = sig * 31 + (unsigned long)state->gamma_lut;
+	sig = sig * 31 + (unsigned long)state->degamma_lut;
+	sig = sig * 31 + (unsigned long)state->ctm;
+	sig = sig * 31 + (unsigned long)cstate->gamut_lut;
+	sig = sig * 31 + (pcc_default_enable ? 1 : 0);
+	sig = sig * 31 + (pcc_probe_rg_enable ? 1 : 0);
+	sig = sig * 31 + (pcc_v4_enable ? 1 : 0);
+	sig = sig * 31 + j716f_pcc_v4_generation;
+
+	return sig;
+}
+
+/*
+ * Program the DSPP colour blocks from the atomic state.
+ *
+ * Ownership rules:
+ *  - a userspace blob (GAMMA_LUT, DEGAMMA_LUT, CTM, GAMUT_LUT) always wins
+ *    over a default policy for the same block;
+ *  - the board PCC defaults are experiments and are only applied to the
+ *    internal panel;
+ *  - a NULL blob clears the block explicitly, so a non-empty -> empty
+ *    transition cannot leave a stale enable bit behind;
+ *  - the programming is skipped on commits that neither change the blobs,
+ *    the module parameters nor the mode.  cp_needs_replay covers CRTC
+ *    disable, resource re-assignment and power collapse.
+ */
 static void _dpu_crtc_setup_cp_blocks(struct drm_crtc *crtc)
 {
 	struct drm_crtc_state *state = crtc->state;
 	struct dpu_crtc_state *cstate = to_dpu_crtc_state(crtc->state);
+	struct dpu_crtc *dpu_crtc = to_dpu_crtc(crtc);
 	struct dpu_crtc_mixer *mixer = cstate->mixers;
 	struct dpu_hw_pcc_cfg cfg;
 	struct dpu_hw_gc_lut *gc_lut;
+	struct dpu_hw_igc_lut *igc_lut;
+	struct dpu_hw_gamut_lut gamut;
 	struct dpu_hw_ctl *ctl;
 	struct dpu_hw_dspp *dspp;
 	bool pcc_default, pcc_probe, internal_panel, pcc_profile;
+	bool complete = true;
+	u32 dspp_mask = 0;
 	u32 profile[J716F_PCC_V4_COEFFS];
+	u64 signature;
 	int i;
-
-
-	if (!state->color_mgmt_changed && !drm_atomic_crtc_needs_modeset(state))
-		return;
 
 	/*
 	 * Snapshot the colour policy once per commit, before the mixer loop,
-	 * so both halves program the same PCC configuration.  Writing the
-	 * module parameters only changes these variables; nothing reaches the
+	 * so both halves program the same configuration.  Writing the module
+	 * parameters only changes these variables; nothing reaches the
 	 * hardware until the next colour commit or modeset runs this function
 	 * again.
 	 */
+	signature = dpu_cp_signature(state, cstate);
+	if (dpu_crtc->cp_programmed && !dpu_crtc->cp_needs_replay &&
+	    !state->color_mgmt_changed && signature == dpu_crtc->cp_signature)
+		return;
+
 	pcc_default = pcc_default_enable;
 	pcc_probe = pcc_probe_rg_enable;
 	pcc_profile = pcc_v4_enable && j716f_pcc_v4_snapshot(profile);
-	internal_panel = (pcc_probe || pcc_profile) && !state->ctm &&
-			 _dpu_crtc_pcc_probe_target(crtc->dev, state);
+	internal_panel = _dpu_crtc_internal_panel(crtc->dev, state);
 
 	for (i = 0; i < cstate->num_mixers; i++) {
 		ctl = mixer[i].lm_ctl;
 		dspp = mixer[i].hw_dspp;
 
-		if (!dspp)
+		if (!dspp) {
+			/*
+			 * A requested transform without a DSPP must be visible
+			 * to the submitter, not silently dropped.
+			 */
+			if (state->gamma_lut || state->degamma_lut ||
+			    state->ctm || cstate->gamut_lut ||
+			    (internal_panel &&
+			     (pcc_default || pcc_probe || pcc_profile))) {
+				complete = false;
+				DPU_ERROR("crtc%d mixer%d has no DSPP for colour programming\n",
+					  crtc->base.id, i);
+			}
 			continue;
+		}
+
+		dspp_mask |= BIT(dspp->idx - DSPP_0);
+
+		if (dspp->ops.setup_igc) {
+			if (!state->degamma_lut) {
+				dspp->ops.setup_igc(dspp, NULL);
+			} else {
+				igc_lut = kzalloc_obj(*igc_lut);
+				if (!igc_lut) {
+					complete = false;
+					continue;
+				}
+				_dpu_crtc_get_igc_lut(state, igc_lut);
+				dspp->ops.setup_igc(dspp, igc_lut);
+				kfree(igc_lut);
+			}
+
+			/* stage config flush mask */
+			ctl->ops.update_pending_flush_dspp(ctl,
+				mixer[i].hw_dspp->idx, DPU_DSPP_IGC);
+		}
+
+		if (dspp->ops.setup_gamut) {
+			memset(&gamut, 0, sizeof(gamut));
+			if (cstate->gamut_lut) {
+				gamut.data = cstate->gamut_lut->data;
+				gamut.len = (u32)cstate->gamut_lut->length;
+			}
+
+			dspp->ops.setup_gamut(dspp,
+					      cstate->gamut_lut ? &gamut : NULL);
+
+			/* stage config flush mask */
+			ctl->ops.update_pending_flush_dspp(ctl,
+				mixer[i].hw_dspp->idx, DPU_DSPP_GAMUT);
+		}
 
 		if (dspp->ops.setup_pcc) {
 			if (_dpu_crtc_pcc_config(state,
@@ -1172,8 +1280,10 @@ static void _dpu_crtc_setup_cp_blocks(struct drm_crtc *crtc)
 				dspp->ops.setup_gc(dspp, NULL);
 			} else {
 				gc_lut = kzalloc_obj(*gc_lut);
-				if (!gc_lut)
+				if (!gc_lut) {
+					complete = false;
 					continue;
+				}
 				_dpu_crtc_get_gc_lut(state, gc_lut);
 				dspp->ops.setup_gc(dspp, gc_lut);
 				kfree(gc_lut);
@@ -1184,6 +1294,22 @@ static void _dpu_crtc_setup_cp_blocks(struct drm_crtc *crtc)
 				mixer[i].hw_dspp->idx, DPU_DSPP_GC);
 		}
 	}
+
+	if (complete) {
+		dpu_crtc->cp_programmed = true;
+		dpu_crtc->cp_needs_replay = false;
+		dpu_crtc->cp_signature = signature;
+	}
+
+	pr_info("J716F cp: crtc%d mixers=%d gc=%s igc=%s gamut=%s pcc=%s dspp=%#x%s\n",
+		crtc->base.id, cstate->num_mixers,
+		state->gamma_lut ? "user" : "bypass",
+		state->degamma_lut ? "user" : "bypass",
+		cstate->gamut_lut ? "user" : "bypass",
+		state->ctm ? "user" :
+		((pcc_profile || (pcc_default && internal_panel)) ?
+		 "default" : "bypass"),
+		dspp_mask, complete ? "" : " incomplete");
 }
 
 static void dpu_crtc_atomic_begin(struct drm_crtc *crtc,
@@ -1298,6 +1424,7 @@ static void dpu_crtc_destroy_state(struct drm_crtc *crtc,
 
 	DRM_DEBUG_ATOMIC("crtc%d\n", crtc->base.id);
 
+	drm_property_blob_put(cstate->gamut_lut);
 	__drm_atomic_helper_crtc_destroy_state(state);
 
 	kfree(cstate);
@@ -1458,6 +1585,13 @@ static struct drm_crtc_state *dpu_crtc_duplicate_state(struct drm_crtc *crtc)
 	/* duplicate base helper */
 	__drm_atomic_helper_crtc_duplicate_state(crtc, &cstate->base);
 
+	/*
+	 * DRM's atomic state does not know about the private gamut blob;
+	 * take our own reference so destroy_state can drop it.
+	 */
+	if (cstate->gamut_lut)
+		drm_property_blob_get(cstate->gamut_lut);
+
 	return &cstate->base;
 }
 
@@ -1465,7 +1599,17 @@ static void dpu_crtc_atomic_print_state(struct drm_printer *p,
 					const struct drm_crtc_state *state)
 {
 	const struct dpu_crtc_state *cstate = to_dpu_crtc_state(state);
+	const struct dpu_crtc *dpu_crtc = to_dpu_crtc(state->crtc);
 	int i;
+
+	drm_printf(p, "\tcp_programmed:%d cp_needs_replay:%d cp_signature:%#llx\n",
+		   dpu_crtc->cp_programmed, dpu_crtc->cp_needs_replay,
+		   dpu_crtc->cp_signature);
+	drm_printf(p, "\tgamma_lut:%u degamma_lut:%u ctm:%u gamut_lut:%u\n",
+		   state->gamma_lut ? state->gamma_lut->base.id : 0,
+		   state->degamma_lut ? state->degamma_lut->base.id : 0,
+		   state->ctm ? state->ctm->base.id : 0,
+		   cstate->gamut_lut ? cstate->gamut_lut->base.id : 0);
 
 	for (i = 0; i < cstate->num_mixers; i++) {
 		drm_printf(p, "\tlm[%d]=%d\n", i, cstate->mixers[i].hw_lm->idx - LM_0);
@@ -1502,6 +1646,9 @@ static void dpu_crtc_disable(struct drm_crtc *crtc,
 
 	/* Disable/save vblank irq handling */
 	drm_crtc_vblank_off(crtc);
+
+	/* The DSPP blocks may lose their programming across disable. */
+	dpu_crtc->cp_needs_replay = true;
 
 	drm_for_each_encoder_mask(encoder, crtc->dev,
 				  old_crtc_state->encoder_mask) {
@@ -1670,8 +1817,10 @@ static struct msm_display_topology dpu_crtc_get_topology(
 		struct drm_crtc_state *crtc_state)
 {
 	struct drm_display_mode *mode = &crtc_state->adjusted_mode;
+	struct dpu_crtc_state *cstate = to_dpu_crtc_state(crtc_state);
 	struct msm_display_topology topology = {0};
 	struct drm_encoder *drm_enc;
+	bool internal_panel;
 
 	drm_for_each_encoder_mask(drm_enc, crtc->dev, crtc_state->encoder_mask)
 		dpu_encoder_update_topology(drm_enc, &topology, crtc_state->state,
@@ -1691,7 +1840,9 @@ static struct msm_display_topology dpu_crtc_get_topology(
 	 *
 	 * If DSC is enabled, use 2 LMs for 2:2:1 topology
 	 *
-	 * Add dspps to the reservation requirements if ctm or gamma_lut are requested
+	 * Add dspps to the reservation requirements if ctm, gamma, degamma or
+	 * gamut is requested, or if the internal panel needs its default
+	 * colour policy (including an explicit bypass of stale blocks).
 	 *
 	 * Only hardcode num_lm to 2 for cases where num_intf == 2 and CWB is not
 	 * enabled. This is because in cases where CWB is enabled, num_intf will
@@ -1711,7 +1862,16 @@ static struct msm_display_topology dpu_crtc_get_topology(
 	else
 		topology.num_lm = 1;
 
-	if (crtc_state->ctm || crtc_state->gamma_lut)
+	internal_panel = _dpu_crtc_internal_panel(crtc->dev, crtc_state);
+
+	/*
+	 * The internal panel always reserves a DSPP per mixer, even when no
+	 * userspace blob is present: the default PCC policy and the explicit
+	 * bypass of stale blocks both need the block.  External displays only
+	 * reserve one when a standard colour property is requested.
+	 */
+	if (crtc_state->ctm || crtc_state->gamma_lut ||
+	    crtc_state->degamma_lut || cstate->gamut_lut || internal_panel)
 		topology.num_dspp = topology.num_lm;
 
 	return topology;
@@ -1774,6 +1934,13 @@ static int dpu_crtc_assign_resources(struct drm_crtc *crtc,
 
 	cstate->num_mixers = num_lm;
 
+	/*
+	 * A new mixer/DSPP assignment may point at a block that was never
+	 * programmed for this CRTC, so force a full CP replay on the next
+	 * atomic_begin even if the blob signature is unchanged.
+	 */
+	to_dpu_crtc(crtc)->cp_needs_replay = true;
+
 	return 0;
 }
 
@@ -1819,6 +1986,7 @@ static int dpu_crtc_atomic_check(struct drm_crtc *crtc,
 	struct drm_plane *plane;
 
 	int rc = 0;
+	int i;
 
 	bool needs_dirtyfb = dpu_crtc_needs_dirtyfb(crtc_state);
 
@@ -1828,6 +1996,24 @@ static int dpu_crtc_atomic_check(struct drm_crtc *crtc,
 		rc = dpu_crtc_assign_resources(crtc, crtc_state);
 		if (rc < 0)
 			return rc;
+	}
+
+	/*
+	 * A colour-management request, or the internal panel's default
+	 * policy, must not be accepted when the pipeline did not get a DSPP
+	 * for every half: the commit would otherwise succeed while silently
+	 * dropping the transform.
+	 */
+	if (crtc_state->ctm || crtc_state->gamma_lut ||
+	    crtc_state->degamma_lut || cstate->gamut_lut ||
+	    _dpu_crtc_internal_panel(crtc->dev, crtc_state)) {
+		for (i = 0; i < cstate->num_mixers; i++) {
+			if (!cstate->mixers[i].hw_dspp) {
+				DPU_ERROR("crtc%d mixer%d: no DSPP for colour mgmt\n",
+					  crtc->base.id, i);
+				return -ENOSPC;
+			}
+		}
 	}
 
 	if (crtc_state->planes_changed || crtc_state->zpos_changed) {
@@ -2128,12 +2314,56 @@ static int dpu_crtc_late_register(struct drm_crtc *crtc)
 	return _dpu_crtc_init_debugfs(crtc);
 }
 
+static int dpu_crtc_atomic_set_property(struct drm_crtc *crtc,
+					struct drm_crtc_state *state,
+					struct drm_property *property,
+					uint64_t val)
+{
+	struct dpu_crtc *dpu_crtc = to_dpu_crtc(crtc);
+	struct dpu_crtc_state *cstate = to_dpu_crtc_state(state);
+	bool replaced = false;
+	int ret;
+
+	if (property == dpu_crtc->gamut_lut_property) {
+		ret = drm_property_replace_blob_from_id(crtc->dev,
+							&cstate->gamut_lut,
+							val,
+							DPU_GAMUT_LUT_SIZE,
+							-1, -1, &replaced);
+		if (ret)
+			return ret;
+
+		state->color_mgmt_changed |= replaced;
+		return 0;
+	}
+
+	return -EINVAL;
+}
+
+static int dpu_crtc_atomic_get_property(struct drm_crtc *crtc,
+					const struct drm_crtc_state *state,
+					struct drm_property *property,
+					uint64_t *val)
+{
+	const struct dpu_crtc_state *cstate = to_dpu_crtc_state(state);
+	struct dpu_crtc *dpu_crtc = to_dpu_crtc(crtc);
+
+	if (property == dpu_crtc->gamut_lut_property) {
+		*val = cstate->gamut_lut ? cstate->gamut_lut->base.id : 0;
+		return 0;
+	}
+
+	return -EINVAL;
+}
+
 static const struct drm_crtc_funcs dpu_crtc_funcs = {
 	.set_config = drm_atomic_helper_set_config,
 	.page_flip = drm_atomic_helper_page_flip,
 	.reset = dpu_crtc_reset,
 	.atomic_duplicate_state = dpu_crtc_duplicate_state,
 	.atomic_destroy_state = dpu_crtc_destroy_state,
+	.atomic_set_property = dpu_crtc_atomic_set_property,
+	.atomic_get_property = dpu_crtc_atomic_get_property,
 	.atomic_print_state = dpu_crtc_atomic_print_state,
 	.late_register = dpu_crtc_late_register,
 	.verify_crc_source = dpu_crtc_verify_crc_source,
@@ -2202,12 +2432,32 @@ struct drm_crtc *dpu_crtc_init(struct drm_device *dev, struct drm_plane *plane,
 
 	if (dpu_kms->catalog->dspp_count) {
 		const struct dpu_dspp_cfg *dspp = &dpu_kms->catalog->dspp[0];
+		unsigned int degamma_size = dspp->sblk->igc_lut_base ?
+					    DPU_IGC_LUT_SIZE : 0;
+		unsigned int gamma_size = dspp->sblk->gc.base ?
+					  DPU_GAMMA_LUT_SIZE : 0;
 
-		if (dspp->sblk->gc.base) {
-			drm_mode_crtc_set_gamma_size(crtc, DPU_GAMMA_LUT_SIZE);
-			drm_crtc_enable_color_mgmt(crtc, 0, true, DPU_GAMMA_LUT_SIZE);
-		} else {
-			drm_crtc_enable_color_mgmt(crtc, 0, true, 0);
+		if (gamma_size)
+			drm_mode_crtc_set_gamma_size(crtc, gamma_size);
+		drm_crtc_enable_color_mgmt(crtc, degamma_size, true, gamma_size);
+
+		/*
+		 * Private 3D gamut blob.  DRM has no standard 3D LUT object,
+		 * and the vendor payload (0x9a70 bytes) is the only format the
+		 * hardware block accepts.  Userspace builds it from the panel's
+		 * QDCM FT3 table; NULL clears the block.
+		 */
+		if (dspp->sblk->gamut.base) {
+			dpu_crtc->gamut_lut_property =
+				drm_property_create(dev, DRM_MODE_PROP_BLOB,
+						    "GAMUT_LUT", 0);
+			if (!dpu_crtc->gamut_lut_property) {
+				DPU_ERROR("failed to create GAMUT_LUT property\n");
+			} else {
+				drm_object_attach_property(&crtc->base,
+							   dpu_crtc->gamut_lut_property,
+							   0);
+			}
 		}
 	}
 
