@@ -593,10 +593,12 @@
 		 * then vdd/lab/ibb before releasing reset; without this rail the
 		 * mainline panel driver never reproduces that sequence.
 		 *
-		 * Vendor constraints from the stock DTB: 3.104-3.304 V, with
-		 * qcom,init-voltage = 3.104 V.  The mainline RPMh regulator
-		 * picked 3.296 V from the range; pin min=max to the vendor
-		 * initial value for the power A/B.
+		 * Vendor regulator defaults from the stock DTB: 3.104-3.304 V,
+		 * with qcom,init-voltage = 3.104 V.  The vendor panel supply
+		 * entry, however, requests 3.3 V and dsi_pwr_enable_vregs()
+		 * applies it on every panel power-on, so LOS24 runs this rail at
+		 * ~3.3 V.  This A/B pinned min=max to the stock init value; the
+		 * 3.104 V vs 3.296 V comparison showed no visible colour change.
 		 */
 		vreg_l11d_3p1: ldoc11 {
 			regulator-name = "vreg_l11d_3p1";
@@ -1195,6 +1197,12 @@
 		compatible = "lenovo,j716f-edo-rm69380", "raydium,rm69380";
 		reg = <0>;
 
+		/*
+		 * The vendor panel also lists lab/ibb (PM8150L AMOLED
+		 * outputs).  They are qcom,swire-control and have no mainline
+		 * regulator provider; the bootloader leaves them on and this
+		 * kernel does not touch them.
+		 */
 		vddio-supply = <&vreg_l14a_1p88>;
 		vdd-supply = <&vreg_l11d_3p1>;
 		avdd-supply = <&panel_avdd>;
