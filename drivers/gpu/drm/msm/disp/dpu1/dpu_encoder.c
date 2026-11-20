@@ -399,6 +399,22 @@ static void _dpu_encoder_setup_dither(struct dpu_hw_pingpong *hw_pp, unsigned bp
 		dither_cfg.c3_bitdepth = 6;
 		dither_cfg.temporal_en = 0;
 		break;
+	case 8:
+		/*
+		 * ZUI 15 default PP dither for this panel.  The vendor kernel
+		 * only disables the pingpong dither when DSC runs at 10 bpc;
+		 * the internal panel is non-DSC 24 bpp (RGB888), so the
+		 * default blob is written and enabled on every kickoff:
+		 * four 8-bit components, the 4x4 matrix below, temporal off.
+		 * dither_depth_map[8] = 3 makes the BITDEPTH register 0xFF,
+		 * matching the vendor default blob.
+		 */
+		dither_cfg.c0_bitdepth = 8;
+		dither_cfg.c1_bitdepth = 8;
+		dither_cfg.c2_bitdepth = 8;
+		dither_cfg.c3_bitdepth = 8;
+		dither_cfg.temporal_en = 0;
+		break;
 	default:
 		hw_pp->ops.setup_dither(hw_pp, NULL);
 		return;

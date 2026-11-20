@@ -40,8 +40,19 @@
 
 #define DITHER_DEPTH_MAP_INDEX 9
 
-static u32 dither_depth_map[DITHER_DEPTH_MAP_INDEX] = {
-	0, 0, 0, 0, 0, 0, 0, 1, 2
+/*
+ * Two-bit depth code per source bit depth.  The vendor default blob for an
+ * RGB888 output (dst_format 3) carries c0..c3 = 8 and its own table maps 8
+ * to 3, i.e. the BITDEPTH register is 0xFF.  This table used to map 8 to 2
+ * (0xAA), which is a different quantiser and the reason a plain "enable
+ * dither for 8 bpc" change did not reproduce the factory pattern.
+ *
+ * Indices 5..7 are deliberately left at the historical values so the
+ * existing 6 bpc path (index 6 -> 0) keeps its behaviour.  Only the 8 bpc
+ * entry is the vendor default we need for this panel.
+ */
+static const u32 dither_depth_map[DITHER_DEPTH_MAP_INDEX] = {
+	0, 0, 0, 0, 0, 0, 0, 1, 3
 };
 
 static void dpu_hw_pp_setup_dither(struct dpu_hw_pingpong *pp,

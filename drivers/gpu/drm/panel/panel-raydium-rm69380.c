@@ -370,7 +370,23 @@ static const struct drm_display_mode rm69380_mode = {
 static int rm69380_get_modes(struct drm_panel *panel,
 					struct drm_connector *connector)
 {
-	return drm_connector_helper_get_modes_fixed(connector, &rm69380_mode);
+	int count;
+
+	count = drm_connector_helper_get_modes_fixed(connector, &rm69380_mode);
+	if (count > 0) {
+		/*
+		 * The panel is a plain 8-bit-per-component RGB sink.  DSI is
+		 * configured as MIPI_DSI_FMT_RGB888 and the vendor DT uses
+		 * 24 bpp.  Advertising bpc=8 lets the encoder select the 8 bpc
+		 * pingpong dither path; without it display_info.bpc stays 0
+		 * and the vendor-default quantiser is never programmed.
+		 */
+		connector->display_info.bpc = 8;
+		connector->display_info.color_formats =
+			BIT(DRM_OUTPUT_COLOR_FORMAT_RGB444);
+	}
+
+	return count;
 }
 
 static const struct drm_panel_funcs rm69380_panel_funcs = {
