@@ -32,8 +32,12 @@
 /*
  * Vendor panel power order (downstream dsi_panel_power_on):
  *   vddio -> 20 ms -> vdd -> lab -> ibb -> 20 ms -> pinctrl -> reset.
- * The mainline driver only has vddio/vdd/avdd; lab/ibb are not modelled yet,
- * so this is the closest reproducible subset.
+ *
+ * Mainline models vddio, vdd and the board's fixed 5.5 V display_panel_avdd
+ * rail.  lab/ibb are PM8150L AMOLED outputs and have no mainline regulator
+ * driver; the vendor kernel does not write their voltage either, because they
+ * are marked qcom,swire-control and are left to the PMIC's SWIRE state
+ * machine.  They are therefore not part of this driver's software sequence.
  */
 #define RM69380_SUPPLY_VDDIO	0
 #define RM69380_SUPPLY_VDD	1
@@ -73,7 +77,9 @@ static void rm69380_reset(struct rm69380_panel *ctx)
 /*
  * Enable the panel rails in the vendor order.  VDDIO is shared with the
  * touch controller on this board and usually stays on; VDD (PM8150A L11)
- * and AVDD are the rails the mainline driver used to leave untouched.
+ * follows it.  AVDD is the board's fixed 5.5 V rail, enabled before the
+ * panel reset; the vendor panel supply list uses lab/ibb instead, which are
+ * SWIRE-controlled and not software-managed here.
  */
 static int rm69380_power_rails(struct rm69380_panel *ctx)
 {
@@ -309,7 +315,8 @@ static int rm69380_prepare(struct drm_panel *panel)
 
 	ret = rm69380_on(ctx);
 	if (ret < 0) {
-		gpiod_set_value_cansleep(ctx->enable_gpio, 0);
+		if (ctx->enable_gpio)
+			gpiod_set_value_cansleep(ctx->enable_gpio, 0);
 		gpiod_set_value_cansleep(ctx->reset_gpio, 1);
 		rm69380_power_off(ctx);
 	}
@@ -323,7 +330,8 @@ static int rm69380_unprepare(struct drm_panel *panel)
 
 	rm69380_off(ctx);
 
-	gpiod_set_value_cansleep(ctx->enable_gpio, 0);
+	if (ctx->enable_gpio)
+		gpiod_set_value_cansleep(ctx->enable_gpio, 0);
 	gpiod_set_value_cansleep(ctx->reset_gpio, 1);
 	rm69380_power_off(ctx);
 
