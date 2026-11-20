@@ -34,6 +34,9 @@ properties:
   avdd-supply:
     description: Analog voltage rail
 
+  vdd-supply:
+    description: Panel power supply rail
+
   vddio-supply:
     description: I/O voltage rail
 
@@ -45,6 +48,7 @@ required:
   - compatible
   - reg
   - avdd-supply
+  - vdd-supply
   - vddio-supply
   - reset-gpios
 
@@ -63,6 +67,7 @@ examples:
             reg = <0>;
 
             avdd-supply = <&panel_avdd_regulator>;
+            vdd-supply = <&vreg_l11d>;
             vddio-supply = <&vreg_l14a>;
             reset-gpios = <&tlmm 75 GPIO_ACTIVE_LOW>;
 
