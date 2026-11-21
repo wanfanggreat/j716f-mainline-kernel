@@ -11,6 +11,7 @@
 #include <dt-bindings/regulator/qcom,rpmh-regulator.h>
 #include <dt-bindings/sound/qcom,q6afe.h>
 #include <dt-bindings/sound/qcom,q6asm.h>
+#include <dt-bindings/usb/pd.h>
 #include "sm8250.dtsi"
 #include "pm8009.dtsi"
 #include "pm8150.dtsi"
@@ -1140,11 +1141,27 @@
 };
 
 &usb_1 {
+	/* USB 2.0 only for this bring-up: use UTMI as the PIPE clock. */
+	qcom,select-utmi-as-pipe-clk;
 	status = "okay";
 };
 
 &usb_1_dwc3 {
-	dr_mode = "peripheral";
+	dr_mode = "otg";
+	usb-role-switch;
+
+	/*
+	 * USB0 is the USB-C port.  Keep the first bring-up on the HS PHY
+	 * only; the QMP SuperSpeed path is enabled once its supplies and the
+	 * Type-C lane orientation are validated.
+	 */
+	maximum-speed = "high-speed";
+	phys = <&usb_1_hsphy>;
+	phy-names = "usb2-phy";
+};
+
+&usb_1_dwc3_hs_out {
+	remote-endpoint = <&pm8150b_hs_in>;
 };
 
 &usb_1_hsphy {
@@ -1160,6 +1177,62 @@
 
 	vdda-phy-supply = <&vreg_l9a_1p2>;
 	vdda-pll-supply = <&vreg_l18a_0p9>;
+
+	/* USB-C bring-up starts on USB 2.0 only. */
+	status = "disabled";
+};
+
+/*
+ * The external USB-C port is wired to USB0.  The PM8150B Type-C block owns
+ * CC detection, cable orientation and the source/sink role, and its OTG
+ * regulator supplies the port when the tablet acts as a host.  TCPM drives
+ * the DWC3 role switch through the connector graph below, so device mode
+ * (NCM debug network) and host mode (keyboard, mouse, hubs, storage) are
+ * selected by the cable instead of being fixed in the device tree.
+ */
+&pm8150b_typec {
+	vdd-pdphy-supply = <&vreg_l2a_3p1>;
+	status = "okay";
+
+	connector {
+		compatible = "usb-c-connector";
+
+		power-role = "dual";
+		data-role = "dual";
+		self-powered;
+
+		op-sink-microwatt = <10000000>;
+
+		vbus-supply = <&pm8150b_vbus>;
+
+		source-pdos = <PDO_FIXED(5000, 1500,
+					 PDO_FIXED_DUAL_ROLE |
+					 PDO_FIXED_USB_COMM |
+					 PDO_FIXED_DATA_SWAP)>;
+
+		sink-pdos = <PDO_FIXED(5000, 3000,
+				       PDO_FIXED_DUAL_ROLE |
+				       PDO_FIXED_USB_COMM |
+				       PDO_FIXED_DATA_SWAP)>;
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@0 {
+				reg = <0>;
+
+				pm8150b_hs_in: endpoint {
+					remote-endpoint = <&usb_1_dwc3_hs_out>;
+				};
+			};
+		};
+	};
+};
+
+&pm8150b_vbus {
+	regulator-min-microamp = <500000>;
+	regulator-max-microamp = <3000000>;
 
 	status = "okay";
 };
