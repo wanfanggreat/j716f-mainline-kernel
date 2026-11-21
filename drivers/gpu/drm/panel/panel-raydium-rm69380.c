@@ -22,11 +22,13 @@
 #include <drm/drm_probe_helper.h>
 
 /*
- * LOS24's minimum brightness is 6 nits -> framework backlight 25/255 ->
- * panel DBV 25 * 2047 / 255 = 200.  Use the same floor so the Linux slider
- * starts where LOS24/ZUI starts instead of the previous 362 floor.
+ * Keep the panel at DBV 233 at the bottom of the range.  ZUI's static
+ * minimum is panel code 232; DBV 233 (one code above) was verified on the
+ * tablet as the lowest readable level, so the driver enforces that floor
+ * itself instead of relying on a userspace udev rule.  The clamp applies to
+ * every non-blank brightness update, including slider zero.
  */
-#define RM69380_MIN_BRIGHTNESS 200
+#define RM69380_MIN_BRIGHTNESS 233
 #define RM69380_MAX_BRIGHTNESS 2047
 
 /*
@@ -431,7 +433,7 @@ static int rm69380_bl_update_status(struct backlight_device *bl)
 		return -ENODEV;
 
 	/*
-	 * Keep active brightness at the chosen floor, including slider zero.
+	 * Keep active brightness at the panel floor, including slider zero.
 	 * Explicit blanking/suspend still sends zero through the normal API.
 	 */
 	if (!backlight_is_blank(bl))
