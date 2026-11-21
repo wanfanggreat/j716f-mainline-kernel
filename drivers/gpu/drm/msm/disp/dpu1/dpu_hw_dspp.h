@@ -22,12 +22,11 @@ struct dpu_hw_dspp;
  * @bb: blue*blue second order coefficient.
  *
  * The v4 register layout (11 groups of three 32 bit lanes, offsets 0x04
- * through 0x84) is verified from the vendor v4 writer.  The linear terms use
- * the S3.15 encoding described in dpu_crtc.c.  The bit width, signedness and
- * fixed-point scaling of the v4 constant, cross and second order terms are
- * still unverified: the 0x3ffff mask in the v1.7 vendor writer covers only
- * the v1.7 coefficient fields and does not establish the v4 second order
- * term width.
+ * through 0x84) is verified from the vendor v4 writer.  The kernel only uses
+ * the linear terms (S3.15 encoding, described in dpu_crtc.c); the remaining
+ * fields are written as zero so a previous commit cannot leave stale
+ * constant, cross or second order terms behind.  The bit width, signedness
+ * and fixed-point scaling of those non-linear terms remain unverified.
  */
 
 struct dpu_hw_pcc_coeff {

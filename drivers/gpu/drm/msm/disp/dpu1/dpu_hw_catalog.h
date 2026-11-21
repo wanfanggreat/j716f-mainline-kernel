@@ -338,7 +338,7 @@ struct dpu_lm_sub_blks {
  * @gamut: 3D gamut block
  * @igc_lut_base: shared IGC LUT data ports relative to the MDP resource,
  *                or 0 if this SoC has no verified mapping
- * @pcc_v4_full: PCC block implements the v4 8 terms per output layout
+ * @pcc_v4_full: PCC block implements the v4 11 terms per output layout
  *               (33 coefficients plus an enable bit)
  */
 struct dpu_dspp_sub_blks {

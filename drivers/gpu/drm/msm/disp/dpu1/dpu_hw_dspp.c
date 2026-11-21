@@ -308,7 +308,7 @@ static void dpu_setup_dspp_gamut(struct dpu_hw_dspp *ctx,
 
 	p = gamut_lut->data;
 	if (get_unaligned_le32(p + GAMUT_PAYLOAD_MODE_OFF) != 1) {
-		DRM_ERROR("J716F gamut: unsupported mode %u\n",
+		DRM_ERROR("unsupported gamut payload mode %u\n",
 			  get_unaligned_le32(p + GAMUT_PAYLOAD_MODE_OFF));
 		DPU_REG_WRITE(&ctx->hw, base + GAMUT_STATUS_OFF, 0);
 		return;

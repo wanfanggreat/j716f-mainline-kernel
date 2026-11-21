@@ -50,13 +50,17 @@ static u32 dpu_crtc_s31_32_to_s3_15(u64 val)
 }
 
 /*
- * Lenovo J716F: at the panel minimum brightness the RM69380 loses saturation
- * relative to ZUI 15, which keeps the panel at a high DBV and dims digitally.
- * This is the least-squares fit from the six colour bars after the userspace
- * sRGB gamma + 10% white trim (DBV233/k=0.26) to ZUI 45/255, with each row
- * normalised so white stays neutral.
+ * Lenovo J716F: low-brightness saturation fit from the 2026-11-19
+ * user-space sRGB-gamma + 10% white-trim baseline (DBV233/k=0.26) to ZUI
+ * 45/255, with each row normalised so white stays neutral.
+ *
+ * The 2026-11-21 m31 fix removed the actual cause of the yellow cast: the
+ * RM69380 page-0x26 init group was never delivered over bonded DSI.  m31's
+ * colour result was nevertheless obtained with this matrix enabled, so the
+ * board default keeps it until a PCC-bypass candidate passes a real-device
+ * A/B.  See the display finalization task in the integration repository.
  */
-static struct dpu_hw_pcc_cfg j716f_pcc_default = {
+static const struct dpu_hw_pcc_cfg j716f_pcc_default = {
 	.r = { .r = 34781, .g = 261626, .b = 260650 },
 	.g = { .r = 121,   .g = 34129,  .b = 260663 },
 	.b = { .r = 261757, .g = 260201, .b = 35098 },
@@ -65,191 +69,7 @@ static struct dpu_hw_pcc_cfg j716f_pcc_default = {
 static bool pcc_default_enable = true;
 module_param(pcc_default_enable, bool, 0644);
 MODULE_PARM_DESC(pcc_default_enable,
-		 "J716F: apply the calibrated low-brightness PCC matrix");
-
-/*
- * J716F PCC v4 probe: add a small positive output-R * RG term on top of the
- * fit2 matrix, so a red+green input pair should raise output R.  The probe is
- * deliberately not a calibration: the cross term scaling is unconfirmed and
- * white will move too.  Its only job is to show that the term reaches the
- * panel.  0x400 is a raw experimental code; if the cross terms use the same
- * S3.15 scale as the linear terms it is 1/32, i.e. about 8 output codes at
- * full R=G.  Marked for measurement on hardware.
- */
-#define J716F_PCC_PROBE_R_RG 0x400
-
-static bool pcc_probe_rg_enable;
-module_param(pcc_probe_rg_enable, bool, 0644);
-MODULE_PARM_DESC(pcc_probe_rg_enable,
-		 "J716F: add the PCC v4 output-R RG cross term on the internal panel (default off)");
-
-/*
- * Runtime PCC v4 profile.  The 33 words use the v4 register order: output R's
- * C,R,G,B,RG,RB,GB,RGB,RR,GG,BB, then output G, then output B.  The values
- * are raw 18-bit two's-complement codes; linear terms use the S3.15 encoding
- * and negative nonlinear terms are written as value & 0x3ffff.
- *
- * The profile is a full replacement for the fit2 matrix, is only used when
- * pcc_v4_enable is set, and still yields to a user CTM.  The initial content
- * is fit2, so enabling it alone is visually a no-op.
- */
-#define J716F_PCC_V4_TERMS 11
-#define J716F_PCC_V4_COEFFS (3 * J716F_PCC_V4_TERMS)
-#define J716F_PCC_V4_MAX 0x3ffff
-
-static u32 j716f_pcc_v4_active[J716F_PCC_V4_COEFFS] = {
-	/* output R: C R G B RG RB GB RGB RR GG BB */
-	0, 34781, 261626, 260650, 0, 0, 0, 0, 0, 0, 0,
-	/* output G */
-	0, 121, 34129, 260663, 0, 0, 0, 0, 0, 0, 0,
-	/* output B */
-	0, 261757, 260201, 35098, 0, 0, 0, 0, 0, 0, 0,
-};
-static DEFINE_SPINLOCK(j716f_pcc_v4_lock);
-static bool j716f_pcc_v4_valid = true;
-static u32 j716f_pcc_v4_generation;
-
-static bool pcc_v4_enable;
-module_param(pcc_v4_enable, bool, 0644);
-MODULE_PARM_DESC(pcc_v4_enable,
-		 "J716F: apply the runtime PCC v4 profile to the internal panel (default off)");
-
-static int j716f_pcc_v4_parse(const char *val, u32 *out)
-{
-	char *buf, *p, *token;
-	int i, ret = 0;
-
-	buf = kstrdup(val, GFP_KERNEL);
-	if (!buf)
-		return -ENOMEM;
-
-	p = buf;
-	for (i = 0; i < J716F_PCC_V4_COEFFS; i++) {
-		u32 v;
-
-		do {
-			token = strsep(&p, ", \t\n");
-		} while (token && !*token);
-		if (!token) {
-			ret = -EINVAL;
-			goto out;
-		}
-		if (kstrtou32(token, 0, &v) || v > J716F_PCC_V4_MAX) {
-			ret = -EINVAL;
-			goto out;
-		}
-		out[i] = v;
-	}
-
-	while (p) {
-		token = strsep(&p, ", \t\n");
-		if (token && *token) {
-			ret = -EINVAL;
-			break;
-		}
-	}
-out:
-	kfree(buf);
-	return ret;
-}
-
-static int j716f_pcc_v4_set(const char *val, const struct kernel_param *kp)
-{
-	u32 tmp[J716F_PCC_V4_COEFFS];
-	unsigned long flags;
-	int ret;
-
-	ret = j716f_pcc_v4_parse(val, tmp);
-	if (ret)
-		return ret;
-
-	spin_lock_irqsave(&j716f_pcc_v4_lock, flags);
-	memcpy(j716f_pcc_v4_active, tmp, sizeof(tmp));
-	j716f_pcc_v4_valid = true;
-	j716f_pcc_v4_generation++;
-	spin_unlock_irqrestore(&j716f_pcc_v4_lock, flags);
-
-	return 0;
-}
-
-static int j716f_pcc_v4_get(char *buf, const struct kernel_param *kp)
-{
-	u32 tmp[J716F_PCC_V4_COEFFS];
-	unsigned long flags;
-	int i, n = 0;
-
-	spin_lock_irqsave(&j716f_pcc_v4_lock, flags);
-	memcpy(tmp, j716f_pcc_v4_active, sizeof(tmp));
-	spin_unlock_irqrestore(&j716f_pcc_v4_lock, flags);
-
-	for (i = 0; i < J716F_PCC_V4_COEFFS; i++)
-		n += scnprintf(buf + n, PAGE_SIZE - n, "%s%u",
-			       i ? "," : "", tmp[i]);
-	n += scnprintf(buf + n, PAGE_SIZE - n, "\n");
-
-	return n;
-}
-
-static const struct kernel_param_ops j716f_pcc_v4_ops = {
-	.set = j716f_pcc_v4_set,
-	.get = j716f_pcc_v4_get,
-};
-module_param_cb(pcc_v4_coeffs, &j716f_pcc_v4_ops, NULL, 0644);
-MODULE_PARM_DESC(pcc_v4_coeffs,
-		 "J716F: 33 runtime PCC v4 coefficients (R then G then B; C,R,G,B,RG,RB,GB,RGB,RR,GG,BB)");
-
-static bool j716f_pcc_v4_snapshot(u32 *out)
-{
-	unsigned long flags;
-	bool valid;
-
-	spin_lock_irqsave(&j716f_pcc_v4_lock, flags);
-	valid = j716f_pcc_v4_valid;
-	if (valid)
-		memcpy(out, j716f_pcc_v4_active, sizeof(j716f_pcc_v4_active));
-	spin_unlock_irqrestore(&j716f_pcc_v4_lock, flags);
-
-	return valid;
-}
-
-static void j716f_pcc_v4_to_cfg(const u32 *v, struct dpu_hw_pcc_cfg *cfg)
-{
-	cfg->r.c = v[0];
-	cfg->r.r = v[1];
-	cfg->r.g = v[2];
-	cfg->r.b = v[3];
-	cfg->r.rg = v[4];
-	cfg->r.rb = v[5];
-	cfg->r.gb = v[6];
-	cfg->r.rgb = v[7];
-	cfg->r.rr = v[8];
-	cfg->r.gg = v[9];
-	cfg->r.bb = v[10];
-
-	cfg->g.c = v[11];
-	cfg->g.r = v[12];
-	cfg->g.g = v[13];
-	cfg->g.b = v[14];
-	cfg->g.rg = v[15];
-	cfg->g.rb = v[16];
-	cfg->g.gb = v[17];
-	cfg->g.rgb = v[18];
-	cfg->g.rr = v[19];
-	cfg->g.gg = v[20];
-	cfg->g.bb = v[21];
-
-	cfg->b.c = v[22];
-	cfg->b.r = v[23];
-	cfg->b.g = v[24];
-	cfg->b.b = v[25];
-	cfg->b.rg = v[26];
-	cfg->b.rb = v[27];
-	cfg->b.gb = v[28];
-	cfg->b.rgb = v[29];
-	cfg->b.rr = v[30];
-	cfg->b.gg = v[31];
-	cfg->b.bb = v[32];
-}
+		 "J716F: apply the calibrated internal-panel PCC matrix");
 
 
 static struct dpu_kms *_dpu_crtc_get_kms(struct drm_crtc *crtc)
@@ -1048,21 +868,18 @@ static bool _dpu_crtc_internal_panel(struct drm_device *dev,
 /*
  * Build the PCC configuration for one CRTC commit.
  *
- * Priority is the user CTM, then the runtime v4 profile, then the board fit2
- * matrix, then bypass.  The runtime profile, the board matrix and the probe
- * only apply to the internal panel, and a user CTM always wins.  A bypass
- * commit clears the PCC enable bit; the next enable rewrites all coefficients
- * before setting it, which is what makes the profile and probe reversible.
+ * A user CTM always wins.  Without one, the board's internal panel receives
+ * the fit2 matrix while the default policy is enabled; every other case
+ * bypasses the block.  A bypass commit clears the PCC enable bit; the next
+ * enable rewrites all coefficients before setting it.
  *
  * Returns true when PCC must be enabled, false to bypass it.
  */
-static bool _dpu_crtc_pcc_config(struct drm_crtc_state *state, bool v4_full,
+static bool _dpu_crtc_pcc_config(struct drm_crtc_state *state,
 				 bool internal_panel, bool default_enable,
-				 bool probe_enable, bool profile_enable,
-				 const u32 *profile,
 				 struct dpu_hw_pcc_cfg *cfg)
 {
-	/* Leave every v4-only term zero for the CTM and plain fit2 cases. */
+	/* Leave every v4-only term zero for the CTM and fit2 cases. */
 	memset(cfg, 0, sizeof(*cfg));
 
 	if (state->ctm) {
@@ -1070,19 +887,10 @@ static bool _dpu_crtc_pcc_config(struct drm_crtc_state *state, bool v4_full,
 		return true;
 	}
 
-	if (profile_enable && v4_full && internal_panel) {
-		j716f_pcc_v4_to_cfg(profile, cfg);
-		return true;
-	}
-
 	if (!default_enable || !internal_panel)
 		return false;
 
 	*cfg = j716f_pcc_default;
-
-	if (probe_enable && v4_full && internal_panel)
-		cfg->r.rg = J716F_PCC_PROBE_R_RG;
-
 	return true;
 }
 
@@ -1147,9 +955,6 @@ static u64 dpu_cp_signature(struct drm_crtc_state *state,
 	sig = sig * 31 + (unsigned long)state->ctm;
 	sig = sig * 31 + (unsigned long)cstate->gamut_lut;
 	sig = sig * 31 + (pcc_default_enable ? 1 : 0);
-	sig = sig * 31 + (pcc_probe_rg_enable ? 1 : 0);
-	sig = sig * 31 + (pcc_v4_enable ? 1 : 0);
-	sig = sig * 31 + j716f_pcc_v4_generation;
 
 	return sig;
 }
@@ -1160,8 +965,8 @@ static u64 dpu_cp_signature(struct drm_crtc_state *state,
  * Ownership rules:
  *  - a userspace blob (GAMMA_LUT, DEGAMMA_LUT, CTM, GAMUT_LUT) always wins
  *    over a default policy for the same block;
- *  - the board PCC defaults are experiments and are only applied to the
- *    internal panel;
+ *  - the board PCC matrix is only applied to the internal panel and is the
+ *    only non-bypass default; it awaits a real-device bypass A/B;
  *  - a NULL blob clears the block explicitly, so a non-empty -> empty
  *    transition cannot leave a stale enable bit behind;
  *  - the programming is skipped on commits that neither change the blobs,
@@ -1180,10 +985,9 @@ static void _dpu_crtc_setup_cp_blocks(struct drm_crtc *crtc)
 	struct dpu_hw_gamut_lut gamut;
 	struct dpu_hw_ctl *ctl;
 	struct dpu_hw_dspp *dspp;
-	bool pcc_default, pcc_probe, internal_panel, pcc_profile;
+	bool pcc_default, internal_panel;
 	bool complete = true;
 	u32 dspp_mask = 0;
-	u32 profile[J716F_PCC_V4_COEFFS];
 	u64 signature;
 	int i;
 
@@ -1200,8 +1004,6 @@ static void _dpu_crtc_setup_cp_blocks(struct drm_crtc *crtc)
 		return;
 
 	pcc_default = pcc_default_enable;
-	pcc_probe = pcc_probe_rg_enable;
-	pcc_profile = pcc_v4_enable && j716f_pcc_v4_snapshot(profile);
 	internal_panel = _dpu_crtc_internal_panel(crtc->dev, state);
 
 	for (i = 0; i < cstate->num_mixers; i++) {
@@ -1215,8 +1017,7 @@ static void _dpu_crtc_setup_cp_blocks(struct drm_crtc *crtc)
 			 */
 			if (state->gamma_lut || state->degamma_lut ||
 			    state->ctm || cstate->gamut_lut ||
-			    (internal_panel &&
-			     (pcc_default || pcc_probe || pcc_profile))) {
+			    (internal_panel && pcc_default)) {
 				complete = false;
 				DPU_ERROR("crtc%d mixer%d has no DSPP for colour programming\n",
 					  crtc->base.id, i);
@@ -1261,11 +1062,8 @@ static void _dpu_crtc_setup_cp_blocks(struct drm_crtc *crtc)
 		}
 
 		if (dspp->ops.setup_pcc) {
-			if (_dpu_crtc_pcc_config(state,
-						 dspp->cap->sblk->pcc_v4_full,
-						 internal_panel, pcc_default,
-						 pcc_probe, pcc_profile,
-						 profile, &cfg))
+			if (_dpu_crtc_pcc_config(state, internal_panel,
+						 pcc_default, &cfg))
 				dspp->ops.setup_pcc(dspp, &cfg);
 			else
 				dspp->ops.setup_pcc(dspp, NULL);
@@ -1301,15 +1099,14 @@ static void _dpu_crtc_setup_cp_blocks(struct drm_crtc *crtc)
 		dpu_crtc->cp_signature = signature;
 	}
 
-	pr_info("J716F cp: crtc%d mixers=%d gc=%s igc=%s gamut=%s pcc=%s dspp=%#x%s\n",
-		crtc->base.id, cstate->num_mixers,
-		state->gamma_lut ? "user" : "bypass",
-		state->degamma_lut ? "user" : "bypass",
-		cstate->gamut_lut ? "user" : "bypass",
-		state->ctm ? "user" :
-		((pcc_profile || (pcc_default && internal_panel)) ?
-		 "default" : "bypass"),
-		dspp_mask, complete ? "" : " incomplete");
+	DRM_DEBUG_DRIVER("crtc%d mixers=%d gc=%s igc=%s gamut=%s pcc=%s dspp=%#x%s\n",
+			 crtc->base.id, cstate->num_mixers,
+			 state->gamma_lut ? "user" : "bypass",
+			 state->degamma_lut ? "user" : "bypass",
+			 cstate->gamut_lut ? "user" : "bypass",
+			 state->ctm ? "user" :
+			 ((pcc_default && internal_panel) ? "default" : "bypass"),
+			 dspp_mask, complete ? "" : " incomplete");
 }
 
 static void dpu_crtc_atomic_begin(struct drm_crtc *crtc,
