@@ -49,29 +49,6 @@ static u32 dpu_crtc_s31_32_to_s3_15(u64 val)
 	return drm_color_ctm_s31_32_to_qm_n(val, 3, 15) & GENMASK(17, 0);
 }
 
-/*
- * Lenovo J716F: low-brightness saturation fit from the 2026-11-19
- * user-space sRGB-gamma + 10% white-trim baseline (DBV233/k=0.26) to ZUI
- * 45/255, with each row normalised so white stays neutral.
- *
- * The 2026-11-21 m31 fix removed the actual cause of the yellow cast: the
- * RM69380 page-0x26 init group was never delivered over bonded DSI.  m31's
- * colour result was nevertheless obtained with this matrix enabled, so the
- * board default keeps it until a PCC-bypass candidate passes a real-device
- * A/B.  See the display finalization task in the integration repository.
- */
-static const struct dpu_hw_pcc_cfg j716f_pcc_default = {
-	.r = { .r = 34781, .g = 261626, .b = 260650 },
-	.g = { .r = 121,   .g = 34129,  .b = 260663 },
-	.b = { .r = 261757, .g = 260201, .b = 35098 },
-};
-
-static bool pcc_default_enable = true;
-module_param(pcc_default_enable, bool, 0644);
-MODULE_PARM_DESC(pcc_default_enable,
-		 "J716F: apply the calibrated internal-panel PCC matrix");
-
-
 static struct dpu_kms *_dpu_crtc_get_kms(struct drm_crtc *crtc)
 {
 	struct msm_drm_private *priv = crtc->dev->dev_private;
@@ -844,10 +821,11 @@ static void _dpu_crtc_get_pcc_coeff(struct drm_crtc_state *state,
 }
 
 /*
- * The J716F colour defaults are only meaningful on this board's internal DSI
- * panel.  Look at the encoders attached to this CRTC's new state: a display
- * can have a DSI encoder somewhere but not drive this CRTC, and other
- * machines may have DSI outputs of their own.
+ * The J716F internal DSI panel always reserves a DSPP per mixer, so the
+ * colour blocks can be programmed or explicitly bypassed even when no
+ * userspace colour property is present.  Look at the encoders attached to
+ * this CRTC's new state: a display can have a DSI encoder somewhere but not
+ * drive this CRTC, and other machines may have DSI outputs of their own.
  */
 static bool _dpu_crtc_internal_panel(struct drm_device *dev,
 				     struct drm_crtc_state *state)
@@ -868,29 +846,20 @@ static bool _dpu_crtc_internal_panel(struct drm_device *dev,
 /*
  * Build the PCC configuration for one CRTC commit.
  *
- * A user CTM always wins.  Without one, the board's internal panel receives
- * the fit2 matrix while the default policy is enabled; every other case
- * bypasses the block.  A bypass commit clears the PCC enable bit; the next
- * enable rewrites all coefficients before setting it.
+ * The only source of PCC coefficients is a user CTM.  Without one the block
+ * is bypassed: there is no board default matrix.  A bypass commit clears the
+ * PCC enable bit; the next enable rewrites all coefficients before setting
+ * it.
  *
  * Returns true when PCC must be enabled, false to bypass it.
  */
 static bool _dpu_crtc_pcc_config(struct drm_crtc_state *state,
-				 bool internal_panel, bool default_enable,
 				 struct dpu_hw_pcc_cfg *cfg)
 {
-	/* Leave every v4-only term zero for the CTM and fit2 cases. */
-	memset(cfg, 0, sizeof(*cfg));
-
-	if (state->ctm) {
-		_dpu_crtc_get_pcc_coeff(state, cfg);
-		return true;
-	}
-
-	if (!default_enable || !internal_panel)
+	if (!state->ctm)
 		return false;
 
-	*cfg = j716f_pcc_default;
+	_dpu_crtc_get_pcc_coeff(state, cfg);
 	return true;
 }
 
@@ -954,7 +923,6 @@ static u64 dpu_cp_signature(struct drm_crtc_state *state,
 	sig = sig * 31 + (unsigned long)state->degamma_lut;
 	sig = sig * 31 + (unsigned long)state->ctm;
 	sig = sig * 31 + (unsigned long)cstate->gamut_lut;
-	sig = sig * 31 + (pcc_default_enable ? 1 : 0);
 
 	return sig;
 }
@@ -963,15 +931,13 @@ static u64 dpu_cp_signature(struct drm_crtc_state *state,
  * Program the DSPP colour blocks from the atomic state.
  *
  * Ownership rules:
- *  - a userspace blob (GAMMA_LUT, DEGAMMA_LUT, CTM, GAMUT_LUT) always wins
- *    over a default policy for the same block;
- *  - the board PCC matrix is only applied to the internal panel and is the
- *    only non-bypass default; it awaits a real-device bypass A/B;
+ *  - a userspace blob (GAMMA_LUT, DEGAMMA_LUT, CTM, GAMUT_LUT) always
+ *    replaces the kernel's state for the same block;
  *  - a NULL blob clears the block explicitly, so a non-empty -> empty
  *    transition cannot leave a stale enable bit behind;
- *  - the programming is skipped on commits that neither change the blobs,
- *    the module parameters nor the mode.  cp_needs_replay covers CRTC
- *    disable, resource re-assignment and power collapse.
+ *  - the programming is skipped on commits that neither change the blobs
+ *    nor the mode.  cp_needs_replay covers CRTC disable, resource
+ *    re-assignment and power collapse.
  */
 static void _dpu_crtc_setup_cp_blocks(struct drm_crtc *crtc)
 {
@@ -985,26 +951,19 @@ static void _dpu_crtc_setup_cp_blocks(struct drm_crtc *crtc)
 	struct dpu_hw_gamut_lut gamut;
 	struct dpu_hw_ctl *ctl;
 	struct dpu_hw_dspp *dspp;
-	bool pcc_default, internal_panel;
 	bool complete = true;
 	u32 dspp_mask = 0;
 	u64 signature;
 	int i;
 
 	/*
-	 * Snapshot the colour policy once per commit, before the mixer loop,
-	 * so both halves program the same configuration.  Writing the module
-	 * parameters only changes these variables; nothing reaches the
-	 * hardware until the next colour commit or modeset runs this function
-	 * again.
+	 * Snapshot the colour state once per commit, before the mixer loop, so
+	 * both halves program the same configuration.
 	 */
 	signature = dpu_cp_signature(state, cstate);
 	if (dpu_crtc->cp_programmed && !dpu_crtc->cp_needs_replay &&
 	    !state->color_mgmt_changed && signature == dpu_crtc->cp_signature)
 		return;
-
-	pcc_default = pcc_default_enable;
-	internal_panel = _dpu_crtc_internal_panel(crtc->dev, state);
 
 	for (i = 0; i < cstate->num_mixers; i++) {
 		ctl = mixer[i].lm_ctl;
@@ -1016,8 +975,7 @@ static void _dpu_crtc_setup_cp_blocks(struct drm_crtc *crtc)
 			 * to the submitter, not silently dropped.
 			 */
 			if (state->gamma_lut || state->degamma_lut ||
-			    state->ctm || cstate->gamut_lut ||
-			    (internal_panel && pcc_default)) {
+			    state->ctm || cstate->gamut_lut) {
 				complete = false;
 				DPU_ERROR("crtc%d mixer%d has no DSPP for colour programming\n",
 					  crtc->base.id, i);
@@ -1062,8 +1020,7 @@ static void _dpu_crtc_setup_cp_blocks(struct drm_crtc *crtc)
 		}
 
 		if (dspp->ops.setup_pcc) {
-			if (_dpu_crtc_pcc_config(state, internal_panel,
-						 pcc_default, &cfg))
+			if (_dpu_crtc_pcc_config(state, &cfg))
 				dspp->ops.setup_pcc(dspp, &cfg);
 			else
 				dspp->ops.setup_pcc(dspp, NULL);
@@ -1104,8 +1061,7 @@ static void _dpu_crtc_setup_cp_blocks(struct drm_crtc *crtc)
 			 state->gamma_lut ? "user" : "bypass",
 			 state->degamma_lut ? "user" : "bypass",
 			 cstate->gamut_lut ? "user" : "bypass",
-			 state->ctm ? "user" :
-			 ((pcc_default && internal_panel) ? "default" : "bypass"),
+			 state->ctm ? "user" : "bypass",
 			 dspp_mask, complete ? "" : " incomplete");
 }
 
@@ -1638,8 +1594,8 @@ static struct msm_display_topology dpu_crtc_get_topology(
 	 * If DSC is enabled, use 2 LMs for 2:2:1 topology
 	 *
 	 * Add dspps to the reservation requirements if ctm, gamma, degamma or
-	 * gamut is requested, or if the internal panel needs its default
-	 * colour policy (including an explicit bypass of stale blocks).
+	 * gamut is requested, or if the internal panel reserves one so its
+	 * colour blocks can be explicitly bypassed.
 	 *
 	 * Only hardcode num_lm to 2 for cases where num_intf == 2 and CWB is not
 	 * enabled. This is because in cases where CWB is enabled, num_intf will
@@ -1663,9 +1619,9 @@ static struct msm_display_topology dpu_crtc_get_topology(
 
 	/*
 	 * The internal panel always reserves a DSPP per mixer, even when no
-	 * userspace blob is present: the default PCC policy and the explicit
-	 * bypass of stale blocks both need the block.  External displays only
-	 * reserve one when a standard colour property is requested.
+	 * userspace blob is present, so a stale colour-block enable from a
+	 * previous commit or mode can always be cleared.  External displays
+	 * only reserve one when a standard colour property is requested.
 	 */
 	if (crtc_state->ctm || crtc_state->gamma_lut ||
 	    crtc_state->degamma_lut || cstate->gamut_lut || internal_panel)
@@ -1796,9 +1752,9 @@ static int dpu_crtc_atomic_check(struct drm_crtc *crtc,
 	}
 
 	/*
-	 * A colour-management request, or the internal panel's default
-	 * policy, must not be accepted when the pipeline did not get a DSPP
-	 * for every half: the commit would otherwise succeed while silently
+	 * A colour-management request, or the internal panel's reserved
+	 * DSPP, must not be accepted when the pipeline did not get a DSPP for
+	 * every half: the commit would otherwise succeed while silently
 	 * dropping the transform.
 	 */
 	if (crtc_state->ctm || crtc_state->gamma_lut ||

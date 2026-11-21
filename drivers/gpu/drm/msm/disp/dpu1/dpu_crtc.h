@@ -155,7 +155,7 @@ struct dpu_crtc_frame_event {
  * @cp_programmed : colour-processing blocks hold the current CP signature
  * @cp_needs_replay : force a full CP replay on the next commit (after disable
  *                  or a resource change)
- * @cp_signature : signature of the userspace blobs and default policy
+ * @cp_signature : signature of the userspace colour blobs
  */
 struct dpu_crtc {
 	struct drm_crtc base;
