@@ -52,7 +52,11 @@ struct rm69380_panel {
 	struct regulator_bulk_data supplies[RM69380_SUPPLY_COUNT];
 	struct gpio_desc *reset_gpio;
 	struct gpio_desc *enable_gpio;
-	/* First bring-up forces a vendor-like vdd/avdd power cycle. */
+	/*
+	 * Historical first-prepare vdd/avdd power cycle.  It bootstraps the
+	 * panel from the bootloader state, but also discards it; a handover
+	 * A/B must confirm the panel still initialises without it.
+	 */
 	bool power_cycled;
 	/* Last brightness written; see rm69380_bl_get_brightness(). */
 	u16 brightness;
@@ -117,6 +121,10 @@ err_vddio:
  * Enable once (so the consumer refs exist), then drop VDD/AVDD and redo the
  * vendor order.  VDDIO is deliberately not dropped: it is shared with the
  * touch controller and cannot be switched off by this driver.
+ *
+ * This forced cycle is a bring-up measure, not part of the vendor sequence.
+ * It is kept because the panel and the verified m31 display behaviour were
+ * obtained with it; removing it needs a separate display-handover A/B.
  */
 static int rm69380_power_on(struct rm69380_panel *ctx)
 {
@@ -522,6 +530,12 @@ static int rm69380_probe(struct mipi_dsi_device *dsi)
 	if (ret < 0)
 		return dev_err_probe(dev, ret, "Failed to get regulators\n");
 
+	/*
+	 * The reset line is active low in DT, so GPIOD_OUT_HIGH drives the
+	 * physical pin low: probe asserts reset and discards the panel state
+	 * left by the bootloader.  Keep the upstream behaviour for now;
+	 * deasserting it here is a separate display-handover A/B.
+	 */
 	ctx->reset_gpio = devm_gpiod_get(dev, "reset", GPIOD_OUT_HIGH);
 	if (IS_ERR(ctx->reset_gpio))
 		return dev_err_probe(dev, PTR_ERR(ctx->reset_gpio),

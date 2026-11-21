@@ -43,13 +43,11 @@
 /*
  * Two-bit depth code per source bit depth.  The vendor default blob for an
  * RGB888 output (dst_format 3) carries c0..c3 = 8 and its own table maps 8
- * to 3, i.e. the BITDEPTH register is 0xFF.  This table used to map 8 to 2
- * (0xAA), which is a different quantiser and the reason a plain "enable
- * dither for 8 bpc" change did not reproduce the factory pattern.
+ * to 3, i.e. the BITDEPTH register is 0xFF.  The historical table mapped 8
+ * to 2 (0xAA), which is a different quantiser.
  *
- * Indices 5..7 are deliberately left at the historical values so the
- * existing 6 bpc path (index 6 -> 0) keeps its behaviour.  Only the 8 bpc
- * entry is the vendor default we need for this panel.
+ * Indices 5..7 keep their historical values so the existing 6 bpc path
+ * (index 6 -> 0) is unchanged.
  */
 static const u32 dither_depth_map[DITHER_DEPTH_MAP_INDEX] = {
 	0, 0, 0, 0, 0, 0, 0, 1, 3
