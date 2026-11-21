@@ -219,13 +219,21 @@ static int rm69380_on(struct rm69380_panel *ctx)
 	rm69380_dual_write_seq(&dsi_ctx, c1, 0x48, 0x00);
 
 	/*
-	 * Page-0x26 settings. The vendor sends these to the PRIMARY link only;
-	 * its "second" panel node omits exactly this group and is otherwise
-	 * identical (verified by decoding both blobs from the device's dtbo).
+	 * Page-0x26 settings.  There is no primary-only panel node: the
+	 * vendor DT has a single RM69380 node whose on-command sequence
+	 * contains this group, and the downstream DSI driver broadcasts the
+	 * whole sequence from ctrl0 to both controllers (the DT also sets
+	 * qcom,dcs-cmd-by-left and qcom,cmd-sync-wait-broadcast).
+	 *
+	 * Writing only to dsi[0] does not work on mainline: the bonded-DSI
+	 * manager makes DSI_0 command transfers return success without
+	 * transmitting, and only DSI_1 triggers the pair.  Route the group
+	 * through the same bonded path as the rest of the sequence so it
+	 * actually reaches the panel.
 	 */
-	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xfe, 0x26);
-	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x75, 0x3f);
-	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x1d, 0x1a);
+	rm69380_dual_write_seq(&dsi_ctx, c1, 0xfe, 0x26);
+	rm69380_dual_write_seq(&dsi_ctx, c1, 0x75, 0x3f);
+	rm69380_dual_write_seq(&dsi_ctx, c1, 0x1d, 0x1a);
 
 	rm69380_dual_write_seq(&dsi_ctx, c1, 0xfe, 0x00);
 	rm69380_dual_write_seq(&dsi_ctx, c1, MIPI_DCS_WRITE_CONTROL_DISPLAY,
