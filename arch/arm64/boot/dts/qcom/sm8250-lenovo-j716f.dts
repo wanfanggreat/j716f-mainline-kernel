@@ -1162,8 +1162,6 @@
 };
 
 &usb_1 {
-	/* USB 2.0 only for this bring-up: use UTMI as the PIPE clock. */
-	qcom,select-utmi-as-pipe-clk;
 	status = "okay";
 };
 
@@ -1171,14 +1169,9 @@
 	dr_mode = "otg";
 	usb-role-switch;
 
-	/*
-	 * USB0 is the USB-C port.  Keep the first bring-up on the HS PHY
-	 * only; the QMP SuperSpeed path is enabled once its supplies and the
-	 * Type-C lane orientation are validated.
-	 */
-	maximum-speed = "high-speed";
-	phys = <&usb_1_hsphy>;
-	phy-names = "usb2-phy";
+	maximum-speed = "super-speed";
+	phys = <&usb_1_hsphy>, <&usb_1_qmpphy QMP_USB43DP_USB3_PHY>;
+	phy-names = "usb2-phy", "usb3-phy";
 };
 
 &usb_1_dwc3_hs_out {
@@ -1194,13 +1187,20 @@
 };
 
 &usb_1_qmpphy {
-	/delete-property/ orientation-switch;
+	/*
+	 * Reference boards pair the 0.9 V analog rail with vdda-phy and the
+	 * 1.2 V PLL rail with vdda-pll.  The USB2-only template this board
+	 * was copied from had them inverted; fix the mapping before powering
+	 * the SuperSpeed side.
+	 */
+	vdda-phy-supply = <&vreg_l18a_0p9>;
+	vdda-pll-supply = <&vreg_l9a_1p2>;
 
-	vdda-phy-supply = <&vreg_l9a_1p2>;
-	vdda-pll-supply = <&vreg_l18a_0p9>;
+	status = "okay";
+};
 
-	/* USB-C bring-up starts on USB 2.0 only. */
-	status = "disabled";
+&usb_1_qmpphy_out {
+	remote-endpoint = <&pm8150b_ss_in>;
 };
 
 /*
@@ -1245,6 +1245,14 @@
 
 				pm8150b_hs_in: endpoint {
 					remote-endpoint = <&usb_1_dwc3_hs_out>;
+				};
+			};
+
+			port@1 {
+				reg = <1>;
+
+				pm8150b_ss_in: endpoint {
+					remote-endpoint = <&usb_1_qmpphy_out>;
 				};
 			};
 		};
