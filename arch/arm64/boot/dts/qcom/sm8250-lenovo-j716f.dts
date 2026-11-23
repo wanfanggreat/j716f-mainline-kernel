@@ -137,6 +137,27 @@
 		vin-supply = <&vph_pwr>;
 	};
 
+	/*
+	 * USB-C 5 V board boost.  The vendor DT calls the enable
+	 * "qcom,boost_en" and describes it as PM8150B gpio 2, i.e. the
+	 * second physical GPIO.  The SPMI block for that pin is 0xC100
+	 * (chip offset 1, owned by the AP); 0xC200 is the third GPIO and
+	 * belongs to another EE.  The regulator is a child of the PMIC OTG
+	 * regulator, so TCPM enables the boost and CMD_OTG only while the
+	 * port is a source and disables both on detach or a role swap.
+	 */
+	j716f_usb_vbus_boost: regulator-usb-vbus-boost {
+		compatible = "regulator-fixed";
+
+		regulator-name = "usb_c_vbus_boost";
+		regulator-min-microvolt = <5000000>;
+		regulator-max-microvolt = <5000000>;
+		enable-active-high;
+
+		gpio = <&pm8150b_gpios 2 GPIO_ACTIVE_HIGH>;
+		vin-supply = <&pm8150b_vbus>;
+	};
+
 	qca6390-pmu {
 		compatible = "qcom,qca6390-pmu";
 
@@ -1203,7 +1224,7 @@
 
 		op-sink-microwatt = <10000000>;
 
-		vbus-supply = <&pm8150b_vbus>;
+		vbus-supply = <&j716f_usb_vbus_boost>;
 
 		source-pdos = <PDO_FIXED(5000, 1500,
 					 PDO_FIXED_DUAL_ROLE |
