@@ -1166,6 +1166,7 @@
 };
 
 &usb_1_dwc3 {
+	reg = <0 0x0a600000 0 0xd93c>;
 	dr_mode = "otg";
 	usb-role-switch;
 
