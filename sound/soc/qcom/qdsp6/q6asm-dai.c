@@ -248,7 +248,8 @@ static void event_handler(uint32_t opcode, uint32_t token,
 		 */
 		if (prtd->reads_inflight)
 			prtd->reads_inflight--;
-		while (prtd->reads_inflight < prtd->periods) {
+		while (READ_ONCE(prtd->state) == Q6ASM_STREAM_RUNNING &&
+		       prtd->reads_inflight < prtd->periods) {
 			if (q6asm_read(prtd->audio_client,
 				       prtd->stream_id) != 0)
 				break;
@@ -374,9 +375,10 @@ static int q6asm_dai_prepare(struct snd_soc_component *component,
 		if (prtd->mapped) {
 			ret = q6asm_unmap_memory_regions(substream->stream,
 							 prtd->audio_client);
-			if (ret < 0)
-				dev_warn(dev, "J716F: unmap before close failed %d\n",
-					 ret);
+			if (ret < 0) {
+				dev_err(dev, "J716F: unmap before close failed %d\n", ret);
+				return ret;
+			}
 			prtd->mapped = false;
 		}
 
@@ -566,6 +568,8 @@ static int q6asm_dai_trigger(struct snd_soc_component *component,
 				       0, 0, 0);
 		break;
 	case SNDRV_PCM_TRIGGER_STOP:
+		WRITE_ONCE(prtd->state, Q6ASM_STREAM_STOPPED);
+		WRITE_ONCE(prtd->reads_pending, false);
 		prtd->capture_started = false;
 		ret = q6asm_cmd_nowait(prtd->audio_client, prtd->stream_id,
 				       CMD_EOS);
@@ -695,6 +699,9 @@ static int q6asm_dai_close(struct snd_soc_component *component,
 	struct q6asm_dai_rtd *prtd = runtime->private_data;
 
 	if (prtd->audio_client) {
+		WRITE_ONCE(prtd->state, Q6ASM_STREAM_STOPPED);
+		WRITE_ONCE(prtd->reads_pending, false);
+		q6asm_audio_client_clear_callback(prtd->audio_client);
 		/*
 		 * Lenovo J716F: always release the ADSP session. Gating this on
 		 * prtd->state leaked the session whenever a prepare() failed
@@ -729,11 +736,12 @@ static snd_pcm_uframes_t q6asm_dai_pointer(struct snd_soc_component *component,
 	struct q6asm_dai_rtd *prtd = runtime->private_data;
 	snd_pcm_uframes_t ptr;
 
-	ptr = q6asm_get_hw_pointer(prtd->audio_client, substream->stream) * runtime->period_size;
-	if (ptr)
-		return ptr - 1;
+	if (!runtime->periods)
+		return 0;
 
-	return 0;
+	ptr = q6asm_get_hw_pointer(prtd->audio_client, substream->stream) %
+	      runtime->periods;
+	return ptr * runtime->period_size;
 }
 
 static int q6asm_dai_hw_params(struct snd_soc_component *component,
@@ -921,6 +929,7 @@ static int q6asm_dai_compr_free(struct snd_soc_component *component,
 	struct snd_soc_pcm_runtime *rtd = stream->private_data;
 
 	if (prtd->audio_client) {
+		q6asm_audio_client_clear_callback(prtd->audio_client);
 		if (prtd->state == Q6ASM_STREAM_RUNNING) {
 			q6asm_cmd(prtd->audio_client, prtd->stream_id,
 				  CMD_CLOSE);

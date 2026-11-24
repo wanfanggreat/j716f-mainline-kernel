@@ -268,6 +268,8 @@ struct audio_client {
 	uint32_t io_mode;
 	struct apr_device *adev;
 	struct mutex cmd_lock;
+	/* APR RX callbacks execute in a workqueue. */
+	struct mutex cb_lock;
 	spinlock_t lock;
 	struct kref refcount;
 	/* idx:1 out port, 0: in port */
@@ -318,8 +320,8 @@ static int q6asm_apr_send_session_pkt(struct q6asm *a, struct audio_client *ac,
 		dev_err(a->dev, "CMD %x timeout\n", hdr->opcode);
 		rc = -ETIMEDOUT;
 	} else if (ac->result.status > 0) {
-		dev_err(a->dev, "DSP returned error[%x]\n",
-			ac->result.status);
+		dev_err(a->dev, "DSP command %#x session %d returned error[%x]\n",
+			hdr->opcode, ac->session, ac->result.status);
 		rc = -EINVAL;
 	} else {
 		/*
@@ -390,11 +392,16 @@ static void q6asm_audio_client_free_buf(struct audio_client *ac,
 {
 	unsigned long flags;
 
+	struct audio_buffer *buf;
+
 	spin_lock_irqsave(&ac->lock, flags);
-	port->num_periods = 0;
-	spin_unlock_irqrestore(&ac->lock, flags);
-	kfree(port->buf);
+	buf = port->buf;
 	port->buf = NULL;
+	port->num_periods = 0;
+	port->dsp_buf = 0;
+	atomic_set(&port->hw_ptr, 0);
+	spin_unlock_irqrestore(&ac->lock, flags);
+	kfree(buf);
 }
 
 /**
@@ -521,7 +528,7 @@ int q6asm_map_memory_regions(unsigned int dir, struct audio_client *ac,
 	if (ac->port[dir].buf) {
 		dev_err(ac->dev, "Buffer already allocated\n");
 		spin_unlock_irqrestore(&ac->lock, flags);
-		return 0;
+		return -EBUSY;
 	}
 
 	buf = kzalloc_objs(*buf, periods, GFP_ATOMIC);
@@ -543,6 +550,8 @@ int q6asm_map_memory_regions(unsigned int dir, struct audio_client *ac,
 		}
 	}
 	ac->port[dir].num_periods = periods;
+	ac->port[dir].dsp_buf = 0;
+	atomic_set(&ac->port[dir].hw_ptr, 0);
 
 	spin_unlock_irqrestore(&ac->lock, flags);
 
@@ -577,8 +586,18 @@ static void q6asm_audio_client_release(struct kref *ref)
  *
  * @ac: audio client to free
  */
+void q6asm_audio_client_clear_callback(struct audio_client *ac)
+{
+	mutex_lock(&ac->cb_lock);
+	ac->cb = NULL;
+	ac->priv = NULL;
+	mutex_unlock(&ac->cb_lock);
+}
+EXPORT_SYMBOL_GPL(q6asm_audio_client_clear_callback);
+
 void q6asm_audio_client_free(struct audio_client *ac)
 {
+	q6asm_audio_client_clear_callback(ac);
 	kref_put(&ac->refcount, q6asm_audio_client_release);
 }
 EXPORT_SYMBOL_GPL(q6asm_audio_client_free);
@@ -601,7 +620,8 @@ static struct audio_client *q6asm_get_audio_client(struct q6asm *a,
 		goto err;
 
 	ac = a->session[session_id];
-	kref_get(&ac->refcount);
+	if (!kref_get_unless_zero(&ac->refcount))
+		ac = NULL;
 err:
 	return ac;
 }
@@ -613,6 +633,15 @@ int q6asm_get_hw_pointer(struct audio_client *ac, unsigned int dir)
 	return (int)atomic_read(&data->hw_ptr);
 }
 EXPORT_SYMBOL_GPL(q6asm_get_hw_pointer);
+
+static void q6asm_notify_client(struct audio_client *ac, u32 event,
+				u32 token, void *payload)
+{
+	mutex_lock(&ac->cb_lock);
+	if (ac->cb)
+		ac->cb(event, token, payload, ac->priv);
+	mutex_unlock(&ac->cb_lock);
+}
 
 static int32_t q6asm_stream_callback(struct apr_device *adev,
 				     const struct apr_resp_pkt *data,
@@ -634,6 +663,10 @@ static int32_t q6asm_stream_callback(struct apr_device *adev,
 
 	switch (hdr->opcode) {
 	case APR_BASIC_RSP_RESULT:
+		if (data->payload_size < sizeof(*result)) {
+			ret = -EINVAL;
+			goto done;
+		}
 		switch (result->opcode) {
 		case ASM_SESSION_CMD_PAUSE:
 			client_event = ASM_CLIENT_EVENT_CMD_PAUSE_DONE;
@@ -719,9 +752,9 @@ static int32_t q6asm_stream_callback(struct apr_device *adev,
 		ac->result = *result;
 		wake_up(&ac->cmd_wait);
 
-		if (ac->cb)
-			ac->cb(client_event, hdr->token,
-			       data->payload, ac->priv);
+		if (!result->status)
+			q6asm_notify_client(ac, client_event, hdr->token,
+					    data->payload);
 
 		ret = 0;
 		goto done;
@@ -736,7 +769,8 @@ static int32_t q6asm_stream_callback(struct apr_device *adev,
 
 			port =  &ac->port[SNDRV_PCM_STREAM_PLAYBACK];
 
-			if (!port->buf) {
+			if (!port->buf || token >= port->num_periods ||
+			    data->payload_size < sizeof(*result)) {
 				ret = 0;
 				goto done;
 			}
@@ -762,7 +796,8 @@ static int32_t q6asm_stream_callback(struct apr_device *adev,
 
 			guard(spinlock_irqsave)(&ac->lock);
 			port =  &ac->port[SNDRV_PCM_STREAM_CAPTURE];
-			if (!port->buf) {
+			if (!port->buf || hdr->token >= port->num_periods ||
+			    data->payload_size < sizeof(*done) || done->status) {
 				ret = 0;
 				goto done;
 			}
@@ -787,8 +822,7 @@ static int32_t q6asm_stream_callback(struct apr_device *adev,
 		break;
 	}
 
-	if (ac->cb)
-		ac->cb(client_event, hdr->token, data->payload, ac->priv);
+	q6asm_notify_client(ac, client_event, hdr->token, data->payload);
 
 done:
 	kref_put(&ac->refcount, q6asm_audio_client_release);
@@ -821,11 +855,15 @@ static int q6asm_srvc_callback(struct apr_device *adev,
 
 	a = dev_get_drvdata(ac->dev->parent);
 	dir = (hdr->token & 0x0F);
+	if (dir >= ARRAY_SIZE(ac->port))
+		goto done;
 	port = &ac->port[dir];
 	result = data->payload;
 
 	switch (hdr->opcode) {
 	case APR_BASIC_RSP_RESULT:
+		if (data->payload_size < sizeof(*result))
+			goto done;
 		switch (result->opcode) {
 		case ASM_CMD_SHARED_MEM_MAP_REGIONS:
 		case ASM_CMD_SHARED_MEM_UNMAP_REGIONS:
@@ -846,6 +884,8 @@ static int q6asm_srvc_callback(struct apr_device *adev,
 		}
 		goto done;
 	case ASM_CMDRSP_SHARED_MEM_MAP_REGIONS:
+		if (data->payload_size < sizeof(u32) || !result->opcode)
+			goto done;
 		ac->result.status = 0;
 		ac->result.opcode = hdr->opcode;
 		port->mem_map_handle = result->opcode;
@@ -863,8 +903,7 @@ static int q6asm_srvc_callback(struct apr_device *adev,
 		break;
 	}
 
-	if (ac->cb)
-		ac->cb(hdr->opcode, hdr->token, data->payload, ac->priv);
+	q6asm_notify_client(ac, hdr->opcode, hdr->token, data->payload);
 
 done:
 	kref_put(&ac->refcount, q6asm_audio_client_release);
@@ -905,19 +944,13 @@ struct audio_client *q6asm_audio_client_alloc(struct device *dev, q6asm_cb cb,
 	struct audio_client *ac;
 	unsigned long flags;
 
-	ac = q6asm_get_audio_client(a, session_id + 1);
-	if (ac) {
-		dev_err(dev, "Audio Client already active\n");
-		return ac;
-	}
+	if (session_id < 0 || session_id >= MAX_SESSIONS)
+		return ERR_PTR(-EINVAL);
 
 	ac = kzalloc_obj(*ac);
 	if (!ac)
 		return ERR_PTR(-ENOMEM);
 
-	spin_lock_irqsave(&a->slock, flags);
-	a->session[session_id + 1] = ac;
-	spin_unlock_irqrestore(&a->slock, flags);
 	ac->session = session_id + 1;
 	ac->cb = cb;
 	ac->dev = dev;
@@ -930,7 +963,17 @@ struct audio_client *q6asm_audio_client_alloc(struct device *dev, q6asm_cb cb,
 
 	init_waitqueue_head(&ac->cmd_wait);
 	mutex_init(&ac->cmd_lock);
+	mutex_init(&ac->cb_lock);
 	spin_lock_init(&ac->lock);
+
+	spin_lock_irqsave(&a->slock, flags);
+	if (a->session[ac->session]) {
+		spin_unlock_irqrestore(&a->slock, flags);
+		kfree(ac);
+		return ERR_PTR(-EBUSY);
+	}
+	a->session[ac->session] = ac;
+	spin_unlock_irqrestore(&a->slock, flags);
 
 	return ac;
 }
@@ -1476,6 +1519,11 @@ int q6asm_read(struct audio_client *ac, uint32_t stream_id)
 
 	spin_lock_irqsave(&ac->lock, flags);
 	port = &ac->port[SNDRV_PCM_STREAM_CAPTURE];
+	if (!port->buf || port->dsp_buf >= port->num_periods ||
+	    !port->mem_map_handle) {
+		spin_unlock_irqrestore(&ac->lock, flags);
+		return -EINVAL;
+	}
 	q6asm_add_hdr(ac, &pkt->hdr, pkt_size, false, stream_id);
 	ab = &port->buf[port->dsp_buf];
 	pkt->hdr.opcode = ASM_DATA_CMD_READ_V2;
@@ -1598,6 +1646,11 @@ int q6asm_write_async(struct audio_client *ac, uint32_t stream_id, uint32_t len,
 
 	spin_lock_irqsave(&ac->lock, flags);
 	port = &ac->port[SNDRV_PCM_STREAM_PLAYBACK];
+	if (!port->buf || port->dsp_buf >= port->num_periods ||
+	    !port->mem_map_handle) {
+		spin_unlock_irqrestore(&ac->lock, flags);
+		return -EINVAL;
+	}
 	q6asm_add_hdr(ac, &pkt->hdr, pkt_size, false, stream_id);
 
 	ab = &port->buf[port->dsp_buf];
