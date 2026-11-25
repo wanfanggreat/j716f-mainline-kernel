@@ -333,8 +333,8 @@ static int q6asm_dai_map_regions(struct device *dev,
 		if (ret >= 0) {
 			prtd->phys = phys;
 			prtd->mapped = true;
-			dev_info(dev,
-				 "J716F: map dir=%d mode=%d phys=%#llx dma=%#llx period=%zu periods=%u accepted\n",
+			dev_dbg(dev,
+				"J716F: map dir=%d mode=%d phys=%#llx dma=%#llx period=%zu periods=%u accepted\n",
 				 substream->stream, attempt,
 				 (unsigned long long)phys,
 				 (unsigned long long)dma_addr, period_sz,
