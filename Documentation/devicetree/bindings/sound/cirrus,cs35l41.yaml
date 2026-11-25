@@ -25,6 +25,9 @@ properties:
   interrupts:
     maxItems: 1
 
+  interrupt-names:
+    maxItems: 1
+
   '#sound-dai-cells':
     description:
       The first cell indicating the audio interface.
@@ -64,6 +67,17 @@ properties:
       and VAMP pins, derated at 11 volts DC. The value must be rounded to the
       nearest integer and expressed in uF.
     $ref: /schemas/types.yaml#/definitions/uint32
+
+  cirrus,boost-ctl-millivolt:
+    description: |
+      Boost converter output voltage control, in millivolts.  The driver
+      programs BSTCVRT_VCTRL1 as ((millivolt - 2550) / 100) + 1.  The
+      converter's floor is 2550 mV and the vendor range accepts
+      2550..11000 mV in 100 mV steps.
+    $ref: /schemas/types.yaml#/definitions/uint32
+    minimum: 2550
+    maximum: 11000
+    multipleOf: 100
 
   cirrus,asp-sdout-hiz:
     description:

@@ -712,8 +712,6 @@
 
 		interrupt-parent = <&tlmm>;
 		interrupts = <67 IRQ_TYPE_LEVEL_LOW>;
-		interrupt-controller;
-		#interrupt-cells = <2>;
 		interrupt-names = "cs35l41_1_irq";
 
 		pinctrl-names = "default";
@@ -743,8 +741,6 @@
 
 		interrupt-parent = <&tlmm>;
 		interrupts = <113 IRQ_TYPE_LEVEL_LOW>;
-		interrupt-controller;
-		#interrupt-cells = <2>;
 		interrupt-names = "cs35l41_2_irq";
 
 		pinctrl-names = "default";
@@ -773,8 +769,6 @@
 
 		interrupt-parent = <&tlmm>;
 		interrupts = <126 IRQ_TYPE_LEVEL_LOW>;
-		interrupt-controller;
-		#interrupt-cells = <2>;
 		interrupt-names = "cs35l41_3_irq";
 
 		pinctrl-names = "default";
@@ -803,8 +797,6 @@
 
 		interrupt-parent = <&tlmm>;
 		interrupts = <68 IRQ_TYPE_LEVEL_LOW>;
-		interrupt-controller;
-		#interrupt-cells = <2>;
 		interrupt-names = "cs35l41_4_irq";
 
 		pinctrl-names = "default";

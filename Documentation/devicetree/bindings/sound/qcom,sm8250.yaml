@@ -73,6 +73,24 @@ properties:
     $ref: /schemas/types.yaml#/definitions/string
     description: User visible long sound card name
 
+  pin-switches:
+    $ref: /schemas/types.yaml#/definitions/string-array
+    description:
+      Names of DAPM pin switches owned by the machine driver, for example
+      "SPK2 SPK".  Each entry must match a pin switch declared by the card.
+
+  qcom,msm-dmic-en-gpio:
+    maxItems: 1
+    description:
+      GPIO that enables the digital-microphone power rail.  The polarity is
+      described by the GPIO flags.
+
+  qcom,msm-dmic-sel-gpio:
+    maxItems: 1
+    description:
+      GPIO that selects the digital-microphone path on boards that have a
+      mux between the DMIC and another microphone front end.
+
 patternProperties:
   ".*-dai-link$":
     description:
