@@ -366,26 +366,28 @@ static int q6asm_dai_prepare(struct snd_soc_component *component,
 	/* rate and channels are sent to audio driver */
 	if (prtd->state) {
 		/*
-		 * Clear the previous setup if any.  Unmap before CMD_CLOSE:
-		 * CMD_CLOSE invalidates the ADSP-side memory map handle, and a
-		 * later UNMAP then fails with "invalid mem handle" and leaves
-		 * the session unusable.  The vendor driver frees the buffer
-		 * before releasing the client for the same reason.
+		 * Clear the previous setup if any.  Close the DSP stream
+		 * before unmapping: while the stream is still open the ADSP
+		 * rejects ASM_CMD_SHARED_MEM_UNMAP_REGIONS (0x10d94) with
+		 * error[a] (-22).  Unmapping first therefore left the DSP-side
+		 * map handle behind, and the next desktop open collided with
+		 * the stale session (silence, then an ADSP reset).  CMD_CLOSE
+		 * releases the stream and the UNMAP that follows succeeds.
 		 */
-		if (prtd->mapped) {
-			ret = q6asm_unmap_memory_regions(substream->stream,
-							 prtd->audio_client);
-			if (ret < 0) {
-				dev_err(dev, "J716F: unmap before close failed %d\n", ret);
-				return ret;
-			}
-			prtd->mapped = false;
-		}
-
 		ret = q6asm_cmd(prtd->audio_client, prtd->stream_id, CMD_CLOSE);
 		if (ret < 0) {
 			dev_err(dev, "Failed to close q6asm stream %d\n", prtd->stream_id);
 			return ret;
+		}
+
+		if (prtd->mapped) {
+			ret = q6asm_unmap_memory_regions(substream->stream,
+							 prtd->audio_client);
+			if (ret < 0) {
+				dev_err(dev, "J716F: unmap after close failed %d\n", ret);
+				return ret;
+			}
+			prtd->mapped = false;
 		}
 
 		q6routing_stream_close(soc_prtd->dai_link->id,
@@ -709,16 +711,17 @@ static int q6asm_dai_close(struct snd_soc_component *component,
 		 * limited number of open sessions and answered the next
 		 * OPEN_WRITE/OPEN_READ with ADSP_EALREADY (0x9).
 		 *
-		 * Unmap first, then close: CMD_CLOSE invalidates the ADSP-side
-		 * memory map handle, so an UNMAP afterwards fails and leaves the
-		 * bookkeeping inconsistent.
+		 * Close first, then unmap: the ADSP rejects UNMAP while the
+		 * stream is still open (0x10d94 error[a], -22), which leaked the
+		 * DSP-side map and made the next desktop open silent or reset
+		 * the ADSP.
 		 */
+		q6asm_cmd(prtd->audio_client, prtd->stream_id, CMD_CLOSE);
 		if (prtd->mapped) {
 			q6asm_unmap_memory_regions(substream->stream,
 						   prtd->audio_client);
 			prtd->mapped = false;
 		}
-		q6asm_cmd(prtd->audio_client, prtd->stream_id, CMD_CLOSE);
 		q6asm_audio_client_free(prtd->audio_client);
 		prtd->audio_client = NULL;
 	}
