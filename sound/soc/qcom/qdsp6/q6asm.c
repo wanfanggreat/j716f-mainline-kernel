@@ -271,7 +271,29 @@ struct q6asm {
 	/* Buffers whose DSP ownership could not be given up, see below. */
 	struct list_head held_buffers;
 	struct mutex held_lock;
+	/*
+	 * One-shot error injection for the teardown paths (J716F debug aid).
+	 * A root user writes inject_fault in sysfs; the next matching command
+	 * fails without reaching the ADSP.
+	 */
+	unsigned int fault;
+	bool fault_timeout;
 };
+
+enum q6asm_fault {
+	Q6ASM_FAULT_NONE = 0,
+	Q6ASM_FAULT_MAP,
+	Q6ASM_FAULT_CLOSE,
+	Q6ASM_FAULT_UNMAP,
+};
+
+static const char *const q6asm_fault_names[] = {
+	[Q6ASM_FAULT_NONE] = "none",
+	[Q6ASM_FAULT_MAP] = "map",
+	[Q6ASM_FAULT_CLOSE] = "close",
+	[Q6ASM_FAULT_UNMAP] = "unmap",
+};
+
 
 /*
  * Compressed-audio buffers whose remote ownership is unknown after a failed
@@ -306,6 +328,31 @@ struct audio_client {
 	/* Pre-allocated owner for a buffer the DSP may still be using. */
 	struct q6asm_held_buffer *hold_slot;
 };
+
+/*
+ * Consume a pending injection for @fault.  Returns 0 when nothing is armed
+ * for this operation, else the errno the caller should fail with.
+ */
+static int q6asm_fault_take(struct audio_client *ac, unsigned int fault)
+{
+	struct q6asm *a = ac->q6asm;
+	unsigned long flags;
+	int rc = 0;
+
+	spin_lock_irqsave(&a->slock, flags);
+	if (a->fault == fault) {
+		a->fault = Q6ASM_FAULT_NONE;
+		rc = a->fault_timeout ? -ETIMEDOUT : -EINVAL;
+	}
+	spin_unlock_irqrestore(&a->slock, flags);
+
+	if (rc)
+		dev_err(ac->dev,
+			"J716F: injected %s failure on session %d\n",
+			q6asm_fault_names[fault], ac->session);
+
+	return rc;
+}
 
 /**
  * q6asm_hold_buffer() - take ownership of a buffer the DSP may still use
@@ -524,6 +571,10 @@ int q6asm_unmap_memory_regions(unsigned int dir, struct audio_client *ac)
 	int cnt = 0;
 	int rc = 0;
 
+	rc = q6asm_fault_take(ac, Q6ASM_FAULT_UNMAP);
+	if (rc)
+		return rc;
+
 	port = &ac->port[dir];
 	if (!port->buf) {
 		rc = -EINVAL;
@@ -629,6 +680,10 @@ int q6asm_map_memory_regions(unsigned int dir, struct audio_client *ac,
 	unsigned long flags;
 	int cnt;
 	int rc;
+
+	rc = q6asm_fault_take(ac, Q6ASM_FAULT_MAP);
+	if (rc)
+		return rc;
 
 	spin_lock_irqsave(&ac->lock, flags);
 	if (ac->port[dir].buf) {
@@ -1905,6 +1960,12 @@ static int __q6asm_cmd(struct audio_client *ac, uint32_t stream_id, int cmd,
 	struct apr_pkt pkt;
 	int rc;
 
+	if (cmd == CMD_CLOSE) {
+		rc = q6asm_fault_take(ac, Q6ASM_FAULT_CLOSE);
+		if (rc)
+			return rc;
+	}
+
 	q6asm_add_hdr(ac, &pkt.hdr, APR_HDR_SIZE, true, stream_id);
 
 	switch (cmd) {
@@ -1974,6 +2035,83 @@ int q6asm_cmd_nowait(struct audio_client *ac, uint32_t stream_id, int cmd)
 }
 EXPORT_SYMBOL_GPL(q6asm_cmd_nowait);
 
+static ssize_t inject_fault_show(struct device *dev,
+				 struct device_attribute *attr, char *buf)
+{
+	struct q6asm *q6asm = dev_get_drvdata(dev);
+	unsigned long flags;
+	unsigned int fault;
+	bool timeout;
+
+	spin_lock_irqsave(&q6asm->slock, flags);
+	fault = q6asm->fault;
+	timeout = q6asm->fault_timeout;
+	spin_unlock_irqrestore(&q6asm->slock, flags);
+
+	if (fault == Q6ASM_FAULT_NONE)
+		return sysfs_emit(buf, "none\n");
+
+	return sysfs_emit(buf, "%s:%s\n", q6asm_fault_names[fault],
+			  timeout ? "timeout" : "reject");
+}
+
+/*
+ * Arm a one-shot failure for one teardown command.  This exists so the
+ * quarantine and held-buffer paths can be exercised on real hardware:
+ *
+ *   echo map:timeout   > .../inject_fault   # MAP fails, session quarantined
+ *   echo close:timeout > .../inject_fault   # CMD_CLOSE fails
+ *   echo unmap:reject  > .../inject_fault   # UNMAP fails after CLOSE
+ *   echo clear         > .../inject_fault   # disarm
+ *
+ * "timeout" returns -ETIMEDOUT, "reject" returns -EINVAL (the value the
+ * DSP uses for a refused command).  Every write needs root and affects only
+ * the next matching operation.
+ */
+static ssize_t inject_fault_store(struct device *dev,
+				  struct device_attribute *attr,
+				  const char *buf, size_t count)
+{
+	struct q6asm *q6asm = dev_get_drvdata(dev);
+	char op[16] = "";
+	char kind[16] = "";
+	unsigned long flags;
+	unsigned int fault = Q6ASM_FAULT_NONE;
+	unsigned int i;
+	bool timeout = false;
+
+	if (sysfs_streq(buf, "clear") || sysfs_streq(buf, "none"))
+		goto store;
+
+	if (sscanf(buf, "%15[a-z]:%15[a-z]", op, kind) != 2)
+		return -EINVAL;
+
+	for (i = Q6ASM_FAULT_MAP; i <= Q6ASM_FAULT_UNMAP; i++)
+		if (sysfs_streq(op, q6asm_fault_names[i]))
+			fault = i;
+	if (fault == Q6ASM_FAULT_NONE)
+		return -EINVAL;
+
+	if (sysfs_streq(kind, "timeout"))
+		timeout = true;
+	else if (!sysfs_streq(kind, "reject"))
+		return -EINVAL;
+
+store:
+	spin_lock_irqsave(&q6asm->slock, flags);
+	q6asm->fault = fault;
+	q6asm->fault_timeout = timeout;
+	spin_unlock_irqrestore(&q6asm->slock, flags);
+
+	return count;
+}
+static DEVICE_ATTR_RW(inject_fault);
+
+static void q6asm_remove_sysfs(void *data)
+{
+	device_remove_file(data, &dev_attr_inject_fault);
+}
+
 static int q6asm_probe(struct apr_device *adev)
 {
 	struct device *dev = &adev->dev;
@@ -2000,6 +2138,13 @@ static int q6asm_probe(struct apr_device *adev)
 	 * removed by a driver unbind while the DSP is still running.
 	 */
 	ret = devm_add_action_or_reset(dev, q6asm_release_held_buffers, q6asm);
+	if (ret)
+		return ret;
+
+	ret = device_create_file(dev, &dev_attr_inject_fault);
+	if (ret)
+		return ret;
+	ret = devm_add_action_or_reset(dev, q6asm_remove_sysfs, dev);
 	if (ret)
 		return ret;
 
