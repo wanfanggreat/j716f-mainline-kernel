@@ -311,14 +311,17 @@ static int q6asm_dai_map_regions(struct device *dev,
 
 	/*
 	 * The 29-bit mask bounds the IOVA from above but says nothing about
-	 * the lower edge of the LPASS window.  Make a violating allocation
-	 * visible instead of silently handing it to the ADSP.
+	 * the lower edge of the LPASS window.  Refuse a violating allocation
+	 * instead of handing an address outside the firmware's window to the
+	 * ADSP.
 	 */
 	if (of_machine_is_compatible("lenovo,j716f") &&
-	    lower_32_bits(dma_addr) < 0x10000000)
-		dev_warn_ratelimited(dev,
-				     "J716F: DMA address %#llx is below the LPASS window 0x10000000\n",
-				     (unsigned long long)dma_addr);
+	    lower_32_bits(dma_addr) < 0x10000000) {
+		dev_err(dev,
+			"J716F: DMA address %#llx is below the LPASS window 0x10000000; refusing to map\n",
+			(unsigned long long)dma_addr);
+		return -ERANGE;
+	}
 
 	for (attempt = 0; attempt < 2; attempt++) {
 		/* 0: upstream layout, 1: plain IOVA (no SID in the msw) */
@@ -390,6 +393,17 @@ static int q6asm_dai_prepare(struct snd_soc_component *component,
 		dev_err(dev, "%s: private data null or audio client freed\n",
 			__func__);
 		return -EINVAL;
+	}
+
+	/*
+	 * A session quarantined by a failed teardown must not be re-prepared
+	 * through an already allocated client; the DSP may still own its
+	 * stream or map.
+	 */
+	if (q6asm_session_is_quarantined(prtd->audio_client)) {
+		dev_err(dev, "J716F: session %d is quarantined; refusing prepare\n",
+			prtd->stream_id);
+		return -EIO;
 	}
 
 	/*
@@ -1372,6 +1386,12 @@ static int q6asm_dai_compr_set_params(struct snd_soc_component *component,
 	if (!prtd || !prtd->audio_client) {
 		dev_err(dev, "private data null or audio client freed\n");
 		return -EINVAL;
+	}
+
+	if (q6asm_session_is_quarantined(prtd->audio_client)) {
+		dev_err(dev, "J716F: session %d is quarantined; refusing compr params\n",
+			prtd->stream_id);
+		return -EIO;
 	}
 
 	prtd->periods = runtime->fragments;

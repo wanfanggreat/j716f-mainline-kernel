@@ -582,6 +582,11 @@ int q6asm_map_memory_regions(unsigned int dir, struct audio_client *ac,
 	if (rc < 0) {
 		dev_err(ac->dev,
 			"Memory_map_regions returned no handle for dir %u\n", dir);
+		/*
+		 * The DSP may have executed the MAP without a usable handle;
+		 * the session must not be reused or re-prepared.
+		 */
+		q6asm_quarantine_session(ac);
 		q6asm_audio_client_free_buf(ac, &ac->port[dir]);
 	}
 
@@ -650,6 +655,28 @@ void q6asm_quarantine_session(struct audio_client *ac)
 		ac->session);
 }
 EXPORT_SYMBOL_GPL(q6asm_quarantine_session);
+
+/**
+ * q6asm_session_is_quarantined() - check a client's session quarantine bit
+ *
+ * @ac: audio client to test
+ *
+ * The DAI must refuse a new prepare() on an existing client whose session
+ * was quarantined by an earlier failed teardown.
+ */
+bool q6asm_session_is_quarantined(struct audio_client *ac)
+{
+	struct q6asm *a = ac->q6asm;
+	unsigned long flags;
+	bool quarantined;
+
+	spin_lock_irqsave(&a->slock, flags);
+	quarantined = test_bit(ac->session, a->session_quarantine);
+	spin_unlock_irqrestore(&a->slock, flags);
+
+	return quarantined;
+}
+EXPORT_SYMBOL_GPL(q6asm_session_is_quarantined);
 
 static struct audio_client *q6asm_get_audio_client(struct q6asm *a,
 						   int session_id)
