@@ -98,6 +98,13 @@ struct q6asm_dai_rtd {
 	unsigned long run_jiffies;
 	/* True while the audio buffer is mapped into the ADSP address space */
 	bool mapped;
+	/*
+	 * True once OPEN_WRITE/OPEN_READ succeeded and until CMD_CLOSE is
+	 * confirmed.  A close() on a PCM that was never opened must not send
+	 * CMD_CLOSE; the ADSP answers -EINVAL and that is not a teardown
+	 * failure (ACP probes open/close PCMs without a stream).
+	 */
+	bool stream_opened;
 	uint32_t initial_samples_drop;
 	uint32_t trailing_samples_drop;
 	bool notify_on_drain;
@@ -374,11 +381,15 @@ static int q6asm_dai_prepare(struct snd_soc_component *component,
 		 * the stale session (silence, then an ADSP reset).  CMD_CLOSE
 		 * releases the stream and the UNMAP that follows succeeds.
 		 */
-		ret = q6asm_cmd(prtd->audio_client, prtd->stream_id, CMD_CLOSE);
-		if (ret < 0) {
-			dev_err(dev, "Failed to close q6asm stream %d\n", prtd->stream_id);
-			q6asm_quarantine_session(prtd->audio_client);
-			return ret;
+		if (prtd->stream_opened) {
+			ret = q6asm_cmd(prtd->audio_client, prtd->stream_id,
+					CMD_CLOSE);
+			if (ret < 0) {
+				dev_err(dev, "Failed to close q6asm stream %d\n", prtd->stream_id);
+				q6asm_quarantine_session(prtd->audio_client);
+				return ret;
+			}
+			prtd->stream_opened = false;
 		}
 
 		if (prtd->mapped) {
@@ -420,6 +431,8 @@ static int q6asm_dai_prepare(struct snd_soc_component *component,
 		dev_err(dev, "%s: q6asm_open_write failed\n", __func__);
 		goto open_err;
 	}
+
+	prtd->stream_opened = true;
 
 	prtd->session_id = q6asm_get_session_id(prtd->audio_client);
 	ret = q6routing_stream_open(soc_prtd->dai_link->id, LEGACY_PCM_MODE,
@@ -523,7 +536,7 @@ static int q6asm_dai_prepare(struct snd_soc_component *component,
 	return ret;
 
 routing_err:
-	{
+	if (prtd->stream_opened) {
 		int crc = q6asm_cmd(prtd->audio_client, prtd->stream_id,
 				    CMD_CLOSE);
 
@@ -534,6 +547,7 @@ routing_err:
 			q6asm_quarantine_session(prtd->audio_client);
 			return crc;
 		}
+		prtd->stream_opened = false;
 	}
 open_err:
 	if (prtd->mapped) {
@@ -750,14 +764,21 @@ static int q6asm_dai_close(struct snd_soc_component *component,
 		 * DSP-side map and made the next desktop open silent or reset
 		 * the ADSP.
 		 */
-		ret = q6asm_cmd(prtd->audio_client, prtd->stream_id, CMD_CLOSE);
-		if (ret < 0) {
-			dev_err(component->dev,
-				"J716F: CMD_CLOSE failed %d; session %d quarantined\n",
-				ret, prtd->stream_id);
-			q6asm_quarantine_session(prtd->audio_client);
-			failed = true;
-		} else if (prtd->mapped) {
+		if (prtd->stream_opened) {
+			ret = q6asm_cmd(prtd->audio_client, prtd->stream_id,
+					CMD_CLOSE);
+			if (ret < 0) {
+				dev_err(component->dev,
+					"J716F: CMD_CLOSE failed %d; session %d quarantined\n",
+					ret, prtd->stream_id);
+				q6asm_quarantine_session(prtd->audio_client);
+				failed = true;
+			} else {
+				prtd->stream_opened = false;
+			}
+		}
+
+		if (!failed && prtd->mapped) {
 			ret = q6asm_unmap_memory_regions(substream->stream,
 							 prtd->audio_client);
 			if (ret < 0) {
