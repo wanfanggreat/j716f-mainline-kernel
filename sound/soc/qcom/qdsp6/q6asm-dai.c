@@ -348,6 +348,24 @@ static int q6asm_dai_map_regions(struct device *dev,
 			substream->stream, attempt, (unsigned long long)phys,
 			(unsigned long long)dma_addr, period_sz,
 			prtd->periods, ret);
+
+		/*
+		 * Only an explicit DSP rejection is safe to retry with the
+		 * other address encoding.  A timeout means the DSP may have
+		 * executed the MAP without the host seeing the response;
+		 * sending a second MAP could create a duplicate mapping or
+		 * mis-match a late response.  Fail closed and retire the
+		 * session.
+		 */
+		if (ret == -ETIMEDOUT) {
+			dev_err(dev,
+				"J716F: MAP timed out; session %d quarantined, not retrying\n",
+				prtd->stream_id);
+			q6asm_quarantine_session(prtd->audio_client);
+			return ret;
+		}
+		if (ret != -EINVAL)
+			return ret;
 	}
 
 	/* Preserve the DSP/APR reason instead of flattening it to -ENOMEM. */
@@ -539,17 +557,22 @@ static int q6asm_dai_prepare(struct snd_soc_component *component,
 
 	}
 	if (ret < 0) {
-		dev_info(dev, "%s: CMD Format block failed\n", __func__);
-		prtd->state = Q6ASM_STREAM_STOPPED;
-	} else {
+		dev_err(dev, "%s: CMD Format block failed\n", __func__);
 		/*
-		 * Lenovo J716F: q6asm_dai_ack() only queues playback periods
-		 * while the stream is RUNNING, so the state has to be set for
-		 * playback too. The capture path already set it before posting
-		 * the reads; this is idempotent there.
+		 * The stream and route are already open.  Use the same
+		 * CLOSE -> UNMAP rollback as the other prepare failures
+		 * instead of leaving them for close().
 		 */
-		prtd->state = Q6ASM_STREAM_RUNNING;
+		goto routing_err;
 	}
+
+	/*
+	 * Lenovo J716F: q6asm_dai_ack() only queues playback periods
+	 * while the stream is RUNNING, so the state has to be set for
+	 * playback too. The capture path already set it before posting
+	 * the reads; this is idempotent there.
+	 */
+	WRITE_ONCE(prtd->state, Q6ASM_STREAM_RUNNING);
 
 	return ret;
 
@@ -679,6 +702,8 @@ static int q6asm_dai_trigger(struct snd_soc_component *component,
 		}
 		ret = q6asm_run_nowait(prtd->audio_client, prtd->stream_id,
 				       0, 0, 0);
+		if (!ret)
+			WRITE_ONCE(prtd->state, Q6ASM_STREAM_RUNNING);
 		break;
 	case SNDRV_PCM_TRIGGER_STOP:
 		WRITE_ONCE(prtd->state, Q6ASM_STREAM_STOPPED);
@@ -691,6 +716,13 @@ static int q6asm_dai_trigger(struct snd_soc_component *component,
 	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
 		ret = q6asm_cmd_nowait(prtd->audio_client, prtd->stream_id,
 				       CMD_PAUSE);
+		/*
+		 * Do not leave the stream in RUNNING: q6asm_dai_ack() would
+		 * keep submitting periods while the DSP is paused.  RESUME
+		 * re-arms it after the RUN send succeeds.
+		 */
+		if (!ret)
+			WRITE_ONCE(prtd->state, Q6ASM_STREAM_STOPPED);
 		break;
 	default:
 		ret = -EINVAL;
@@ -1087,26 +1119,57 @@ static int q6asm_dai_compr_free(struct snd_soc_component *component,
 	struct snd_compr_runtime *runtime = stream->runtime;
 	struct q6asm_dai_rtd *prtd = runtime->private_data;
 	struct snd_soc_pcm_runtime *rtd = stream->private_data;
+	bool failed = false;
+	int ret;
 
 	if (prtd->audio_client) {
 		q6asm_audio_client_clear_callback(prtd->audio_client);
 		if (prtd->state == Q6ASM_STREAM_RUNNING) {
-			q6asm_cmd(prtd->audio_client, prtd->stream_id,
-				  CMD_CLOSE);
+			ret = q6asm_cmd(prtd->audio_client, prtd->stream_id,
+					CMD_CLOSE);
+			if (ret < 0) {
+				dev_err(component->dev,
+					"J716F: compr CMD_CLOSE failed %d; session %d quarantined\n",
+					ret, prtd->stream_id);
+				q6asm_quarantine_session(prtd->audio_client);
+				failed = true;
+			}
 			if (prtd->next_track_stream_id) {
-				q6asm_cmd(prtd->audio_client,
-					  prtd->next_track_stream_id,
-					  CMD_CLOSE);
+				ret = q6asm_cmd(prtd->audio_client,
+						prtd->next_track_stream_id,
+						CMD_CLOSE);
+				if (ret < 0) {
+					dev_err(component->dev,
+						"J716F: compr gapless CMD_CLOSE failed %d\n",
+						ret);
+					q6asm_quarantine_session(prtd->audio_client);
+					failed = true;
+				}
 			}
 
-			q6asm_unmap_memory_regions(stream->direction,
-					   prtd->audio_client);
+			if (!failed) {
+				ret = q6asm_unmap_memory_regions(stream->direction,
+								 prtd->audio_client);
+				if (ret < 0) {
+					dev_err(component->dev,
+						"J716F: compr UNMAP failed %d after CLOSE; session %d quarantined\n",
+						ret, prtd->stream_id);
+					q6asm_quarantine_session(prtd->audio_client);
+					failed = true;
+				}
+			}
 		}
-		snd_dma_free_pages(&prtd->dma_buffer);
+
+		if (!failed)
+			snd_dma_free_pages(&prtd->dma_buffer);
+		else
+			dev_err(component->dev,
+				"J716F: compr DMA buffer held, ADSP ownership unknown\n");
 		q6asm_audio_client_free(prtd->audio_client);
 		prtd->audio_client = NULL;
 	}
-	q6routing_stream_close(rtd->dai_link->id, stream->direction);
+	if (!failed)
+		q6routing_stream_close(rtd->dai_link->id, stream->direction);
 	kfree(prtd);
 
 	return 0;

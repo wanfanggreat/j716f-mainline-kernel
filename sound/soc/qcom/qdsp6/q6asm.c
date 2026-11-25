@@ -566,6 +566,23 @@ int q6asm_map_memory_regions(unsigned int dir, struct audio_client *ac,
 	if (rc < 0) {
 		dev_err(ac->dev, "Memory_map_regions failed\n");
 		q6asm_audio_client_free_buf(ac, &ac->port[dir]);
+		return rc;
+	}
+
+	/*
+	 * A zero status without a handle is a protocol-level anomaly: the
+	 * mapping cannot be addressed or unmapped, so fail closed instead of
+	 * handing a zero handle to READ/WRITE.
+	 */
+	spin_lock_irqsave(&ac->lock, flags);
+	if (!ac->port[dir].mem_map_handle)
+		rc = -EIO;
+	spin_unlock_irqrestore(&ac->lock, flags);
+
+	if (rc < 0) {
+		dev_err(ac->dev,
+			"Memory_map_regions returned no handle for dir %u\n", dir);
+		q6asm_audio_client_free_buf(ac, &ac->port[dir]);
 	}
 
 	return rc;
@@ -1583,16 +1600,22 @@ int q6asm_read(struct audio_client *ac, uint32_t stream_id)
 		(unsigned long long)ab->phys, ab->size,
 		port->mem_map_handle, port->dsp_buf, port->dsp_buf);
 
-	port->dsp_buf++;
-
-	if (port->dsp_buf >= port->num_periods)
-		port->dsp_buf = 0;
-
-	spin_unlock_irqrestore(&ac->lock, flags);
+	/*
+	 * Send under ac->lock and advance the ring cursor only when the packet
+	 * was accepted.  apr_send_pkt() is non-blocking (endpoint spinlock +
+	 * rpmsg_trysend).  Advancing first desynchronised the host and DSP
+	 * period indices after one failed send.
+	 */
 	rc = apr_send_pkt(ac->adev, pkt);
-	if (rc == pkt_size)
+	if (rc == pkt_size) {
+		port->dsp_buf++;
+		if (port->dsp_buf >= port->num_periods)
+			port->dsp_buf = 0;
 		rc = 0;
-	else
+	}
+	spin_unlock_irqrestore(&ac->lock, flags);
+
+	if (rc)
 		pr_err("read op[0x%x]rc[%d]\n", pkt->hdr.opcode, rc);
 
 	return rc;
@@ -1707,15 +1730,19 @@ int q6asm_write_async(struct audio_client *ac, uint32_t stream_id, uint32_t len,
 
 	write->flags = wflags;
 
-	port->dsp_buf++;
-
-	if (port->dsp_buf >= port->num_periods)
-		port->dsp_buf = 0;
-
-	spin_unlock_irqrestore(&ac->lock, flags);
+	/*
+	 * Same rule as q6asm_read(): send under ac->lock and advance the
+	 * ring cursor only after a successful send.  A failed send must leave
+	 * the host and DSP period indices in sync.
+	 */
 	rc = apr_send_pkt(ac->adev, pkt);
-	if (rc == pkt_size)
+	if (rc == pkt_size) {
+		port->dsp_buf++;
+		if (port->dsp_buf >= port->num_periods)
+			port->dsp_buf = 0;
 		rc = 0;
+	}
+	spin_unlock_irqrestore(&ac->lock, flags);
 
 	return rc;
 }
