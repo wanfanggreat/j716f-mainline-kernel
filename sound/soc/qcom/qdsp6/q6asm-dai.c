@@ -301,13 +301,24 @@ static int q6asm_dai_map_regions(struct device *dev,
 	dma_addr_t dma_addr = substream->dma_buffer.addr;
 	phys_addr_t phys;
 	size_t period_sz;
-	int ret, attempt;
+	int ret, attempt, last_ret = -ENOMEM;
 
 	if (!prtd->periods) {
 		dev_err(dev, "J716F: no periods for the DMA map\n");
 		return -EINVAL;
 	}
 	period_sz = prtd->pcm_size / prtd->periods;
+
+	/*
+	 * The 29-bit mask bounds the IOVA from above but says nothing about
+	 * the lower edge of the LPASS window.  Make a violating allocation
+	 * visible instead of silently handing it to the ADSP.
+	 */
+	if (of_machine_is_compatible("lenovo,j716f") &&
+	    lower_32_bits(dma_addr) < 0x10000000)
+		dev_warn_ratelimited(dev,
+				     "J716F: DMA address %#llx is below the LPASS window 0x10000000\n",
+				     (unsigned long long)dma_addr);
 
 	for (attempt = 0; attempt < 2; attempt++) {
 		/* 0: upstream layout, 1: plain IOVA (no SID in the msw) */
@@ -331,6 +342,7 @@ static int q6asm_dai_map_regions(struct device *dev,
 			return 0;
 		}
 
+		last_ret = ret;
 		dev_err(dev,
 			"J716F: map dir=%d mode=%d phys=%#llx dma=%#llx period=%zu periods=%u failed (%d)\n",
 			substream->stream, attempt, (unsigned long long)phys,
@@ -338,7 +350,8 @@ static int q6asm_dai_map_regions(struct device *dev,
 			prtd->periods, ret);
 	}
 
-	return -ENOMEM;
+	/* Preserve the DSP/APR reason instead of flattening it to -ENOMEM. */
+	return last_ret;
 }
 
 static int q6asm_dai_prepare(struct snd_soc_component *component,
@@ -418,9 +431,8 @@ static int q6asm_dai_prepare(struct snd_soc_component *component,
 				    pdata->sid < 0 ? 0 : ((u64)pdata->sid << 32));
 
 	if (ret < 0) {
-		dev_err(dev, "Audio Start: Buffer Allocation failed rc = %d\n",
-							ret);
-		return -ENOMEM;
+		dev_err(dev, "Audio Start: DMA mapping failed rc = %d\n", ret);
+		return ret;
 	}
 
 	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
@@ -782,6 +794,16 @@ static int q6asm_dai_open(struct snd_soc_component *component,
 		snd_soc_set_runtime_hwparams(substream, &q6asm_dai_hardware_capture);
 		runtime->dma_bytes = q6asm_dai_hardware_capture.buffer_bytes_max;
 	}
+
+	/*
+	 * Lenovo J716F: the CS35L41 ASP path is wired for 16-bit slots.
+	 * The ADSP accepts S24_LE but the amplifier output is heavily
+	 * attenuated (measured in R4/M43: only audible with the ear on the
+	 * speaker at full volume); S16_LE is the verified format.  Do not
+	 * advertise a format this board cannot reproduce correctly.
+	 */
+	if (of_machine_is_compatible("lenovo,j716f"))
+		runtime->hw.formats = SNDRV_PCM_FMTBIT_S16_LE;
 
 	if (pdata->sid < 0) {
 		prtd->phys = substream->dma_buffer.addr;
@@ -1593,9 +1615,17 @@ static int q6asm_dai_pcm_new(struct snd_soc_component *component,
 	 * built for. A 29-bit mask makes iommu-dma allocate top-down at
 	 * 0x1FFF_xxxx, i.e. inside that window.
 	 */
-	if (dma_set_mask_and_coherent(component->dev, DMA_BIT_MASK(29)))
-		dev_warn(component->dev,
-			 "J716F: could not limit the audio DMA mask to 29 bits\n");
+	if (of_machine_is_compatible("lenovo,j716f")) {
+		int ret = dma_set_mask_and_coherent(component->dev,
+						    DMA_BIT_MASK(29));
+
+		if (ret) {
+			dev_err(component->dev,
+				"J716F: cannot limit the audio DMA mask to the LPASS window (%d); refusing PCM registration\n",
+				ret);
+			return ret;
+		}
+	}
 
 	return snd_pcm_set_fixed_buffer_all(pcm, SNDRV_DMA_TYPE_DEV,
 					    component->dev, size);
