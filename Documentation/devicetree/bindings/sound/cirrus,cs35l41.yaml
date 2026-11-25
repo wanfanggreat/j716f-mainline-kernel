@@ -84,13 +84,14 @@ properties:
   cirrus,boost-ctl-millivolt:
     description: |
       Boost converter output voltage control, in millivolts.  The driver
-      programs BSTCVRT_VCTRL1 as ((millivolt - 2550) / 100) + 1.  The
-      converter's floor is 2550 mV and the vendor range accepts
-      2550..11000 mV in 100 mV steps.
+      programs BSTCVRT_VCTRL1 as ((millivolt - 2550) / 100) + 1, so the
+      valid steps are 2550 + 100n mV (2550, 2650, ...), not multiples of
+      100 mV; values between steps are floored by the driver.  The
+      converter's floor is 2550 mV and the vendor range accepts up to
+      11000 mV.
     $ref: /schemas/types.yaml#/definitions/uint32
     minimum: 2550
     maximum: 11000
-    multipleOf: 100
 
   cirrus,asp-sdout-hiz:
     description:
