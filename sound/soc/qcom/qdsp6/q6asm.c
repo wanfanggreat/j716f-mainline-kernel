@@ -8,6 +8,8 @@
 #include <linux/module.h>
 #include <linux/atomic.h>
 #include <linux/bitops.h>
+#include <linux/list.h>
+#include <sound/pcm.h>
 #include <linux/soc/qcom/apr.h>
 #include <linux/device.h>
 #include <linux/of_platform.h>
@@ -267,6 +269,62 @@ struct q6asm {
 	 */
 	unsigned long session_quarantine[BITS_TO_LONGS(MAX_SESSIONS + 1)];
 };
+
+/*
+ * Compressed-audio buffers whose remote ownership is unknown are moved
+ * here on a failed teardown.  They are kept valid until the q6asm APR
+ * device is removed (ADSP reset/rebind), the point where the DSP can no
+ * longer access them.
+ */
+struct q6asm_held_buffer {
+	struct list_head node;
+	struct snd_dma_buffer dma;
+	u32 session;
+};
+
+static LIST_HEAD(q6asm_held_buffers);
+static DEFINE_MUTEX(q6asm_held_lock);
+
+void q6asm_hold_buffer(struct snd_dma_buffer *dma, u32 session)
+{
+	struct q6asm_held_buffer *held;
+
+	held = kzalloc_obj(*held);
+	if (!held) {
+		dev_err(dma->dev.dev,
+			"J716F: cannot hold compr buffer for session %u; leaking it\n",
+			session);
+		return;
+	}
+	held->dma = *dma;
+	held->session = session;
+	INIT_LIST_HEAD(&held->node);
+
+	mutex_lock(&q6asm_held_lock);
+	list_add_tail(&held->node, &q6asm_held_buffers);
+	mutex_unlock(&q6asm_held_lock);
+
+	/* The held record owns the pages now; do not free them again. */
+	dma->area = NULL;
+	dma->bytes = 0;
+	dev_warn(dma->dev.dev,
+		 "J716F: holding compr DMA buffer for session %u until ADSP rebind\n",
+		 session);
+}
+EXPORT_SYMBOL_GPL(q6asm_hold_buffer);
+
+static void q6asm_release_held_buffers(void *unused)
+{
+	struct q6asm_held_buffer *held, *tmp;
+
+	mutex_lock(&q6asm_held_lock);
+	list_for_each_entry_safe(held, tmp, &q6asm_held_buffers, node) {
+		snd_dma_free_pages(&held->dma);
+		list_del(&held->node);
+		kfree(held);
+	}
+	mutex_unlock(&q6asm_held_lock);
+}
 
 struct audio_client {
 	int session;
@@ -1865,6 +1923,7 @@ static int q6asm_probe(struct apr_device *adev)
 {
 	struct device *dev = &adev->dev;
 	struct q6asm *q6asm;
+	int ret;
 
 	q6asm = devm_kzalloc(dev, sizeof(*q6asm), GFP_KERNEL);
 	if (!q6asm)
@@ -1877,6 +1936,15 @@ static int q6asm_probe(struct apr_device *adev)
 	init_waitqueue_head(&q6asm->mem_wait);
 	spin_lock_init(&q6asm->slock);
 	dev_set_drvdata(dev, q6asm);
+
+	/*
+	 * Free compressed-audio buffers held after a failed teardown when
+	 * this APR device goes away.  Removal happens on an ADSP reset, so
+	 * the DSP can no longer access those pages at this point.
+	 */
+	ret = devm_add_action_or_reset(dev, q6asm_release_held_buffers, NULL);
+	if (ret)
+		return ret;
 
 	return devm_of_platform_populate(dev);
 }

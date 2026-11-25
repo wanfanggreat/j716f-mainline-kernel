@@ -917,10 +917,15 @@ static int q6asm_dai_close(struct snd_soc_component *component,
 		 * Release the host client even when the remote teardown failed:
 		 * q6asm_quarantine_session() keeps the session id unusable until
 		 * the ADSP is rebound, so a later open fails closed instead of
-		 * colliding with a session the DSP may still own.  The residual
-		 * risk of freeing the ALSA DMA buffer while the DSP still maps
-		 * it is handled by the DMA/IOMMU work (M46); a close timeout
-		 * means the ADSP is already unhealthy and needs a reset/reboot.
+		 * colliding with a session the DSP may still own.
+		 *
+		 * The PCM ring is not freed here: it is the fixed preallocation
+		 * from snd_pcm_set_fixed_buffer_all() (max == 0), and
+		 * snd_pcm_lib_free_pages() only detaches it from the runtime.
+		 * The pages are released when the card is torn down, so a stale
+		 * DSP mapping still points at valid memory.  The quarantine
+		 * blocks the next open from reusing that ring, and an ADSP
+		 * rebind clears the mapping.
 		 */
 		q6asm_audio_client_free(prtd->audio_client);
 		prtd->audio_client = NULL;
@@ -1177,8 +1182,7 @@ static int q6asm_dai_compr_free(struct snd_soc_component *component,
 		if (!failed)
 			snd_dma_free_pages(&prtd->dma_buffer);
 		else
-			dev_err(component->dev,
-				"J716F: compr DMA buffer held, ADSP ownership unknown\n");
+			q6asm_hold_buffer(&prtd->dma_buffer, prtd->stream_id);
 		q6asm_audio_client_free(prtd->audio_client);
 		prtd->audio_client = NULL;
 	}
