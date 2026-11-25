@@ -3,6 +3,7 @@
 
 #include <dt-bindings/sound/qcom,q6afe.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/gpio/consumer.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
@@ -41,7 +42,13 @@ struct sm8250_snd_data {
 	 * macro register programmed correctly.
 	 */
 	struct gpio_desc *dmic_en_gpio;
-	int dmic_en_state;
+	/* GPIO level currently driven */
+	bool dmic_en_state;
+	/* Capture backends currently holding the shared rail */
+	int dmic_users;
+	/* "DMIC EN" mixer-control request */
+	bool dmic_manual;
+	struct mutex dmic_lock;
 	/*
 	 * Lenovo J716F: PM8150B GPIO1 selects the internal microphone path
 	 * (vendor: qcom,msm-dmic-sel-gpio = <&pm8150b_gpios 1
@@ -67,13 +74,37 @@ struct sm8250_snd_data {
  *
  * We keep the same shape so userspace sees the control it expects.
  */
+/*
+ * Change the shared rail level from the refcount and the manual control.
+ * Return true when the GPIO level changed; the caller does the settle
+ * delay and any DAPM sync outside dmic_lock.
+ */
+static bool sm8250_dmic_refresh(struct sm8250_snd_data *data)
+{
+	bool on = data->dmic_users > 0 || data->dmic_manual;
+
+	if (!data->dmic_en_gpio || on == data->dmic_en_state)
+		return false;
+
+	gpiod_set_value_cansleep(data->dmic_en_gpio, on);
+	data->dmic_en_state = on;
+	dev_dbg(data->card->dev, "J716F: DMIC EN -> %d\n", on);
+
+	return true;
+}
+
 static int sm8250_dmic_en_get(struct snd_kcontrol *kcontrol,
 			      struct snd_ctl_elem_value *ucontrol)
 {
 	struct snd_soc_card *card = snd_kcontrol_chip(kcontrol);
 	struct sm8250_snd_data *data = snd_soc_card_get_drvdata(card);
+	int value;
 
-	ucontrol->value.integer.value[0] = data->dmic_en_state;
+	mutex_lock(&data->dmic_lock);
+	value = data->dmic_manual;
+	mutex_unlock(&data->dmic_lock);
+
+	ucontrol->value.integer.value[0] = value;
 
 	return 0;
 }
@@ -84,25 +115,28 @@ static int sm8250_dmic_en_put(struct snd_kcontrol *kcontrol,
 	struct snd_soc_card *card = snd_kcontrol_chip(kcontrol);
 	struct sm8250_snd_data *data = snd_soc_card_get_drvdata(card);
 	int on = !!ucontrol->value.integer.value[0];
+	bool changed, gpio_changed;
 
 	if (!data->dmic_en_gpio)
 		return 0;
 
-	if (on == data->dmic_en_state)
-		return 0;
+	mutex_lock(&data->dmic_lock);
+	changed = data->dmic_manual != on;
+	data->dmic_manual = on;
+	gpio_changed = sm8250_dmic_refresh(data);
+	mutex_unlock(&data->dmic_lock);
 
-	gpiod_set_value_cansleep(data->dmic_en_gpio, on);
-	data->dmic_en_state = on;
 	/*
-	 * The vendor waits 5 ms here for the rail to settle before letting
-	 * DAPM re-evaluate the widgets that depend on it.
+	 * Do not hold dmic_lock across the settle delay or the DAPM sync:
+	 * the sync can re-enter the card's control/DAPM paths.
 	 */
-	usleep_range(5000, 5100);
-	snd_soc_dapm_sync(card->dapm);
+	if (gpio_changed)
+		usleep_range(5000, 5100);
+	if (changed)
+		snd_soc_dapm_sync(snd_soc_card_to_dapm(card));
 
-	dev_dbg(card->dev, "J716F: DMIC EN -> %d\n", on);
-
-	return 0;
+	/* ALSA kcontrol put returns 1 when the value actually changed. */
+	return changed ? 1 : 0;
 }
 
 static const struct snd_kcontrol_new sm8250_dmic_en_control =
@@ -210,18 +244,23 @@ static int sm8250_snd_startup(struct snd_pcm_substream *substream)
 	 * powered.
 	 */
 	if (cpu_dai->id == TX_CODEC_DMA_TX_3 || cpu_dai->id == VA_CODEC_DMA_TX_0) {
+		bool powered;
+
 		/*
-		 * Select the internal microphone path first, then power the
-		 * rail, so the mics are connected when the DMIC clock starts.
+		 * Select the internal microphone path first, then take a
+		 * reference on the shared rail so one backend's shutdown
+		 * cannot power off a microphone still used by the other.
 		 */
 		if (data->dmic_sel_gpio)
 			gpiod_set_value_cansleep(data->dmic_sel_gpio, 1);
-		if (data->dmic_en_gpio) {
-			gpiod_set_value_cansleep(data->dmic_en_gpio, 1);
-			/* let the rail settle before the clock starts */
-			usleep_range(2000, 2500);
-		}
-		pr_debug("J716F-DMIC: power on (dai id %d)\n", cpu_dai->id);
+		mutex_lock(&data->dmic_lock);
+		data->dmic_users++;
+		powered = sm8250_dmic_refresh(data);
+		mutex_unlock(&data->dmic_lock);
+		if (powered)
+			usleep_range(5000, 5100);
+		pr_debug("J716F-DMIC: power on (dai id %d, users %d)\n",
+			 cpu_dai->id, data->dmic_users);
 	}
 
 	switch (cpu_dai->id) {
@@ -368,8 +407,17 @@ static void sm8250_snd_shutdown(struct snd_pcm_substream *substream)
 	if (data->dmic_en_gpio &&
 	    (cpu_dai->id == TX_CODEC_DMA_TX_3 ||
 	     cpu_dai->id == VA_CODEC_DMA_TX_0)) {
-		gpiod_set_value_cansleep(data->dmic_en_gpio, 0);
-		pr_debug("J716F-DMIC: power off (dai id %d)\n", cpu_dai->id);
+		bool powered;
+
+		mutex_lock(&data->dmic_lock);
+		if (data->dmic_users > 0)
+			data->dmic_users--;
+		powered = sm8250_dmic_refresh(data);
+		mutex_unlock(&data->dmic_lock);
+		if (powered)
+			usleep_range(5000, 5100);
+		pr_debug("J716F-DMIC: power down (dai id %d, users %d)\n",
+			 cpu_dai->id, data->dmic_users);
 	}
 
 	qcom_snd_sdw_shutdown(substream);
@@ -534,6 +582,7 @@ static int sm8250_platform_probe(struct platform_device *pdev)
 	card->dev = dev;
 	dev_set_drvdata(dev, card);
 	snd_soc_card_set_drvdata(card, data);
+	mutex_init(&data->dmic_lock);
 
 	/*
 	 * Lenovo J716F: optional digital-microphone power enable.  The

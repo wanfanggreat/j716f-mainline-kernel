@@ -604,6 +604,18 @@ static const struct snd_soc_component_driver es7210_component_driver = {
 	.endianness		= 1,
 };
 
+static void es7210_release_power(void *data)
+{
+	struct es7210_priv *es7210 = data;
+
+	if (es7210->mclk)
+		clk_disable_unprepare(es7210->mclk);
+	if (es7210->vdd_p)
+		regulator_disable(es7210->vdd_p);
+	if (es7210->vdd_d)
+		regulator_disable(es7210->vdd_d);
+}
+
 static int es7210_i2c_probe(struct i2c_client *client)
 {
 	struct es7210_priv *es7210;
@@ -673,35 +685,25 @@ static int es7210_i2c_probe(struct i2c_client *client)
 
 	i2c_set_clientdata(client, es7210);
 
+	/*
+	 * Register the power release before the component so devres runs it
+	 * after the component is unregistered (LIFO), including on a probe
+	 * failure below.
+	 */
+	ret = devm_add_action_or_reset(&client->dev, es7210_release_power,
+				       es7210);
+	if (ret)
+		return dev_err_probe(&client->dev, ret,
+				     "failed to register power release action\n");
+
 	ret = devm_snd_soc_register_component(&client->dev,
 					      &es7210_component_driver,
 					      &es7210_dai, 1);
-	if (ret) {
-		if (es7210->mclk)
-			clk_disable_unprepare(es7210->mclk);
-		if (es7210->vdd_p)
-			regulator_disable(es7210->vdd_p);
-		if (es7210->vdd_d)
-			regulator_disable(es7210->vdd_d);
+	if (ret)
 		return dev_err_probe(&client->dev, ret,
 				     "failed to register component\n");
-	}
 
 	return 0;
-}
-
-static void es7210_i2c_remove(struct i2c_client *client)
-{
-	struct es7210_priv *es7210 = i2c_get_clientdata(client);
-
-	if (!es7210)
-		return;
-	if (es7210->mclk)
-		clk_disable_unprepare(es7210->mclk);
-	if (es7210->vdd_p)
-		regulator_disable(es7210->vdd_p);
-	if (es7210->vdd_d)
-		regulator_disable(es7210->vdd_d);
 }
 
 static const struct of_device_id es7210_of_match[] = {
@@ -722,7 +724,6 @@ static struct i2c_driver es7210_i2c_driver = {
 		.of_match_table	= es7210_of_match,
 	},
 	.probe		= es7210_i2c_probe,
-	.remove		= es7210_i2c_remove,
 	.id_table	= es7210_i2c_id,
 };
 module_i2c_driver(es7210_i2c_driver);
