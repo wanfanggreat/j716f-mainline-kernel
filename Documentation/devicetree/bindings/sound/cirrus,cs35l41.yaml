@@ -33,6 +33,19 @@ properties:
       The first cell indicating the audio interface.
     const: 1
 
+  cirrus,asp-rx-slots:
+    description: |
+      ASP RX1 slot pair used for the amplifier's left and right channels,
+      expressed as I2S slot indices.  Boards with mirrored amplifier
+      placement (for example a right-hand amplifier fed from slot 1 first)
+      use <1 0>; the default is <0 1>.
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    minItems: 2
+    maxItems: 2
+    items:
+      minimum: 0
+      maximum: 1
+
   reset-gpios:
     maxItems: 1
 
