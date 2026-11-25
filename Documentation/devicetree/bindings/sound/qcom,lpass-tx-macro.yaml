@@ -60,6 +60,10 @@ properties:
     description: dmic sample rate
     $ref: /schemas/types.yaml#/definitions/uint32
 
+  vdd-micb-supply:
+    description:
+      MIC Bias supply referenced by the TX macro's vdd-micb DAPM supply.
+
 required:
   - compatible
   - reg

@@ -64,6 +64,21 @@ properties:
   vdd-micb-supply:
     description: phandle to voltage regulator of MIC Bias
 
+  va-vdd-micb-supply:
+    description:
+      Optional second MIC Bias supply used by the vendor VA-macro wiring.
+
+  qcom,va-vdd-micb-voltage:
+    description:
+      MIC Bias rail voltage in microvolts, used to derive the microphone
+      bias register value.
+    $ref: /schemas/types.yaml#/definitions/uint32
+
+  qcom,va-vdd-micb-current:
+    description:
+      MIC Bias rail current limit in microamps.
+    $ref: /schemas/types.yaml#/definitions/uint32
+
 required:
   - compatible
   - reg
@@ -125,12 +140,18 @@ allOf:
       properties:
         clocks:
           minItems: 3
-          maxItems: 3
+          maxItems: 4
         clock-names:
-          items:
-            - const: mclk
-            - const: macro
-            - const: dcodec
+          oneOf:
+            - items:
+                - const: mclk
+                - const: macro
+                - const: dcodec
+            - items:
+                - const: mclk
+                - const: mclk2x
+                - const: macro
+                - const: dcodec
 
   - if:
       properties:
