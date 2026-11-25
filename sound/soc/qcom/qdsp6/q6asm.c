@@ -7,6 +7,7 @@
 #include <linux/wait.h>
 #include <linux/module.h>
 #include <linux/atomic.h>
+#include <linux/bitops.h>
 #include <linux/soc/qcom/apr.h>
 #include <linux/device.h>
 #include <linux/of_platform.h>
@@ -259,6 +260,12 @@ struct q6asm {
 	wait_queue_head_t mem_wait;
 	spinlock_t slock;
 	struct audio_client *session[MAX_SESSIONS + 1];
+	/*
+	 * Sessions whose ADSP-side ownership is unknown after a failed
+	 * teardown.  A new client must not reuse them until the ADSP is
+	 * rebound; devm_kzalloc() in probe clears the bitmap.
+	 */
+	unsigned long session_quarantine[BITS_TO_LONGS(MAX_SESSIONS + 1)];
 };
 
 struct audio_client {
@@ -601,6 +608,31 @@ void q6asm_audio_client_free(struct audio_client *ac)
 	kref_put(&ac->refcount, q6asm_audio_client_release);
 }
 EXPORT_SYMBOL_GPL(q6asm_audio_client_free);
+
+/**
+ * q6asm_quarantine_session() - keep a session id unusable after a failed teardown
+ *
+ * @ac: audio client whose ADSP-side state could not be confirmed
+ *
+ * A failed CMD_CLOSE or UNMAP leaves the DSP owning a stream and/or DMA
+ * mapping that the host can no longer address.  Retiring the id prevents a
+ * later client from reusing the same session and colliding with that state.
+ * The bitmap lives in struct q6asm and is cleared only when the ADSP is
+ * rebound (probe allocates a fresh struct).
+ */
+void q6asm_quarantine_session(struct audio_client *ac)
+{
+	struct q6asm *a = ac->q6asm;
+	unsigned long flags;
+
+	spin_lock_irqsave(&a->slock, flags);
+	set_bit(ac->session, a->session_quarantine);
+	spin_unlock_irqrestore(&a->slock, flags);
+
+	dev_err(ac->dev, "session %d quarantined; ADSP ownership unknown\n",
+		ac->session);
+}
+EXPORT_SYMBOL_GPL(q6asm_quarantine_session);
 
 static struct audio_client *q6asm_get_audio_client(struct q6asm *a,
 						   int session_id)
@@ -967,6 +999,14 @@ struct audio_client *q6asm_audio_client_alloc(struct device *dev, q6asm_cb cb,
 	spin_lock_init(&ac->lock);
 
 	spin_lock_irqsave(&a->slock, flags);
+	if (test_bit(ac->session, a->session_quarantine)) {
+		spin_unlock_irqrestore(&a->slock, flags);
+		kfree(ac);
+		dev_err(dev,
+			"session %d is quarantined; refusing a new client\n",
+			session_id + 1);
+		return ERR_PTR(-EIO);
+	}
 	if (a->session[ac->session]) {
 		spin_unlock_irqrestore(&a->slock, flags);
 		kfree(ac);

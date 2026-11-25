@@ -377,6 +377,7 @@ static int q6asm_dai_prepare(struct snd_soc_component *component,
 		ret = q6asm_cmd(prtd->audio_client, prtd->stream_id, CMD_CLOSE);
 		if (ret < 0) {
 			dev_err(dev, "Failed to close q6asm stream %d\n", prtd->stream_id);
+			q6asm_quarantine_session(prtd->audio_client);
 			return ret;
 		}
 
@@ -385,6 +386,7 @@ static int q6asm_dai_prepare(struct snd_soc_component *component,
 							 prtd->audio_client);
 			if (ret < 0) {
 				dev_err(dev, "J716F: unmap after close failed %d\n", ret);
+				q6asm_quarantine_session(prtd->audio_client);
 				return ret;
 			}
 			prtd->mapped = false;
@@ -439,6 +441,12 @@ static int q6asm_dai_prepare(struct snd_soc_component *component,
 							   runtime->channels,
 							   prtd->bits_per_sample);
 
+		if (ret < 0) {
+			dev_err(dev, "%s: capture format block failed ret:%d\n",
+				__func__, ret);
+			goto routing_err;
+		}
+
 		/*
 		 * Lenovo J716F: mark the stream RUNNING *before* queueing the
 		 * capture buffers. The DSP can start returning
@@ -489,7 +497,12 @@ static int q6asm_dai_prepare(struct snd_soc_component *component,
 			dev_err(dev, "capture run failed %d\n", ret);
 			prtd->reads_pending = false;
 			prtd->state = Q6ASM_STREAM_STOPPED;
-			goto open_err;
+			/*
+			 * The stream is already open and may be running: close
+			 * it before unmapping.  Sending UNMAP first is the exact
+			 * order the ADSP rejects with 0x10d94 error[a]/-22.
+			 */
+			goto routing_err;
 		}
 		prtd->capture_started = true;
 
@@ -510,11 +523,30 @@ static int q6asm_dai_prepare(struct snd_soc_component *component,
 	return ret;
 
 routing_err:
-	q6asm_cmd(prtd->audio_client, prtd->stream_id,  CMD_CLOSE);
+	{
+		int crc = q6asm_cmd(prtd->audio_client, prtd->stream_id,
+				    CMD_CLOSE);
+
+		if (crc < 0) {
+			dev_err(dev,
+				"J716F: cleanup CMD_CLOSE failed %d; session %d quarantined\n",
+				crc, prtd->stream_id);
+			q6asm_quarantine_session(prtd->audio_client);
+			return crc;
+		}
+	}
 open_err:
 	if (prtd->mapped) {
-		q6asm_unmap_memory_regions(substream->stream,
-					   prtd->audio_client);
+		int urc = q6asm_unmap_memory_regions(substream->stream,
+						     prtd->audio_client);
+
+		if (urc < 0) {
+			dev_err(dev,
+				"J716F: cleanup UNMAP failed %d; session %d quarantined\n",
+				urc, prtd->stream_id);
+			q6asm_quarantine_session(prtd->audio_client);
+			return urc;
+		}
 		prtd->mapped = false;
 	}
 
@@ -699,6 +731,8 @@ static int q6asm_dai_close(struct snd_soc_component *component,
 	struct snd_pcm_runtime *runtime = substream->runtime;
 	struct snd_soc_pcm_runtime *soc_prtd = snd_soc_substream_to_rtd(substream);
 	struct q6asm_dai_rtd *prtd = runtime->private_data;
+	bool failed = false;
+	int ret;
 
 	if (prtd->audio_client) {
 		WRITE_ONCE(prtd->state, Q6ASM_STREAM_STOPPED);
@@ -716,17 +750,44 @@ static int q6asm_dai_close(struct snd_soc_component *component,
 		 * DSP-side map and made the next desktop open silent or reset
 		 * the ADSP.
 		 */
-		q6asm_cmd(prtd->audio_client, prtd->stream_id, CMD_CLOSE);
-		if (prtd->mapped) {
-			q6asm_unmap_memory_regions(substream->stream,
-						   prtd->audio_client);
-			prtd->mapped = false;
+		ret = q6asm_cmd(prtd->audio_client, prtd->stream_id, CMD_CLOSE);
+		if (ret < 0) {
+			dev_err(component->dev,
+				"J716F: CMD_CLOSE failed %d; session %d quarantined\n",
+				ret, prtd->stream_id);
+			q6asm_quarantine_session(prtd->audio_client);
+			failed = true;
+		} else if (prtd->mapped) {
+			ret = q6asm_unmap_memory_regions(substream->stream,
+							 prtd->audio_client);
+			if (ret < 0) {
+				dev_err(component->dev,
+					"J716F: UNMAP failed %d after CLOSE; session %d quarantined\n",
+					ret, prtd->stream_id);
+				q6asm_quarantine_session(prtd->audio_client);
+				failed = true;
+			} else {
+				prtd->mapped = false;
+			}
 		}
+
+		/*
+		 * Release the host client even when the remote teardown failed:
+		 * q6asm_quarantine_session() keeps the session id unusable until
+		 * the ADSP is rebound, so a later open fails closed instead of
+		 * colliding with a session the DSP may still own.  The residual
+		 * risk of freeing the ALSA DMA buffer while the DSP still maps
+		 * it is handled by the DMA/IOMMU work (M46); a close timeout
+		 * means the ADSP is already unhealthy and needs a reset/reboot.
+		 */
 		q6asm_audio_client_free(prtd->audio_client);
 		prtd->audio_client = NULL;
 	}
-	q6routing_stream_close(soc_prtd->dai_link->id,
-						substream->stream);
+
+	/* Do not touch a possibly wedged ADSP's routing after a failed close. */
+	if (!failed)
+		q6routing_stream_close(soc_prtd->dai_link->id,
+				       substream->stream);
 	kfree(prtd);
 	return 0;
 }
