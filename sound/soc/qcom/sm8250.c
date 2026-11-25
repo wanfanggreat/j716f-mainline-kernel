@@ -93,6 +93,36 @@ static bool sm8250_dmic_refresh(struct sm8250_snd_data *data)
 	return true;
 }
 
+/*
+ * The GPIO transition and its settle delay are a single mutex-protected
+ * operation so a second capture backend cannot start before the rail is
+ * stable.  Only snd_soc_dapm_sync() is called outside the lock.
+ */
+static void sm8250_dmic_get(struct sm8250_snd_data *data)
+{
+	bool powered;
+
+	mutex_lock(&data->dmic_lock);
+	data->dmic_users++;
+	powered = sm8250_dmic_refresh(data);
+	if (powered)
+		usleep_range(5000, 5100);
+	mutex_unlock(&data->dmic_lock);
+}
+
+static void sm8250_dmic_put(struct sm8250_snd_data *data)
+{
+	bool powered;
+
+	mutex_lock(&data->dmic_lock);
+	if (data->dmic_users > 0)
+		data->dmic_users--;
+	powered = sm8250_dmic_refresh(data);
+	if (powered)
+		usleep_range(5000, 5100);
+	mutex_unlock(&data->dmic_lock);
+}
+
 static int sm8250_dmic_en_get(struct snd_kcontrol *kcontrol,
 			      struct snd_ctl_elem_value *ucontrol)
 {
@@ -124,14 +154,15 @@ static int sm8250_dmic_en_put(struct snd_kcontrol *kcontrol,
 	changed = data->dmic_manual != on;
 	data->dmic_manual = on;
 	gpio_changed = sm8250_dmic_refresh(data);
+	if (gpio_changed)
+		usleep_range(5000, 5100);
 	mutex_unlock(&data->dmic_lock);
 
 	/*
-	 * Do not hold dmic_lock across the settle delay or the DAPM sync:
-	 * the sync can re-enter the card's control/DAPM paths.
+	 * Keep the DAPM sync outside dmic_lock: it can re-enter the card's
+	 * control/DAPM paths.  The GPIO transition and settle delay stay
+	 * inside the lock so a concurrent capture start waits for the rail.
 	 */
-	if (gpio_changed)
-		usleep_range(5000, 5100);
 	if (changed)
 		snd_soc_dapm_sync(snd_soc_card_to_dapm(card));
 
@@ -229,6 +260,7 @@ static int sm8250_snd_startup(struct snd_pcm_substream *substream)
 	struct snd_soc_dai *cpu_dai = snd_soc_rtd_to_cpu(rtd, 0);
 	struct snd_soc_dai *codec_dai = snd_soc_rtd_to_codec(rtd, 0);
 	struct sm8250_snd_data *data = snd_soc_card_get_drvdata(rtd->card);
+	bool dmic_ref = false;
 	int i, ret;
 
 	pr_debug("J716F-CLK: sm8250_snd_startup called\n");
@@ -243,9 +275,9 @@ static int sm8250_snd_startup(struct snd_pcm_substream *substream)
 	 * macro registers say, because the microphones themselves are not
 	 * powered.
 	 */
-	if (cpu_dai->id == TX_CODEC_DMA_TX_3 || cpu_dai->id == VA_CODEC_DMA_TX_0) {
-		bool powered;
-
+	if (data->dmic_en_gpio &&
+	    (cpu_dai->id == TX_CODEC_DMA_TX_3 ||
+	     cpu_dai->id == VA_CODEC_DMA_TX_0)) {
 		/*
 		 * Select the internal microphone path first, then take a
 		 * reference on the shared rail so one backend's shutdown
@@ -253,12 +285,8 @@ static int sm8250_snd_startup(struct snd_pcm_substream *substream)
 		 */
 		if (data->dmic_sel_gpio)
 			gpiod_set_value_cansleep(data->dmic_sel_gpio, 1);
-		mutex_lock(&data->dmic_lock);
-		data->dmic_users++;
-		powered = sm8250_dmic_refresh(data);
-		mutex_unlock(&data->dmic_lock);
-		if (powered)
-			usleep_range(5000, 5100);
+		sm8250_dmic_get(data);
+		dmic_ref = true;
 		pr_debug("J716F-DMIC: power on (dai id %d, users %d)\n",
 			 cpu_dai->id, data->dmic_users);
 	}
@@ -395,7 +423,11 @@ static int sm8250_snd_startup(struct snd_pcm_substream *substream)
 		break;
 	}
 
-	return qcom_snd_sdw_startup(substream);
+	ret = qcom_snd_sdw_startup(substream);
+	if (ret && dmic_ref)
+		sm8250_dmic_put(data);
+
+	return ret;
 }
 
 static void sm8250_snd_shutdown(struct snd_pcm_substream *substream)
@@ -407,15 +439,7 @@ static void sm8250_snd_shutdown(struct snd_pcm_substream *substream)
 	if (data->dmic_en_gpio &&
 	    (cpu_dai->id == TX_CODEC_DMA_TX_3 ||
 	     cpu_dai->id == VA_CODEC_DMA_TX_0)) {
-		bool powered;
-
-		mutex_lock(&data->dmic_lock);
-		if (data->dmic_users > 0)
-			data->dmic_users--;
-		powered = sm8250_dmic_refresh(data);
-		mutex_unlock(&data->dmic_lock);
-		if (powered)
-			usleep_range(5000, 5100);
+		sm8250_dmic_put(data);
 		pr_debug("J716F-DMIC: power down (dai id %d, users %d)\n",
 			 cpu_dai->id, data->dmic_users);
 	}
