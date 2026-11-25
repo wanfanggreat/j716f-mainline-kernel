@@ -393,15 +393,32 @@ static int sm8250_snd_hw_params(struct snd_pcm_substream *substream,
 	 * 0x40/0x43 are on the left, 0x41/0x42 on the right.
 	 */
 	for_each_rtd_codec_dais(rtd, i, codec_dai) {
+		unsigned int rx_slots_buf[2];
 		const unsigned int *rx_slots = left_slots;
+		struct device_node *np;
 		u32 address;
 
 		if (!strstr(codec_dai->name, "cs35l41"))
 			continue;
 
-		if (of_machine_is_compatible("lenovo,j716f")) {
-			ret = of_property_read_u32(codec_dai->component->dev->of_node,
-						   "reg", &address);
+		np = codec_dai->component->dev->of_node;
+		/*
+		 * The board describes the amplifier's ASP RX slot pair.  The
+		 * J716F address fallback below is only for DTBs that predate
+		 * the property; new boards should not need a machine-driver
+		 * table keyed by I2C address.
+		 */
+		if (of_property_count_u32_elems(np, "cirrus,asp-rx-slots") ==
+		    ARRAY_SIZE(rx_slots_buf)) {
+			ret = of_property_read_u32_array(np,
+							 "cirrus,asp-rx-slots",
+							 rx_slots_buf,
+							 ARRAY_SIZE(rx_slots_buf));
+			if (ret)
+				return ret;
+			rx_slots = rx_slots_buf;
+		} else if (of_machine_is_compatible("lenovo,j716f")) {
+			ret = of_property_read_u32(np, "reg", &address);
 			if (ret)
 				return ret;
 			switch (address) {
