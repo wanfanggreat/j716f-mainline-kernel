@@ -414,32 +414,41 @@ EXPORT_SYMBOL_GPL(q6asm_hold_buffer);
  * A readiness query is not enough: it also fails on a timeout or when
  * q6core is gone, neither of which says anything about DMA.  The remoteproc
  * state becomes RPROC_OFFLINE only after the remote has been halted, so that
- * is the evidence accepted here; every other case (including a driver unbind
- * while the ADSP keeps running, or a kernel built without remoteproc) keeps
- * the pages alive.
+ * is the evidence accepted here.
+ *
+ * rproc_get_by_child() borrows the pointer (it takes no device reference),
+ * so there is no rproc_put(): the rproc device is an ancestor of @dev and
+ * cannot be released while @dev is still registered, which is the case for
+ * the whole devres release callback this runs in.
+ *
+ * The state is written after the remote is halted, so a removal that races
+ * the stop sees RUNNING and keeps the pages.  That is deliberate: without a
+ * stop-completion event the buffers stay owned by this instance and are
+ * leaked when it goes away.  See q6asm_release_held_buffers().
  */
 static bool q6asm_remote_stopped(struct device *dev)
 {
 	struct rproc *rproc;
-	bool stopped;
 
 	rproc = rproc_get_by_child(dev);
 	if (!rproc)
 		return false;
 
-	stopped = READ_ONCE(rproc->state) == RPROC_OFFLINE;
-	rproc_put(rproc);
-
-	return stopped;
+	return READ_ONCE(rproc->state) == RPROC_OFFLINE;
 }
 
 /*
  * Free the held buffers, but only once the remote processor is known to be
  * stopped.  An APR device also goes away on a driver unbind while the ADSP
  * keeps running, so device removal alone is not proof that the DSP stopped
- * touching the pages.  When the DSP may still run, the buffers are
- * deliberately left allocated and untracked: a bounded leak is recoverable,
- * a DSP write after free is not.
+ * touching the pages.
+ *
+ * This is a conservative quarantine, not a complete automatic reclaim: the
+ * driver has no stop-completion event, so a removal that races rproc_stop()
+ * (or a build without remoteproc) keeps the pages and lets them leak with
+ * this instance.  A DSP write after free is unrecoverable, a bounded leak is
+ * not; a real reclaim would have to hang off a remote-stop notification and
+ * keep the owner alive until it fires.
  */
 static void q6asm_release_held_buffers(void *data)
 {

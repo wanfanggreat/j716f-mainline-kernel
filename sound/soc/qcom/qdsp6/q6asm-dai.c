@@ -1486,12 +1486,13 @@ static int q6asm_dai_compr_set_params(struct snd_soc_component *component,
 	if (ret < 0) {
 		dev_err(dev, "Buffer Mapping failed ret:%d\n", ret);
 		/*
-		 * A timeout means the MAP may have executed at the DSP even
-		 * though the host saw no reply, so the teardown has to attempt
-		 * the unmap and keep the pages if it cannot.  Keep the real
-		 * error: a refusal and a missing reply are different answers.
+		 * A timeout, or a success without a map handle (-EIO, where the
+		 * DSP may have mapped the region anyway), means the mapping is
+		 * unconfirmed: the teardown has to attempt the unmap and keep
+		 * the pages if it cannot.  Keep the real error: a refusal and a
+		 * missing reply are different answers.
 		 */
-		if (ret == -ETIMEDOUT)
+		if (ret == -ETIMEDOUT || ret == -EIO)
 			prtd->map_state = Q6ASM_MAP_UNKNOWN;
 		goto q6_err;
 	}
