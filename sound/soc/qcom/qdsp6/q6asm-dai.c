@@ -6,6 +6,7 @@
 #include <linux/init.h>
 #include <linux/err.h>
 #include <linux/module.h>
+#include <linux/atomic.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/slab.h>
@@ -95,6 +96,8 @@ struct q6asm_dai_rtd {
 	bool reads_pending;
 	/* How many READ_V2 commands are currently outstanding at the ADSP */
 	unsigned int reads_inflight;
+	/* How many WRITE commands were queued but not yet completed */
+	atomic_t write_inflight;
 	unsigned long run_jiffies;
 	/* True while the audio buffer is mapped into the ADSP address space */
 	bool mapped;
@@ -242,6 +245,8 @@ static void event_handler(uint32_t opcode, uint32_t token,
 		prtd->state = Q6ASM_STREAM_STOPPED;
 		break;
 	case ASM_CLIENT_EVENT_DATA_WRITE_DONE:
+		/* One queued period is now consumed by the DSP. */
+		atomic_dec_if_positive(&prtd->write_inflight);
 		snd_pcm_period_elapsed(substream);
 		break;
 	case ASM_CLIENT_EVENT_DATA_READ_DONE:
@@ -367,6 +372,7 @@ static int q6asm_dai_prepare(struct snd_soc_component *component,
 		(prtd->pcm_size / prtd->periods) :
 		snd_pcm_lib_period_bytes(substream);
 	prtd->queue_ptr = 0;
+	atomic_set(&prtd->write_inflight, 0);
 	prtd->reads_inflight = 0;
 	prtd->reads_pending = false;
 	prtd->capture_started = false;
@@ -571,20 +577,67 @@ static int q6asm_dai_ack(struct snd_soc_component *component, struct snd_pcm_sub
 {
 	struct snd_pcm_runtime *runtime = substream->runtime;
 	struct q6asm_dai_rtd *prtd = runtime->private_data;
-	int i, ret = 0, avail_periods;
+	snd_pcm_uframes_t appl, qp, delta, avail, boundary;
+	int free_slots, i, ret = 0;
 
-	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK && prtd->state == Q6ASM_STREAM_RUNNING) {
-		avail_periods = (runtime->control->appl_ptr - prtd->queue_ptr)/runtime->period_size;
-		for (i = 0; i < avail_periods; i++) {
-			ret = q6asm_write_async(prtd->audio_client, prtd->stream_id,
-					   prtd->pcm_count, 0, 0, 0);
+	if (substream->stream != SNDRV_PCM_STREAM_PLAYBACK ||
+	    READ_ONCE(prtd->state) != Q6ASM_STREAM_RUNNING)
+		return 0;
 
-			if (ret < 0) {
-				dev_err(component->dev, "Error queuing playback buffer %d\n", ret);
-				return ret;
-			}
-			prtd->queue_ptr += runtime->period_size;
+	if (!runtime->period_size || !runtime->periods)
+		return 0;
+
+	boundary = runtime->boundary;
+	if (!boundary)
+		return -EINVAL;
+
+	/*
+	 * appl_ptr wraps at runtime->boundary; a plain subtraction can
+	 * underflow and make the loop below queue an unbounded number of
+	 * periods under the PCM stream lock.
+	 */
+	appl = runtime->control->appl_ptr;
+	qp = prtd->queue_ptr;
+	if (qp >= boundary)
+		qp %= boundary;
+
+	delta = (appl >= qp) ? appl - qp : boundary - qp + appl;
+	if (delta > runtime->buffer_size) {
+		dev_warn_ratelimited(component->dev,
+				     "J716F: ack delta %lu > buffer %lu, clamping\n",
+				     (unsigned long)delta,
+				     (unsigned long)runtime->buffer_size);
+		delta = runtime->buffer_size;
+	}
+
+	avail = delta / runtime->period_size;
+	if (!avail)
+		return 0;
+
+	/* Never overwrite a period the DSP still holds. */
+	free_slots = (int)runtime->periods - atomic_read(&prtd->write_inflight);
+	if (free_slots <= 0)
+		return 0;
+	if (avail > (snd_pcm_uframes_t)free_slots)
+		avail = free_slots;
+
+	for (i = 0; i < (int)avail; i++) {
+		/*
+		 * Reserve the slot before the send: the completion can run as
+		 * soon as the packet is queued, and decrementing afterwards
+		 * would lose that completion.
+		 */
+		atomic_inc(&prtd->write_inflight);
+		ret = q6asm_write_async(prtd->audio_client, prtd->stream_id,
+					prtd->pcm_count, 0, 0, 0);
+		if (ret < 0) {
+			atomic_dec(&prtd->write_inflight);
+			dev_err(component->dev,
+				"Error queuing playback buffer %d\n", ret);
+			break;
 		}
+		prtd->queue_ptr = (qp + runtime->period_size) % boundary;
+		qp = prtd->queue_ptr;
 	}
 
 	return ret;
