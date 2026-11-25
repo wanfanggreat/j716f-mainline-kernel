@@ -2078,13 +2078,30 @@ static ssize_t inject_fault_store(struct device *dev,
 	unsigned long flags;
 	unsigned int fault = Q6ASM_FAULT_NONE;
 	unsigned int i;
+	const char *colon;
+	size_t len;
 	bool timeout = false;
 
 	if (sysfs_streq(buf, "clear") || sysfs_streq(buf, "none"))
 		goto store;
 
-	if (sscanf(buf, "%15[a-z]:%15[a-z]", op, kind) != 2)
+	colon = strchr(buf, ':');
+	if (!colon)
 		return -EINVAL;
+	len = colon - buf;
+	if (!len || len >= sizeof(op))
+		return -EINVAL;
+	memcpy(op, buf, len);
+	op[len] = '\0';
+
+	colon++;
+	len = strlen(colon);
+	while (len && (colon[len - 1] == '\n' || colon[len - 1] == '\r'))
+		len--;
+	if (!len || len >= sizeof(kind))
+		return -EINVAL;
+	memcpy(kind, colon, len);
+	kind[len] = '\0';
 
 	for (i = Q6ASM_FAULT_MAP; i <= Q6ASM_FAULT_UNMAP; i++)
 		if (sysfs_streq(op, q6asm_fault_names[i]))
