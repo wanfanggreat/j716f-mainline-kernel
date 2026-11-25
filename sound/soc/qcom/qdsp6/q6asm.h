@@ -98,7 +98,8 @@ struct audio_client *q6asm_audio_client_alloc(struct device *dev,
 void q6asm_audio_client_clear_callback(struct audio_client *ac);
 void q6asm_audio_client_free(struct audio_client *ac);
 void q6asm_quarantine_session(struct audio_client *ac);
-void q6asm_hold_buffer(struct snd_dma_buffer *dma, u32 session);
+void q6asm_hold_buffer(struct audio_client *ac, struct snd_dma_buffer *dma,
+		       u32 session);
 bool q6asm_session_is_quarantined(struct audio_client *ac);
 int q6asm_write_async(struct audio_client *ac, uint32_t stream_id, uint32_t len,
 		      uint32_t msw_ts, uint32_t lsw_ts, uint32_t wflags);

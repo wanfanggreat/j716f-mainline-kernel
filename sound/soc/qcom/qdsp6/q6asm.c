@@ -268,63 +268,22 @@ struct q6asm {
 	 * rebound; devm_kzalloc() in probe clears the bitmap.
 	 */
 	unsigned long session_quarantine[BITS_TO_LONGS(MAX_SESSIONS + 1)];
+	/* Buffers whose DSP ownership could not be given up, see below. */
+	struct list_head held_buffers;
+	struct mutex held_lock;
 };
 
 /*
- * Compressed-audio buffers whose remote ownership is unknown are moved
- * here on a failed teardown.  They are kept valid until the q6asm APR
- * device is removed (ADSP reset/rebind), the point where the DSP can no
- * longer access them.
+ * Compressed-audio buffers whose remote ownership is unknown after a failed
+ * teardown are moved here.  The record is allocated together with the audio
+ * client so the failure path never has to allocate memory, and the list is
+ * owned by the q6asm instance the buffers were mapped through.
  */
 struct q6asm_held_buffer {
 	struct list_head node;
 	struct snd_dma_buffer dma;
 	u32 session;
 };
-
-static LIST_HEAD(q6asm_held_buffers);
-static DEFINE_MUTEX(q6asm_held_lock);
-
-void q6asm_hold_buffer(struct snd_dma_buffer *dma, u32 session)
-{
-	struct q6asm_held_buffer *held;
-
-	held = kzalloc_obj(*held);
-	if (!held) {
-		dev_err(dma->dev.dev,
-			"J716F: cannot hold compr buffer for session %u; leaking it\n",
-			session);
-		return;
-	}
-	held->dma = *dma;
-	held->session = session;
-	INIT_LIST_HEAD(&held->node);
-
-	mutex_lock(&q6asm_held_lock);
-	list_add_tail(&held->node, &q6asm_held_buffers);
-	mutex_unlock(&q6asm_held_lock);
-
-	/* The held record owns the pages now; do not free them again. */
-	dma->area = NULL;
-	dma->bytes = 0;
-	dev_warn(dma->dev.dev,
-		 "J716F: holding compr DMA buffer for session %u until ADSP rebind\n",
-		 session);
-}
-EXPORT_SYMBOL_GPL(q6asm_hold_buffer);
-
-static void q6asm_release_held_buffers(void *unused)
-{
-	struct q6asm_held_buffer *held, *tmp;
-
-	mutex_lock(&q6asm_held_lock);
-	list_for_each_entry_safe(held, tmp, &q6asm_held_buffers, node) {
-		snd_dma_free_pages(&held->dma);
-		list_del(&held->node);
-		kfree(held);
-	}
-	mutex_unlock(&q6asm_held_lock);
-}
 
 struct audio_client {
 	int session;
@@ -344,7 +303,89 @@ struct audio_client {
 	int perf_mode;
 	struct q6asm *q6asm;
 	struct device *dev;
+	/* Pre-allocated owner for a buffer the DSP may still be using. */
+	struct q6asm_held_buffer *hold_slot;
 };
+
+/**
+ * q6asm_hold_buffer() - take ownership of a buffer the DSP may still use
+ *
+ * @ac: audio client the buffer was mapped through
+ * @dma: buffer to keep alive; it is left detached on return
+ * @session: session id the buffer was mapped for, for diagnostics
+ *
+ * Called when CMD_CLOSE or UNMAP failed, so the host can no longer tell
+ * whether the ADSP still reads or writes the pages.  The buffer is queued on
+ * the owning q6asm instance and freed only once the ADSP is known to be down.
+ * The queue record was allocated with the client, so this path cannot fail
+ * for lack of memory.
+ */
+void q6asm_hold_buffer(struct audio_client *ac, struct snd_dma_buffer *dma,
+		       u32 session)
+{
+	struct q6asm_held_buffer *held = ac->hold_slot;
+
+	if (!held) {
+		dev_err(ac->dev,
+			"J716F: no hold record for session %u; leaking its buffer\n",
+			session);
+		return;
+	}
+	ac->hold_slot = NULL;
+
+	held->dma = *dma;
+	held->session = session;
+	INIT_LIST_HEAD(&held->node);
+
+	mutex_lock(&ac->q6asm->held_lock);
+	list_add_tail(&held->node, &ac->q6asm->held_buffers);
+	mutex_unlock(&ac->q6asm->held_lock);
+
+	/* The held record owns the pages now; do not free them again. */
+	dma->area = NULL;
+	dma->bytes = 0;
+	dev_warn(ac->dev,
+		 "J716F: holding compr DMA buffer for session %u until the ADSP stops\n",
+		 session);
+}
+EXPORT_SYMBOL_GPL(q6asm_hold_buffer);
+
+/*
+ * Free the held buffers, but only once the ADSP is known to be down.  An APR
+ * device also goes away on a driver unbind while the ADSP keeps running, so
+ * device removal alone is not proof that the DSP stopped touching the pages.
+ * When the ADSP still answers, the buffers are deliberately left allocated:
+ * a leak is recoverable, a DSP write after free is not.
+ */
+static void q6asm_release_held_buffers(void *data)
+{
+	struct q6asm *q6asm = data;
+	struct q6asm_held_buffer *held, *tmp;
+	unsigned int kept = 0;
+
+	mutex_lock(&q6asm->held_lock);
+	if (list_empty(&q6asm->held_buffers)) {
+		mutex_unlock(&q6asm->held_lock);
+		return;
+	}
+	if (q6core_is_adsp_ready()) {
+		list_for_each_entry(held, &q6asm->held_buffers, node)
+			kept++;
+		mutex_unlock(&q6asm->held_lock);
+		if (kept)
+			dev_err(q6asm->dev,
+				"J716F: ADSP still running; refusing to free %u held DMA buffer(s)\n",
+				kept);
+		return;
+	}
+
+	list_for_each_entry_safe(held, tmp, &q6asm->held_buffers, node) {
+		snd_dma_free_pages(&held->dma);
+		list_del(&held->node);
+		kfree(held);
+	}
+	mutex_unlock(&q6asm->held_lock);
+}
 
 static inline void q6asm_add_hdr(struct audio_client *ac, struct apr_hdr *hdr,
 				 uint32_t pkt_size, bool cmd_flg,
@@ -665,6 +706,7 @@ static void q6asm_audio_client_release(struct kref *ref)
 	a->session[ac->session] = NULL;
 	spin_unlock_irqrestore(&a->slock, flags);
 
+	kfree(ac->hold_slot);
 	kfree(ac);
 }
 
@@ -1085,6 +1127,17 @@ struct audio_client *q6asm_audio_client_alloc(struct device *dev, q6asm_cb cb,
 	if (!ac)
 		return ERR_PTR(-ENOMEM);
 
+	/*
+	 * Allocate the held-buffer record up front so that a failed teardown
+	 * never has to allocate.  It is only used if CLOSE/UNMAP cannot
+	 * confirm that the DSP gave the buffer back.
+	 */
+	ac->hold_slot = kzalloc_obj(*ac->hold_slot);
+	if (!ac->hold_slot) {
+		kfree(ac);
+		return ERR_PTR(-ENOMEM);
+	}
+
 	ac->session = session_id + 1;
 	ac->cb = cb;
 	ac->dev = dev;
@@ -1103,6 +1156,7 @@ struct audio_client *q6asm_audio_client_alloc(struct device *dev, q6asm_cb cb,
 	spin_lock_irqsave(&a->slock, flags);
 	if (test_bit(ac->session, a->session_quarantine)) {
 		spin_unlock_irqrestore(&a->slock, flags);
+		kfree(ac->hold_slot);
 		kfree(ac);
 		dev_err(dev,
 			"session %d is quarantined; refusing a new client\n",
@@ -1111,6 +1165,7 @@ struct audio_client *q6asm_audio_client_alloc(struct device *dev, q6asm_cb cb,
 	}
 	if (a->session[ac->session]) {
 		spin_unlock_irqrestore(&a->slock, flags);
+		kfree(ac->hold_slot);
 		kfree(ac);
 		return ERR_PTR(-EBUSY);
 	}
@@ -1935,14 +1990,16 @@ static int q6asm_probe(struct apr_device *adev)
 	q6asm->adev = adev;
 	init_waitqueue_head(&q6asm->mem_wait);
 	spin_lock_init(&q6asm->slock);
+	INIT_LIST_HEAD(&q6asm->held_buffers);
+	mutex_init(&q6asm->held_lock);
 	dev_set_drvdata(dev, q6asm);
 
 	/*
-	 * Free compressed-audio buffers held after a failed teardown when
-	 * this APR device goes away.  Removal happens on an ADSP reset, so
-	 * the DSP can no longer access those pages at this point.
+	 * Reclaim compressed-audio buffers held after a failed teardown.  The
+	 * callback asks the ADSP before freeing: this device can also be
+	 * removed by a driver unbind while the DSP is still running.
 	 */
-	ret = devm_add_action_or_reset(dev, q6asm_release_held_buffers, NULL);
+	ret = devm_add_action_or_reset(dev, q6asm_release_held_buffers, q6asm);
 	if (ret)
 		return ret;
 

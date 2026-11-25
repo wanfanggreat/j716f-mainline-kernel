@@ -108,6 +108,12 @@ struct q6asm_dai_rtd {
 	 * failure (ACP probes open/close PCMs without a stream).
 	 */
 	bool stream_opened;
+	/*
+	 * True when set_params() or free() could not confirm that the ADSP
+	 * released the compressed stream.  The DMA buffer is then handed to
+	 * q6asm instead of snd_dma_free_pages().
+	 */
+	bool teardown_unknown;
 	uint32_t initial_samples_drop;
 	uint32_t trailing_samples_drop;
 	bool notify_on_drain;
@@ -1132,62 +1138,93 @@ free_prtd:
 	return ret;
 }
 
+/*
+ * Give a compressed stream back in the order the ADSP expects: CLOSE the
+ * stream, then UNMAP the buffer, then drop the routing.  A step is only
+ * skipped when it is known to have completed, so one failure leaves the
+ * remaining ownership question to the caller.  Returns true when the remote
+ * state could not be confirmed.
+ */
+static bool q6asm_dai_compr_teardown(struct snd_soc_component *component,
+				     struct snd_soc_pcm_runtime *rtd,
+				     struct q6asm_dai_rtd *prtd, int dir)
+{
+	struct audio_client *ac = prtd->audio_client;
+	bool failed = false;
+	int ret;
+
+	if (prtd->stream_opened) {
+		ret = q6asm_cmd(ac, prtd->stream_id, CMD_CLOSE);
+		if (ret < 0) {
+			dev_err(component->dev,
+				"J716F: compr CMD_CLOSE failed %d; session %d quarantined\n",
+				ret, prtd->stream_id);
+			q6asm_quarantine_session(ac);
+			failed = true;
+		} else {
+			prtd->stream_opened = false;
+		}
+	}
+
+	if (prtd->next_track_stream_id) {
+		ret = q6asm_cmd(ac, prtd->next_track_stream_id, CMD_CLOSE);
+		if (ret < 0) {
+			dev_err(component->dev,
+				"J716F: compr gapless CMD_CLOSE failed %d\n", ret);
+			q6asm_quarantine_session(ac);
+			failed = true;
+		} else {
+			prtd->next_track_stream_id = 0;
+		}
+	}
+
+	if (!failed && prtd->mapped) {
+		ret = q6asm_unmap_memory_regions(dir, ac);
+		if (ret < 0) {
+			dev_err(component->dev,
+				"J716F: compr UNMAP failed %d after CLOSE; session %d quarantined\n",
+				ret, prtd->stream_id);
+			q6asm_quarantine_session(ac);
+			failed = true;
+		} else {
+			prtd->mapped = false;
+		}
+	}
+
+	if (!failed)
+		q6routing_stream_close(rtd->dai_link->id, dir);
+
+	return failed;
+}
+
 static int q6asm_dai_compr_free(struct snd_soc_component *component,
 				struct snd_compr_stream *stream)
 {
 	struct snd_compr_runtime *runtime = stream->runtime;
 	struct q6asm_dai_rtd *prtd = runtime->private_data;
 	struct snd_soc_pcm_runtime *rtd = stream->private_data;
-	bool failed = false;
-	int ret;
 
 	if (prtd->audio_client) {
 		q6asm_audio_client_clear_callback(prtd->audio_client);
-		if (prtd->state == Q6ASM_STREAM_RUNNING) {
-			ret = q6asm_cmd(prtd->audio_client, prtd->stream_id,
-					CMD_CLOSE);
-			if (ret < 0) {
-				dev_err(component->dev,
-					"J716F: compr CMD_CLOSE failed %d; session %d quarantined\n",
-					ret, prtd->stream_id);
-				q6asm_quarantine_session(prtd->audio_client);
-				failed = true;
-			}
-			if (prtd->next_track_stream_id) {
-				ret = q6asm_cmd(prtd->audio_client,
-						prtd->next_track_stream_id,
-						CMD_CLOSE);
-				if (ret < 0) {
-					dev_err(component->dev,
-						"J716F: compr gapless CMD_CLOSE failed %d\n",
-						ret);
-					q6asm_quarantine_session(prtd->audio_client);
-					failed = true;
-				}
-			}
 
-			if (!failed) {
-				ret = q6asm_unmap_memory_regions(stream->direction,
-								 prtd->audio_client);
-				if (ret < 0) {
-					dev_err(component->dev,
-						"J716F: compr UNMAP failed %d after CLOSE; session %d quarantined\n",
-						ret, prtd->stream_id);
-					q6asm_quarantine_session(prtd->audio_client);
-					failed = true;
-				}
-			}
-		}
+		/*
+		 * set_params() already ran this teardown when it failed; only
+		 * retry a teardown that has not been attempted or that was
+		 * never recorded as unconfirmed.
+		 */
+		if (!prtd->teardown_unknown &&
+		    q6asm_dai_compr_teardown(component, rtd, prtd,
+					     stream->direction))
+			prtd->teardown_unknown = true;
 
-		if (!failed)
-			snd_dma_free_pages(&prtd->dma_buffer);
+		if (prtd->teardown_unknown)
+			q6asm_hold_buffer(prtd->audio_client, &prtd->dma_buffer,
+					  prtd->stream_id);
 		else
-			q6asm_hold_buffer(&prtd->dma_buffer, prtd->stream_id);
+			snd_dma_free_pages(&prtd->dma_buffer);
 		q6asm_audio_client_free(prtd->audio_client);
 		prtd->audio_client = NULL;
 	}
-	if (!failed)
-		q6routing_stream_close(rtd->dai_link->id, stream->direction);
 	kfree(prtd);
 
 	return 0;
@@ -1412,6 +1449,7 @@ static int q6asm_dai_compr_set_params(struct snd_soc_component *component,
 			dev_err(dev, "q6asm_open_write failed\n");
 			goto open_err;
 		}
+		prtd->stream_opened = true;
 	}
 
 	prtd->session_id = q6asm_get_session_id(prtd->audio_client);
@@ -1440,14 +1478,21 @@ static int q6asm_dai_compr_set_params(struct snd_soc_component *component,
 		goto q6_err;
 	}
 
+	prtd->mapped = true;
 	prtd->state = Q6ASM_STREAM_RUNNING;
 
 	return 0;
 
 q6_err:
-	q6routing_stream_close(rtd->dai_link->id, dir);
 routing_err:
-	q6asm_cmd(prtd->audio_client, prtd->stream_id, CMD_CLOSE);
+	/*
+	 * Roll back through the same ordered teardown free() uses.  If it
+	 * cannot confirm that the ADSP released the stream, remember that so
+	 * free() keeps the DMA buffer instead of handing it back to the page
+	 * allocator while the DSP may still be using it.
+	 */
+	if (q6asm_dai_compr_teardown(component, rtd, prtd, dir))
+		prtd->teardown_unknown = true;
 
 open_err:
 	return ret;
