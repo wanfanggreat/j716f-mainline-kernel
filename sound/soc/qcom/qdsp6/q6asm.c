@@ -15,6 +15,7 @@
 #include <linux/of_platform.h>
 #include <linux/spinlock.h>
 #include <linux/kref.h>
+#include <linux/remoteproc.h>
 #include <linux/of.h>
 #include <uapi/sound/asound.h>
 #include <uapi/sound/compress_params.h>
@@ -271,6 +272,7 @@ struct q6asm {
 	/* Buffers whose DSP ownership could not be given up, see below. */
 	struct list_head held_buffers;
 	struct mutex held_lock;
+#ifdef CONFIG_SND_SOC_QDSP6_ASM_FAULT_INJECT
 	/*
 	 * One-shot error injection for the teardown paths (J716F debug aid).
 	 * A root user writes inject_fault in sysfs; the next matching command
@@ -278,6 +280,7 @@ struct q6asm {
 	 */
 	unsigned int fault;
 	bool fault_timeout;
+#endif
 };
 
 enum q6asm_fault {
@@ -287,12 +290,14 @@ enum q6asm_fault {
 	Q6ASM_FAULT_UNMAP,
 };
 
+#ifdef CONFIG_SND_SOC_QDSP6_ASM_FAULT_INJECT
 static const char *const q6asm_fault_names[] = {
 	[Q6ASM_FAULT_NONE] = "none",
 	[Q6ASM_FAULT_MAP] = "map",
 	[Q6ASM_FAULT_CLOSE] = "close",
 	[Q6ASM_FAULT_UNMAP] = "unmap",
 };
+#endif
 
 
 /*
@@ -329,6 +334,7 @@ struct audio_client {
 	struct q6asm_held_buffer *hold_slot;
 };
 
+#ifdef CONFIG_SND_SOC_QDSP6_ASM_FAULT_INJECT
 /*
  * Consume a pending injection for @fault.  Returns 0 when nothing is armed
  * for this operation, else the errno the caller should fail with.
@@ -353,6 +359,12 @@ static int q6asm_fault_take(struct audio_client *ac, unsigned int fault)
 
 	return rc;
 }
+#else
+static inline int q6asm_fault_take(struct audio_client *ac, unsigned int fault)
+{
+	return 0;
+}
+#endif
 
 /**
  * q6asm_hold_buffer() - take ownership of a buffer the DSP may still use
@@ -398,11 +410,36 @@ void q6asm_hold_buffer(struct audio_client *ac, struct snd_dma_buffer *dma,
 EXPORT_SYMBOL_GPL(q6asm_hold_buffer);
 
 /*
- * Free the held buffers, but only once the ADSP is known to be down.  An APR
- * device also goes away on a driver unbind while the ADSP keeps running, so
- * device removal alone is not proof that the DSP stopped touching the pages.
- * When the ADSP still answers, the buffers are deliberately left allocated:
- * a leak is recoverable, a DSP write after free is not.
+ * True only when the remote processor that owns this device has stopped.
+ * A readiness query is not enough: it also fails on a timeout or when
+ * q6core is gone, neither of which says anything about DMA.  The remoteproc
+ * state becomes RPROC_OFFLINE only after the remote has been halted, so that
+ * is the evidence accepted here; every other case (including a driver unbind
+ * while the ADSP keeps running, or a kernel built without remoteproc) keeps
+ * the pages alive.
+ */
+static bool q6asm_remote_stopped(struct device *dev)
+{
+	struct rproc *rproc;
+	bool stopped;
+
+	rproc = rproc_get_by_child(dev);
+	if (!rproc)
+		return false;
+
+	stopped = READ_ONCE(rproc->state) == RPROC_OFFLINE;
+	rproc_put(rproc);
+
+	return stopped;
+}
+
+/*
+ * Free the held buffers, but only once the remote processor is known to be
+ * stopped.  An APR device also goes away on a driver unbind while the ADSP
+ * keeps running, so device removal alone is not proof that the DSP stopped
+ * touching the pages.  When the DSP may still run, the buffers are
+ * deliberately left allocated and untracked: a bounded leak is recoverable,
+ * a DSP write after free is not.
  */
 static void q6asm_release_held_buffers(void *data)
 {
@@ -415,13 +452,13 @@ static void q6asm_release_held_buffers(void *data)
 		mutex_unlock(&q6asm->held_lock);
 		return;
 	}
-	if (q6core_is_adsp_ready()) {
+	if (!q6asm_remote_stopped(q6asm->dev)) {
 		list_for_each_entry(held, &q6asm->held_buffers, node)
 			kept++;
 		mutex_unlock(&q6asm->held_lock);
 		if (kept)
 			dev_err(q6asm->dev,
-				"J716F: ADSP still running; refusing to free %u held DMA buffer(s)\n",
+				"J716F: remote processor not stopped; keeping %u held DMA buffer(s)\n",
 				kept);
 		return;
 	}
@@ -2035,6 +2072,7 @@ int q6asm_cmd_nowait(struct audio_client *ac, uint32_t stream_id, int cmd)
 }
 EXPORT_SYMBOL_GPL(q6asm_cmd_nowait);
 
+#ifdef CONFIG_SND_SOC_QDSP6_ASM_FAULT_INJECT
 static ssize_t inject_fault_show(struct device *dev,
 				 struct device_attribute *attr, char *buf)
 {
@@ -2128,6 +2166,7 @@ static void q6asm_remove_sysfs(void *data)
 {
 	device_remove_file(data, &dev_attr_inject_fault);
 }
+#endif /* CONFIG_SND_SOC_QDSP6_ASM_FAULT_INJECT */
 
 static int q6asm_probe(struct apr_device *adev)
 {
@@ -2158,12 +2197,14 @@ static int q6asm_probe(struct apr_device *adev)
 	if (ret)
 		return ret;
 
+#ifdef CONFIG_SND_SOC_QDSP6_ASM_FAULT_INJECT
 	ret = device_create_file(dev, &dev_attr_inject_fault);
 	if (ret)
 		return ret;
 	ret = devm_add_action_or_reset(dev, q6asm_remove_sysfs, dev);
 	if (ret)
 		return ret;
+#endif
 
 	return devm_of_platform_populate(dev);
 }

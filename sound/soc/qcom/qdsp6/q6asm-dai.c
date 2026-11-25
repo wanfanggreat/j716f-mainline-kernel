@@ -70,6 +70,17 @@ enum stream_state {
 	Q6ASM_STREAM_RUNNING,
 };
 
+/*
+ * Mapping state of a stream's DMA buffer.  A MAP command that timed out may
+ * still have executed at the DSP, so "unknown" is a real state: the teardown
+ * must try to unmap and, if it cannot, keep the pages alive.
+ */
+enum q6asm_map_state {
+	Q6ASM_MAP_NONE = 0,	/* no mapping was requested or it was released */
+	Q6ASM_MAP_CONFIRMED,	/* the DSP returned a map handle */
+	Q6ASM_MAP_UNKNOWN,	/* MAP may have executed; no reply seen */
+};
+
 struct q6asm_dai_rtd {
 	struct snd_pcm_substream *substream;
 	struct snd_compr_stream *cstream;
@@ -99,8 +110,8 @@ struct q6asm_dai_rtd {
 	/* How many WRITE commands were queued but not yet completed */
 	atomic_t write_inflight;
 	unsigned long run_jiffies;
-	/* True while the audio buffer is mapped into the ADSP address space */
-	bool mapped;
+	/* Whether the audio buffer is mapped into the ADSP address space */
+	enum q6asm_map_state map_state;
 	/*
 	 * True once OPEN_WRITE/OPEN_READ succeeded and until CMD_CLOSE is
 	 * confirmed.  A close() on a PCM that was never opened must not send
@@ -341,7 +352,7 @@ static int q6asm_dai_map_regions(struct device *dev,
 					       period_sz, prtd->periods);
 		if (ret >= 0) {
 			prtd->phys = phys;
-			prtd->mapped = true;
+			prtd->map_state = Q6ASM_MAP_CONFIRMED;
 			dev_dbg(dev,
 				"J716F: map dir=%d mode=%d phys=%#llx dma=%#llx period=%zu periods=%u accepted\n",
 				 substream->stream, attempt,
@@ -449,7 +460,7 @@ static int q6asm_dai_prepare(struct snd_soc_component *component,
 			prtd->stream_opened = false;
 		}
 
-		if (prtd->mapped) {
+		if (prtd->map_state != Q6ASM_MAP_NONE) {
 			ret = q6asm_unmap_memory_regions(substream->stream,
 							 prtd->audio_client);
 			if (ret < 0) {
@@ -457,7 +468,7 @@ static int q6asm_dai_prepare(struct snd_soc_component *component,
 				q6asm_quarantine_session(prtd->audio_client);
 				return ret;
 			}
-			prtd->mapped = false;
+			prtd->map_state = Q6ASM_MAP_NONE;
 		}
 
 		q6routing_stream_close(soc_prtd->dai_link->id,
@@ -611,7 +622,7 @@ routing_err:
 		prtd->stream_opened = false;
 	}
 open_err:
-	if (prtd->mapped) {
+	if (prtd->map_state != Q6ASM_MAP_NONE) {
 		int urc = q6asm_unmap_memory_regions(substream->stream,
 						     prtd->audio_client);
 
@@ -622,7 +633,7 @@ open_err:
 			q6asm_quarantine_session(prtd->audio_client);
 			return urc;
 		}
-		prtd->mapped = false;
+		prtd->map_state = Q6ASM_MAP_NONE;
 	}
 
 	return ret;
@@ -905,7 +916,7 @@ static int q6asm_dai_close(struct snd_soc_component *component,
 			}
 		}
 
-		if (!failed && prtd->mapped) {
+		if (!failed && prtd->map_state != Q6ASM_MAP_NONE) {
 			ret = q6asm_unmap_memory_regions(substream->stream,
 							 prtd->audio_client);
 			if (ret < 0) {
@@ -915,7 +926,7 @@ static int q6asm_dai_close(struct snd_soc_component *component,
 				q6asm_quarantine_session(prtd->audio_client);
 				failed = true;
 			} else {
-				prtd->mapped = false;
+				prtd->map_state = Q6ASM_MAP_NONE;
 			}
 		}
 
@@ -1178,7 +1189,7 @@ static bool q6asm_dai_compr_teardown(struct snd_soc_component *component,
 		}
 	}
 
-	if (!failed && prtd->mapped) {
+	if (!failed && prtd->map_state != Q6ASM_MAP_NONE) {
 		ret = q6asm_unmap_memory_regions(dir, ac);
 		if (ret < 0) {
 			dev_err(component->dev,
@@ -1187,7 +1198,7 @@ static bool q6asm_dai_compr_teardown(struct snd_soc_component *component,
 			q6asm_quarantine_session(ac);
 			failed = true;
 		} else {
-			prtd->mapped = false;
+			prtd->map_state = Q6ASM_MAP_NONE;
 		}
 	}
 
@@ -1474,11 +1485,18 @@ static int q6asm_dai_compr_set_params(struct snd_soc_component *component,
 
 	if (ret < 0) {
 		dev_err(dev, "Buffer Mapping failed ret:%d\n", ret);
-		ret = -ENOMEM;
+		/*
+		 * A timeout means the MAP may have executed at the DSP even
+		 * though the host saw no reply, so the teardown has to attempt
+		 * the unmap and keep the pages if it cannot.  Keep the real
+		 * error: a refusal and a missing reply are different answers.
+		 */
+		if (ret == -ETIMEDOUT)
+			prtd->map_state = Q6ASM_MAP_UNKNOWN;
 		goto q6_err;
 	}
 
-	prtd->mapped = true;
+	prtd->map_state = Q6ASM_MAP_CONFIRMED;
 	prtd->state = Q6ASM_STREAM_RUNNING;
 
 	return 0;
