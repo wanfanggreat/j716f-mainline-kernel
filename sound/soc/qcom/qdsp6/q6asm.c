@@ -24,6 +24,7 @@
 #include <linux/delay.h>
 #include <linux/slab.h>
 #include <linux/mm.h>
+#include <linux/string.h>
 #include "q6asm.h"
 #include "q6core.h"
 #include "q6dsp-errno.h"
@@ -453,10 +454,8 @@ struct q6asm_global {
 	q6asm_ssr_unregister_fn ssr_unregister;
 	unsigned long session_quarantine[BITS_TO_LONGS(MAX_SESSIONS + 1)];
 	struct list_head held_buffers;
-	struct notifier_block ssr_nb_lpass;
-	struct notifier_block ssr_nb_adsp;
-	struct srcu_notifier_head *ssr_head_lpass;
-	struct srcu_notifier_head *ssr_head_adsp;
+	struct notifier_block ssr_nb;
+	struct srcu_notifier_head *ssr_head;
 	bool adsp_offline;
 	bool reclaim_registered;
 	unsigned int leaked_buffers;
@@ -468,6 +467,9 @@ static struct q6asm_global q6asm_global = {
 	.held_buffers = LIST_HEAD_INIT(q6asm_global.held_buffers),
 	.adsp_offline = false,
 };
+
+/* SSR name the audio DSP registers on every supported remoteproc. */
+static const char q6asm_ssr_name[] = "lpass";
 
 #ifdef CONFIG_SND_SOC_QDSP6_ASM_FAULT_INJECT
 /*
@@ -651,13 +653,21 @@ EXPORT_SYMBOL_GPL(q6asm_dma_device_register);
  * conclude that the ADSP no longer accesses audio DMA memory.  Sessions
  * quarantined by a failed teardown become usable again here, not on a mere
  * driver rebind.
+ *
+ * The audio DSP is the "lpass" subsystem on every remoteproc descriptor that
+ * this driver serves.  Check the name carried by the event so a future alias
+ * cannot let an unrelated remote stop free audio DMA or clear isolation.
  */
 static int q6asm_ssr_notify(struct notifier_block *nb, unsigned long event,
 			    void *data)
 {
+	const struct qcom_ssr_notify_data *notify = data;
 	struct q6asm_held_buffer *held, *tmp;
 	unsigned int freed = 0, lost = 0;
 	size_t lost_bytes = 0;
+
+	if (!notify || !notify->name || strcmp(notify->name, q6asm_ssr_name))
+		return NOTIFY_DONE;
 
 	switch (event) {
 	case QCOM_SSR_AFTER_POWERUP:
@@ -696,11 +706,20 @@ static int q6asm_ssr_notify(struct notifier_block *nb, unsigned long event,
 	return NOTIFY_OK;
 }
 
+/*
+ * Registering and unregistering must not take q6asm_global.lock.  Removing
+ * an SRCU notifier waits for a callback that is already running, and that
+ * callback takes q6asm_global.lock to clear the quarantine; holding the
+ * state lock across the removal would therefore wait for itself.  A
+ * separate mutex serializes the two operations instead.
+ */
+static DEFINE_MUTEX(q6asm_reclaim_lock);
+
 static void q6asm_reclaim_register(void)
 {
 	struct srcu_notifier_head *head;
 
-	mutex_lock(&q6asm_global.lock);
+	mutex_lock(&q6asm_reclaim_lock);
 	if (q6asm_global.reclaim_registered)
 		goto out;
 
@@ -722,41 +741,42 @@ static void q6asm_reclaim_register(void)
 		}
 	}
 
-	q6asm_global.ssr_nb_lpass.notifier_call = q6asm_ssr_notify;
-	q6asm_global.ssr_nb_adsp.notifier_call = q6asm_ssr_notify;
+	q6asm_global.ssr_nb.notifier_call = q6asm_ssr_notify;
+	head = q6asm_global.ssr_register(q6asm_ssr_name,
+					 &q6asm_global.ssr_nb);
+	if (IS_ERR(head)) {
+		pr_err("q6asm: cannot follow %s stop events: %ld\n",
+		       q6asm_ssr_name, PTR_ERR(head));
+		/*
+		 * Nothing is registered, so no callback can be running and the
+		 * symbol references can be dropped again.  Isolation stays
+		 * fail-closed without them.
+		 */
+		symbol_put(qcom_register_ssr_notifier);
+		symbol_put(qcom_unregister_ssr_notifier);
+		q6asm_global.ssr_register = NULL;
+		q6asm_global.ssr_unregister = NULL;
+		goto out;
+	}
 
-	head = q6asm_global.ssr_register("lpass",
-					 &q6asm_global.ssr_nb_lpass);
-	if (IS_ERR(head))
-		pr_err("q6asm: cannot follow lpass stop events: %ld\n",
-		       PTR_ERR(head));
-	else
-		q6asm_global.ssr_head_lpass = head;
-
-	head = q6asm_global.ssr_register("adsp", &q6asm_global.ssr_nb_adsp);
-	if (IS_ERR(head))
-		pr_err("q6asm: cannot follow adsp stop events: %ld\n",
-		       PTR_ERR(head));
-	else
-		q6asm_global.ssr_head_adsp = head;
-
+	q6asm_global.ssr_head = head;
 	q6asm_global.reclaim_registered = true;
 out:
-	mutex_unlock(&q6asm_global.lock);
+	mutex_unlock(&q6asm_reclaim_lock);
 }
 
 static void q6asm_reclaim_unregister(void)
 {
-	mutex_lock(&q6asm_global.lock);
-	if (q6asm_global.ssr_head_lpass && q6asm_global.ssr_unregister) {
-		q6asm_global.ssr_unregister(q6asm_global.ssr_head_lpass,
-					    &q6asm_global.ssr_nb_lpass);
-		q6asm_global.ssr_head_lpass = NULL;
-	}
-	if (q6asm_global.ssr_head_adsp && q6asm_global.ssr_unregister) {
-		q6asm_global.ssr_unregister(q6asm_global.ssr_head_adsp,
-					    &q6asm_global.ssr_nb_adsp);
-		q6asm_global.ssr_head_adsp = NULL;
+	mutex_lock(&q6asm_reclaim_lock);
+	if (q6asm_global.reclaim_registered) {
+		/*
+		 * The removal waits for a running callback, which only needs
+		 * q6asm_global.lock, so it must not be held here.
+		 */
+		q6asm_global.ssr_unregister(q6asm_global.ssr_head,
+					    &q6asm_global.ssr_nb);
+		q6asm_global.ssr_head = NULL;
+		q6asm_global.reclaim_registered = false;
 	}
 	if (q6asm_global.ssr_register) {
 		symbol_put(qcom_register_ssr_notifier);
@@ -766,8 +786,7 @@ static void q6asm_reclaim_unregister(void)
 		symbol_put(qcom_unregister_ssr_notifier);
 		q6asm_global.ssr_unregister = NULL;
 	}
-	q6asm_global.reclaim_registered = false;
-	mutex_unlock(&q6asm_global.lock);
+	mutex_unlock(&q6asm_reclaim_lock);
 }
 
 static inline void q6asm_add_hdr(struct audio_client *ac, struct apr_hdr *hdr,
