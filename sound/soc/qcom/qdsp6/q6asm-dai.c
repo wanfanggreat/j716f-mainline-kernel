@@ -378,6 +378,8 @@ static void event_handler(const struct q6asm_client_event *event, void *priv)
 				xrun = prtd->started;
 			}
 			spin_unlock(&prtd->lock);
+			if (xrun)
+				snd_pcm_stop_xrun(substream);
 			break;
 		}
 		/*
