@@ -331,6 +331,8 @@ struct q6asm_cmd_rsp {
 	} async[Q6ASM_RSP_ASYNC_MAX];
 	/* Too many unanswered opcodes to track: refuse all new commands. */
 	bool overflow;
+	/* A CLOSE answer is owed but could not be recorded in the table. */
+	bool close_owed;
 	/* ADSP instance the retirements belong to; an SSR start voids them. */
 	u32 epoch;
 	bool pending;
@@ -481,6 +483,7 @@ enum q6asm_fault {
 	Q6ASM_FAULT_PAUSE,
 	Q6ASM_FAULT_PAUSE_REJECT,
 	Q6ASM_FAULT_RUN_REJECT,
+	Q6ASM_FAULT_DROP_MAP,
 };
 
 #ifdef CONFIG_SND_SOC_QDSP6_ASM_FAULT_INJECT
@@ -497,6 +500,7 @@ static const char *const q6asm_fault_names[] = {
 	[Q6ASM_FAULT_PAUSE] = "pause",
 	[Q6ASM_FAULT_PAUSE_REJECT] = "pausereject",
 	[Q6ASM_FAULT_RUN_REJECT] = "runreject",
+	[Q6ASM_FAULT_DROP_MAP] = "dropmap",
 };
 #endif
 
@@ -605,6 +609,27 @@ static u32 q6asm_fault_status_take(struct audio_client *ac, unsigned int fault,
 
 	return rc;
 }
+
+/* Swallow the next answer of @fault so the command runs into its timeout. */
+static bool q6asm_fault_drop(struct audio_client *ac, unsigned int fault)
+{
+	struct q6asm *a = ac->q6asm;
+	unsigned long flags;
+	bool drop = false;
+
+	spin_lock_irqsave(&a->slock, flags);
+	if (a->fault == fault) {
+		a->fault = Q6ASM_FAULT_NONE;
+		drop = true;
+	}
+	spin_unlock_irqrestore(&a->slock, flags);
+
+	if (drop)
+		dev_err(ac->dev, "J716F: injected %s drop on session %d\n",
+			q6asm_fault_names[fault], ac->session);
+
+	return drop;
+}
 #else
 static inline int q6asm_fault_take(struct audio_client *ac, unsigned int fault)
 {
@@ -615,6 +640,12 @@ static inline u32 q6asm_fault_status_take(struct audio_client *ac,
 					  unsigned int fault, u32 status)
 {
 	return 0;
+}
+
+static inline bool q6asm_fault_drop(struct audio_client *ac,
+				    unsigned int fault)
+{
+	return false;
 }
 #endif
 
@@ -755,12 +786,20 @@ static int q6asm_ssr_notify(struct notifier_block *nb, unsigned long event,
 	case QCOM_SSR_AFTER_POWERUP:
 		mutex_lock(&q6asm_global.lock);
 		q6asm_global.adsp_offline = false;
-		q6asm_global.ssr_epoch++;
+		WRITE_ONCE(q6asm_global.ssr_epoch,
+			   q6asm_global.ssr_epoch + 1);
 		mutex_unlock(&q6asm_global.lock);
 		break;
 	case QCOM_SSR_AFTER_SHUTDOWN:
 		mutex_lock(&q6asm_global.lock);
 		q6asm_global.adsp_offline = true;
+		/*
+		 * No answer from the stopped instance can arrive any more, so
+		 * its retirements are void from this point, not only once a
+		 * new instance powers up.
+		 */
+		WRITE_ONCE(q6asm_global.ssr_epoch,
+			   q6asm_global.ssr_epoch + 1);
 		bitmap_zero(q6asm_global.session_quarantine,
 			    MAX_SESSIONS + 1);
 		list_for_each_entry_safe(held, tmp, &q6asm_global.held_buffers,
@@ -918,7 +957,15 @@ static void q6asm_rsp_mark_stale_locked(struct q6asm_cmd_rsp *rsp, u32 opcode)
 	}
 
 	if (slot < 0) {
+		/*
+		 * The table cannot name the opcode, so the client stays
+		 * fail-closed until a confirmed CLOSE or a restart.  CLOSE
+		 * itself is let through by the arm path; remember that its
+		 * answer is also owed so a second CLOSE is not accepted.
+		 */
 		rsp->overflow = true;
+		if (opcode == ASM_STREAM_CMD_CLOSE)
+			rsp->close_owed = true;
 		return;
 	}
 	rsp->stale[slot] = opcode;
@@ -926,20 +973,11 @@ static void q6asm_rsp_mark_stale_locked(struct q6asm_cmd_rsp *rsp, u32 opcode)
 
 static bool q6asm_rsp_clear_stale_locked(struct q6asm_cmd_rsp *rsp, u32 opcode)
 {
-	int i, j;
+	int i;
 
 	for (i = 0; i < Q6ASM_RSP_STALE_MAX; i++) {
 		if (rsp->stale[i] == opcode) {
 			rsp->stale[i] = 0;
-			/*
-			 * The latch means "the table is full", not "it was
-			 * once full": once every owed answer has arrived the
-			 * client may send commands again.
-			 */
-			for (j = 0; j < Q6ASM_RSP_STALE_MAX; j++)
-				if (rsp->stale[j])
-					return true;
-			rsp->overflow = false;
 			return true;
 		}
 	}
@@ -1020,6 +1058,7 @@ static void q6asm_rsp_sync_epoch_locked(struct q6asm_cmd_rsp *rsp)
 		memset(rsp->stale, 0, sizeof(rsp->stale));
 		memset(rsp->async, 0, sizeof(rsp->async));
 		rsp->overflow = false;
+		rsp->close_owed = false;
 		rsp->epoch = epoch;
 	}
 }
@@ -1028,33 +1067,42 @@ static int q6asm_cmd_rsp_arm(struct audio_client *ac, u32 opcode)
 {
 	struct q6asm_cmd_rsp *rsp = &ac->rsp;
 	unsigned long flags;
-	int rc = 0;
+	int attempt, rc = -EIO;
 
-	spin_lock_irqsave(&rsp->lock, flags);
-	q6asm_rsp_sync_epoch_locked(rsp);
-	/*
-	 * CLOSE is the recovery path: allow it even when the table overflowed,
-	 * because a confirmed CLOSE retires every owed opcode.  A retired
-	 * CLOSE itself is still refused; its answer may never arrive and the
-	 * caller quarantines the session instead.
-	 */
-	if ((rsp->overflow && opcode != ASM_STREAM_CMD_CLOSE) ||
-	    q6asm_rsp_stale_locked(rsp, opcode) ||
-	    q6asm_rsp_async_locked(rsp, opcode)) {
+	for (attempt = 0; attempt < 2; attempt++) {
+		spin_lock_irqsave(&rsp->lock, flags);
+		q6asm_rsp_sync_epoch_locked(rsp);
 		/*
-		 * An answer for this opcode is still owed (or its owner can
-		 * no longer be told apart), so a new command must not reuse
-		 * the opcode: the late response would complete it.
+		 * CLOSE is the recovery path: allow it even when the table
+		 * overflowed, because a confirmed CLOSE retires every owed
+		 * opcode.  A CLOSE whose own answer is owed (recorded or not)
+		 * is still refused; the caller quarantines the session then.
 		 */
-		rc = -EIO;
-	} else {
-		rsp->opcode = opcode;
-		rsp->status = 0;
-		rsp->handle = 0;
-		rsp->done = false;
-		rsp->pending = true;
+		if ((rsp->overflow && opcode != ASM_STREAM_CMD_CLOSE) ||
+		    (opcode == ASM_STREAM_CMD_CLOSE && rsp->close_owed) ||
+		    q6asm_rsp_stale_locked(rsp, opcode) ||
+		    q6asm_rsp_async_locked(rsp, opcode)) {
+			rc = -EIO;
+		} else {
+			rsp->opcode = opcode;
+			rsp->status = 0;
+			rsp->handle = 0;
+			rsp->done = false;
+			rsp->pending = true;
+			rc = 0;
+		}
+		spin_unlock_irqrestore(&rsp->lock, flags);
+
+		/*
+		 * A restart between the epoch sync and the checks would make a
+		 * void retirement reject a command the new instance never saw.
+		 * Retry once; the loop is bounded so a restart storm cannot
+		 * spin here.
+		 */
+		if (!rc || READ_ONCE(q6asm_global.ssr_epoch) ==
+			   READ_ONCE(rsp->epoch))
+			break;
 	}
-	spin_unlock_irqrestore(&rsp->lock, flags);
 
 	return rc;
 }
@@ -1084,6 +1132,7 @@ static void q6asm_cmd_rsp_forget_stream(struct audio_client *ac)
 	memset(rsp->stale, 0, sizeof(rsp->stale));
 	memset(rsp->async, 0, sizeof(rsp->async));
 	rsp->overflow = false;
+	rsp->close_owed = false;
 	rsp->epoch = READ_ONCE(q6asm_global.ssr_epoch);
 	spin_unlock_irqrestore(&rsp->lock, flags);
 }
@@ -1105,6 +1154,9 @@ static enum q6asm_rsp_owner q6asm_cmd_rsp_claim(struct audio_client *ac,
 	bool late = false, unowned = false;
 
 	spin_lock_irqsave(&rsp->lock, flags);
+	/* Any answer for CLOSE proves one close command was executed. */
+	if (opcode == ASM_STREAM_CMD_CLOSE)
+		rsp->close_owed = false;
 	if (rsp->pending && rsp->opcode == opcode) {
 		rsp->status = status;
 		rsp->handle = handle;
@@ -1206,12 +1258,17 @@ static int q6asm_send_cmd_sync(struct audio_client *ac, struct apr_pkt *pkt,
 		*handle = rsp->handle;
 	if (!done) {
 		rsp->pending = false;
-		/*
-		 * A restart during the wait means the answer will never
-		 * arrive; the opcode is not owed by the new instance.
-		 */
-		if (rsp->epoch == READ_ONCE(q6asm_global.ssr_epoch))
+		if (rsp->epoch == READ_ONCE(q6asm_global.ssr_epoch)) {
 			q6asm_rsp_mark_stale_locked(rsp, expected);
+		} else {
+			/*
+			 * The instance changed while the command was in
+			 * flight: it may have been received by either one.
+			 * Refuse further commands with unknown answers until
+			 * a CLOSE proves the stream's state.
+			 */
+			rsp->overflow = true;
+		}
 	}
 	spin_unlock_irqrestore(&rsp->lock, flags);
 
@@ -2125,6 +2182,8 @@ static int q6asm_srvc_callback(struct apr_device *adev,
 		}
 		break;
 	case ASM_CMDRSP_SHARED_MEM_MAP_REGIONS:
+		if (q6asm_fault_drop(ac, Q6ASM_FAULT_DROP_MAP))
+			break;
 		if (data->payload_size < sizeof(u32))
 			break;
 		q6asm_cmd_rsp_claim(ac, ASM_CMD_SHARED_MEM_MAP_REGIONS, 0,
@@ -3119,7 +3178,8 @@ static void q6asm_inject_completion(struct q6asm *a, bool fresh)
 		phys_addr_t phys;
 		u32 generation;
 
-		if (!port->buf || !port->submit || !port->num_periods)
+		if (!READ_ONCE(port->buf) || !READ_ONCE(port->submit) ||
+		    !READ_ONCE(port->num_periods))
 			continue;
 		spin_lock_irqsave(&ac->lock, flags);
 		/* Re-check under the lock: release clears both pointers. */
@@ -3277,6 +3337,10 @@ static ssize_t inject_fault_store(struct device *dev,
 		q6asm_inject_completion(q6asm, true);
 		return count;
 	}
+	if (sysfs_streq(buf, "dropmap")) {
+		fault = Q6ASM_FAULT_DROP_MAP;
+		goto store;
+	}
 
 	colon = strchr(buf, ':');
 	if (!colon)
@@ -3296,7 +3360,7 @@ static ssize_t inject_fault_store(struct device *dev,
 	memcpy(kind, colon, len);
 	kind[len] = '\0';
 
-	for (i = Q6ASM_FAULT_MAP; i <= Q6ASM_FAULT_RUN_REJECT; i++)
+	for (i = Q6ASM_FAULT_MAP; i <= Q6ASM_FAULT_DROP_MAP; i++)
 		if (sysfs_streq(op, q6asm_fault_names[i]))
 			fault = i;
 	if (fault == Q6ASM_FAULT_NONE)
