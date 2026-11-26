@@ -1075,11 +1075,6 @@ static int32_t q6asm_stream_callback(struct apr_device *adev,
 			port =  &ac->port[SNDRV_PCM_STREAM_CAPTURE];
 			if (!port->buf || hdr->token >= port->num_periods ||
 			    data->payload_size < sizeof(*done) || done->status) {
-				pr_info_ratelimited("J716F-READ-DONE: dropped token=%u payload=%u status=%u have_buf=%d\n",
-						    hdr->token, data->payload_size,
-						    data->payload_size >= sizeof(*done) ?
-						    done->status : ~0U,
-						    port->buf ? 1 : 0);
 				ret = 0;
 				goto done;
 			}

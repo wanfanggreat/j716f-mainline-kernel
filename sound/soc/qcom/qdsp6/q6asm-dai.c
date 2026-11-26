@@ -265,8 +265,6 @@ static void event_handler(uint32_t opcode, uint32_t token,
 					break;
 				}
 			}
-			pr_info_ratelimited("J716F-CAP: run posted prtd=%p inflight=%u periods=%u\n",
-					    prtd, prtd->reads_inflight, prtd->periods);
 		}
 		break;
 	case ASM_CLIENT_EVENT_CMD_EOS_DONE:
@@ -280,10 +278,6 @@ static void event_handler(uint32_t opcode, uint32_t token,
 	case ASM_CLIENT_EVENT_DATA_READ_DONE: {
 		int rerr;
 
-		pr_info_ratelimited("J716F-CAP: read done prtd=%p token=%u state=%d inflight=%u periods=%u started=%d\n",
-				    prtd, token, READ_ONCE(prtd->state),
-				    prtd->reads_inflight, prtd->periods,
-				    prtd->capture_started);
 		/*
 		 * ACP re-prepares a running capture stream.  The old session's
 		 * READ completions can arrive after the teardown but before the
@@ -292,8 +286,6 @@ static void event_handler(uint32_t opcode, uint32_t token,
 		 * the queue "full" and the new stream never got its own reads.
 		 */
 		if (!prtd->capture_started) {
-			pr_info_ratelimited("J716F-CAP: late read done ignored token=%u\n",
-					    token);
 			break;
 		}
 		snd_pcm_period_elapsed(substream);
@@ -312,9 +304,6 @@ static void event_handler(uint32_t opcode, uint32_t token,
 			rerr = q6asm_read(prtd->audio_client, prtd->stream_id);
 			if (rerr) {
 				prtd->reads_inflight--;
-				pr_info_ratelimited("J716F-CAP: requeue failed %d state=%d inflight=%u\n",
-						    rerr, READ_ONCE(prtd->state),
-						    prtd->reads_inflight);
 				break;
 			}
 		}
@@ -458,9 +447,6 @@ static int q6asm_dai_prepare(struct snd_soc_component *component,
 		return -EIO;
 	}
 
-	pr_info_ratelimited("J716F-CAP: prepare prtd=%p state=%d inflight=%u pending=%d opened=%d\n",
-			    prtd, READ_ONCE(prtd->state), prtd->reads_inflight,
-			    prtd->reads_pending, prtd->stream_opened);
 
 	/*
 	 * Lenovo J716F: keep pcm_count consistent with the period size that is
@@ -619,9 +605,6 @@ static int q6asm_dai_prepare(struct snd_soc_component *component,
 		 */
 		prtd->capture_started = true;
 
-		pr_info_ratelimited("J716F-CAP: run prtd=%p sid=%d inflight=%u state=%d\n",
-				    prtd, prtd->session_id, prtd->reads_inflight,
-				    READ_ONCE(prtd->state));
 		ret = q6asm_run(prtd->audio_client, prtd->stream_id, 0, 0, 0);
 		if (ret) {
 			dev_err(dev, "capture run failed %d\n", ret);
