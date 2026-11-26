@@ -47,6 +47,8 @@ struct q6copp {
 	int acdb_id;
 	/* DEVICE_OPEN succeeded; only then is DEVICE_CLOSE meaningful. */
 	bool opened;
+	/* The CMDRSP delivered the COPP id; the basic ACK alone does not. */
+	bool id_valid;
 
 	struct aprv2_ibasic_rsp_result_t result;
 	struct kref refcount;
@@ -128,8 +130,18 @@ static int q6adm_apr_send_copp_pkt(struct q6adm *adm, struct q6copp *copp,
 		goto err;
 	}
 
-	/* Wait for the callback with copp id */
-	if (rsp_opcode)
+	/*
+	 * DEVICE_OPEN returns a basic ACK and a CMDRSP that carries the COPP
+	 * id.  The ACK only says the command was accepted; returning on it
+	 * would let the caller map a route with an id the DSP never assigned.
+	 * Wait for the id, or for a rejection.
+	 */
+	if (rsp_opcode == ADM_CMDRSP_DEVICE_OPEN_V5)
+		ret = wait_event_timeout(copp->wait,
+					 copp->id_valid ||
+					 copp->result.status > 0,
+					 msecs_to_jiffies(TIMEOUT_MS));
+	else if (rsp_opcode)
 		ret = wait_event_timeout(copp->wait,
 					 (copp->result.opcode == opcode) ||
 					 (copp->result.opcode == rsp_opcode),
@@ -177,7 +189,7 @@ static void q6adm_free_copp(struct kref *ref)
 	unsigned long flags;
 	int ret;
 
-	if (c->opened) {
+	if (c->opened && c->id_valid) {
 		ret = q6adm_device_close(adm, c, c->afe_port, c->copp_idx);
 		if (ret < 0)
 			dev_err(adm->dev, "Failed to close copp %d\n", ret);
@@ -291,6 +303,7 @@ static int q6adm_callback(struct apr_device *adev, const struct apr_resp_pkt *da
 		}
 		copp->result.opcode = hdr->opcode;
 		copp->id = open->copp_id;
+		copp->id_valid = true;
 		wake_up(&copp->wait);
 		kref_put(&copp->refcount, q6adm_free_copp);
 	}
@@ -559,8 +572,8 @@ int q6adm_matrix_map(struct device *dev, int path,
 		if (!copp)
 			return -EINVAL;
 
-		if (!copp->id) {
-			/* The DEVICE_OPEN response has not arrived yet. */
+		if (!copp->id_valid) {
+			/* The DEVICE_OPEN CMDRSP has not arrived yet. */
 			kref_put(&copp->refcount, q6adm_free_copp);
 			return -EAGAIN;
 		}
@@ -593,6 +606,8 @@ int q6adm_matrix_map(struct device *dev, int path,
 		ret = -EINVAL;
 		goto fail_cmd;
 	}
+	/* wait_event_timeout() returns the remaining jiffies, not success. */
+	ret = 0;
 
 fail_cmd:
 	mutex_unlock(&adm->lock);
