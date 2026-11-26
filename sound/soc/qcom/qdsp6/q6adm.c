@@ -49,6 +49,8 @@ struct q6copp {
 	bool opened;
 	/* The CMDRSP delivered the COPP id; the basic ACK alone does not. */
 	bool id_valid;
+	/* Opcode of the command currently waiting on copp->wait, or 0. */
+	u32 pending_opcode;
 
 	struct aprv2_ibasic_rsp_result_t result;
 	struct kref refcount;
@@ -123,11 +125,16 @@ static int q6adm_apr_send_copp_pkt(struct q6adm *adm, struct q6copp *copp,
 				   struct apr_pkt *pkt)
 {
 	struct device *dev = adm->dev;
+	unsigned long flags;
 	int ret;
 
 	mutex_lock(&adm->lock);
+	spin_lock_irqsave(&adm->copps_list_lock, flags);
 	copp->result.opcode = 0;
 	copp->result.status = 0;
+	copp->pending_opcode = pkt->hdr.opcode;
+	spin_unlock_irqrestore(&adm->copps_list_lock, flags);
+
 	ret = apr_send_pkt(adm->apr, pkt);
 	if (ret < 0) {
 		dev_err(dev, "Failed to send APR packet\n");
@@ -166,6 +173,9 @@ static int q6adm_apr_send_copp_pkt(struct q6adm *adm, struct q6copp *copp,
 	}
 
 err:
+	spin_lock_irqsave(&adm->copps_list_lock, flags);
+	copp->pending_opcode = 0;
+	spin_unlock_irqrestore(&adm->copps_list_lock, flags);
 	mutex_unlock(&adm->lock);
 	return ret;
 }
@@ -287,7 +297,7 @@ static int q6adm_callback(struct apr_device *adev, const struct apr_resp_pkt *da
 			 */
 			spin_lock_irqsave(&adm->copps_list_lock, flags);
 			copp = q6adm_peek_copp(adm, port_idx, copp_idx);
-			if (copp) {
+			if (copp && copp->pending_opcode == result->opcode) {
 				copp->result = *result;
 				wake_up(&copp->wait);
 			}
@@ -331,9 +341,9 @@ static int q6adm_callback(struct apr_device *adev, const struct apr_resp_pkt *da
 
 		spin_lock_irqsave(&adm->copps_list_lock, flags);
 		copp = q6adm_peek_copp(adm, port_idx, copp_idx);
-		if (!copp) {
+		if (!copp || copp->pending_opcode != ADM_CMD_DEVICE_OPEN_V5) {
 			dev_warn_ratelimited(&adev->dev,
-					     "DEVICE_OPEN rsp for unknown COPP %d:%d\n",
+					     "unexpected DEVICE_OPEN rsp for COPP %d:%d\n",
 					     port_idx, copp_idx);
 			spin_unlock_irqrestore(&adm->copps_list_lock, flags);
 			return 0;
