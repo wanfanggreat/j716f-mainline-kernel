@@ -14,6 +14,7 @@
 #include <linux/slab.h>
 #include <linux/soc/qcom/apr.h>
 #include <linux/wait.h>
+#include <linux/workqueue.h>
 #include <sound/asound.h>
 #include "q6adm.h"
 #include "q6afe.h"
@@ -51,7 +52,7 @@ struct q6copp {
 	bool acked;
 	/* Generation carried in the token; rejects older COPP's responses. */
 	u8 gen;
-	/* Opcode of the command currently waiting on copp->wait, or 0. */
+	/* Opcode of the DEVICE_OPEN waiting on copp->wait, or 0. */
 	u32 pending_opcode;
 
 	struct aprv2_ibasic_rsp_result_t result;
@@ -61,13 +62,37 @@ struct q6copp {
 	struct q6adm *adm;
 };
 
+/*
+ * A DEVICE_CLOSE outlives the COPP it closes: the object is already off the
+ * list and about to be freed when the command is queued.  Copy everything
+ * the command and its response need, and confirm it from a workqueue worker
+ * so the single-threaded APR RX worker never waits for a response it has to
+ * deliver itself.
+ */
+struct q6adm_close_req {
+	struct work_struct work;
+	struct q6adm *adm;
+	struct list_head node;
+	wait_queue_head_t wait;
+	int afe_port;
+	int copp_idx;
+	int copp_id;
+	u8 gen;
+	bool acked;
+	u32 status;
+};
+
 struct q6adm {
 	struct apr_device *apr;
 	struct device *dev;
 	struct q6core_svc_api_info ainfo;
 	unsigned long copp_bitmap[AFE_MAX_PORTS];
 	struct list_head copps_list;
+	/* COPP close commands waiting for their basic result. */
+	struct list_head closing;
 	spinlock_t copps_list_lock;
+	struct workqueue_struct *close_wq;
+	unsigned int closes_unconfirmed;
 	struct aprv2_ibasic_rsp_result_t result;
 	/*
 	 * Protects result/map_pending: the RX worker must not complete a
@@ -187,28 +212,143 @@ err:
 	return ret;
 }
 
-static int q6adm_device_close(struct q6adm *adm, struct q6copp *copp)
+#define Q6ADM_CLOSE_RETRIES	3
+#define Q6ADM_CLOSE_RETRY_MS	20
+
+static int q6adm_send_close(struct q6adm *adm, const struct q6adm_close_req *req)
 {
-	struct apr_pkt close;
+	struct apr_pkt close = { };
 
 	close.hdr.hdr_field = APR_HDR_FIELD(APR_MSG_TYPE_SEQ_CMD,
-					APR_HDR_LEN(APR_HDR_SIZE),
-					APR_PKT_VER);
+					    APR_HDR_LEN(APR_HDR_SIZE),
+					    APR_PKT_VER);
 	close.hdr.pkt_size = sizeof(close);
-	close.hdr.src_port = copp->afe_port;
-	close.hdr.dest_port = copp->id;
-	close.hdr.token = copp->afe_port << 16 | copp->copp_idx;
+	close.hdr.src_port = req->afe_port;
+	close.hdr.dest_port = req->copp_id;
+	close.hdr.token = req->afe_port << 16 | req->copp_idx;
 	if (adm->token_gen)
-		close.hdr.token |= copp->gen << 8;
+		close.hdr.token |= req->gen << 8;
 	close.hdr.opcode = ADM_CMD_DEVICE_CLOSE_V5;
 
-	/*
-	 * Fire and forget.  This runs from the kref destructor, which can be
-	 * the single-threaded APR RX worker; waiting for the basic ACK there
-	 * would block the worker that has to deliver it.  rpmsg_trysend()
-	 * copies the packet, so the stack buffer is safe.
-	 */
 	return apr_send_pkt(adm->apr, &close);
+}
+
+/*
+ * Runs outside the APR RX worker.  A send that failed never reached the DSP,
+ * so retrying it is safe and bounded.  A send that succeeded is only ever
+ * sent once: the first copy may already have closed the COPP, and a second
+ * one would either be an error or, worse, close a recycled COPP id.
+ */
+static void q6adm_close_work(struct work_struct *work)
+{
+	struct q6adm_close_req *req = container_of(work,
+						   struct q6adm_close_req,
+						   work);
+	struct q6adm *adm = req->adm;
+	unsigned long flags;
+	bool acked;
+	u32 status;
+	int attempt, ret = -EIO;
+
+	for (attempt = 0; attempt < Q6ADM_CLOSE_RETRIES; attempt++) {
+		ret = q6adm_send_close(adm, req);
+		if (ret >= 0)
+			break;
+		msleep(Q6ADM_CLOSE_RETRY_MS);
+	}
+
+	if (ret < 0) {
+		dev_warn_ratelimited(adm->dev,
+				     "COPP %d:%d close not sent after %d attempts: %d\n",
+				     req->afe_port, req->copp_idx,
+				     Q6ADM_CLOSE_RETRIES, ret);
+		goto out;
+	}
+
+	if (!adm->token_gen)
+		goto out;
+
+	/* The packet is on the wire; wait for the DSP's answer, never resend. */
+	wait_event_timeout(req->wait, READ_ONCE(req->acked),
+			   msecs_to_jiffies(TIMEOUT_MS));
+
+	spin_lock_irqsave(&adm->copps_list_lock, flags);
+	acked = req->acked;
+	status = req->status;
+	if (!acked)
+		adm->closes_unconfirmed++;
+	spin_unlock_irqrestore(&adm->copps_list_lock, flags);
+
+	if (!acked) {
+		dev_warn_ratelimited(adm->dev,
+				     "COPP %d:%d close unconfirmed (%u so far)\n",
+				     req->afe_port, req->copp_idx,
+				     READ_ONCE(adm->closes_unconfirmed));
+	} else if (status) {
+		dev_err_ratelimited(adm->dev,
+				    "COPP %d:%d close rejected: %u\n",
+				    req->afe_port, req->copp_idx, status);
+	}
+
+out:
+	spin_lock_irqsave(&adm->copps_list_lock, flags);
+	list_del(&req->node);
+	spin_unlock_irqrestore(&adm->copps_list_lock, flags);
+	kfree(req);
+}
+
+/* Caller holds no lock; the request copies everything it needs. */
+static void q6adm_schedule_close(struct q6adm *adm, struct q6copp *copp)
+{
+	struct q6adm_close_req *req;
+	unsigned long flags;
+
+	req = kzalloc_obj(*req, GFP_ATOMIC);
+	if (!req) {
+		dev_warn_ratelimited(adm->dev,
+				     "COPP %d:%d left open: no memory to close it\n",
+				     copp->afe_port, copp->copp_idx);
+		return;
+	}
+
+	INIT_WORK(&req->work, q6adm_close_work);
+	init_waitqueue_head(&req->wait);
+	req->adm = adm;
+	req->afe_port = copp->afe_port;
+	req->copp_idx = copp->copp_idx;
+	req->copp_id = copp->id;
+	req->gen = copp->gen;
+
+	spin_lock_irqsave(&adm->copps_list_lock, flags);
+	list_add_tail(&req->node, &adm->closing);
+	spin_unlock_irqrestore(&adm->copps_list_lock, flags);
+
+	if (!queue_work(adm->close_wq, &req->work)) {
+		spin_lock_irqsave(&adm->copps_list_lock, flags);
+		list_del(&req->node);
+		spin_unlock_irqrestore(&adm->copps_list_lock, flags);
+		kfree(req);
+	}
+}
+
+/* Caller holds copps_list_lock. */
+static void q6adm_close_ack_locked(struct q6adm *adm, int port_idx,
+				   int copp_idx, u8 gen, u32 status)
+{
+	struct q6adm_close_req *req;
+
+	if (!adm->token_gen)
+		return;
+
+	list_for_each_entry(req, &adm->closing, node) {
+		if (req->afe_port == port_idx && req->copp_idx == copp_idx &&
+		    req->gen == gen) {
+			req->status = status;
+			req->acked = true;
+			wake_up(&req->wait);
+			break;
+		}
+	}
 }
 
 static void q6adm_free_copp(struct kref *ref)
@@ -216,35 +356,23 @@ static void q6adm_free_copp(struct kref *ref)
 	struct q6copp *c = container_of(ref, struct q6copp, refcount);
 	struct q6adm *adm = c->adm;
 	unsigned long flags;
-	int ret;
 
 	/*
 	 * Delist before any remote cleanup.  A lookup that finds a COPP with
-	 * a zero refcount must not be able to take a reference to it, and the
-	 * close no longer needs the list entry to find its response.
+	 * a zero refcount must not be able to take a reference to it.
 	 */
 	spin_lock_irqsave(&adm->copps_list_lock, flags);
 	list_del(&c->node);
 	spin_unlock_irqrestore(&adm->copps_list_lock, flags);
 
 	if (c->id_valid) {
-		ret = q6adm_device_close(adm, c);
-		if (ret < 0) {
-			dev_err(adm->dev, "Failed to close copp %d: %d\n",
-				c->copp_idx, ret);
-			/*
-			 * The command never left the host; the DSP COPP stays
-			 * until the ADSP restarts.  Counted by its warning.
-			 */
-			dev_warn_ratelimited(adm->dev,
-					     "COPP %d left open on the DSP: close send failed\n",
-					     c->copp_idx);
-		}
+		q6adm_schedule_close(adm, c);
 	} else if (c->acked) {
 		/*
 		 * The DSP accepted DEVICE_OPEN but its CMDRSP never reached
 		 * us.  There is no id to close with, so the COPP stays until
-		 * the ADSP restarts.
+		 * the ADSP restarts; this is a protocol limitation, not a
+		 * host resource leak.
 		 */
 		dev_warn_ratelimited(adm->dev,
 				     "COPP %d left open on the DSP: acked without an id\n",
@@ -252,8 +380,11 @@ static void q6adm_free_copp(struct kref *ref)
 	}
 
 	/*
-	 * Keep the index reserved until the close packet is queued, so a new
-	 * DEVICE_OPEN cannot overtake the close for the same token.
+	 * The index may be reused once the COPP is off the list.  A late
+	 * CLOSE answer is matched by the index-and-generation token of the
+	 * close request, so a new COPP with another generation cannot
+	 * consume it (the byte can alias after 256 allocations, which is
+	 * bounded by the close timeout and only misaccounts a log line).
 	 */
 	spin_lock_irqsave(&adm->copps_list_lock, flags);
 	clear_bit(c->copp_idx, &adm->copp_bitmap[c->afe_port]);
@@ -328,6 +459,13 @@ static int q6adm_callback(struct apr_device *adev, const struct apr_resp_pkt *da
 				    !result->status)
 					copp->acked = true;
 				wake_up(&copp->wait);
+			} else if (result->opcode == ADM_CMD_DEVICE_CLOSE_V5) {
+				/*
+				 * The COPP itself is already off the list; the
+				 * close request outlives it.
+				 */
+				q6adm_close_ack_locked(adm, port_idx, copp_idx,
+						       gen, result->status);
 			}
 			spin_unlock_irqrestore(&adm->copps_list_lock, flags);
 			break;
@@ -752,7 +890,19 @@ static int q6adm_probe(struct apr_device *adev)
 	init_waitqueue_head(&adm->matrix_map_wait);
 
 	INIT_LIST_HEAD(&adm->copps_list);
+	INIT_LIST_HEAD(&adm->closing);
 	spin_lock_init(&adm->copps_list_lock);
+
+	/*
+	 * Ordered so the closes leave in the order the COPPs were released
+	 * and one of them cannot be mistaken for another by the DSP.  The
+	 * devres release destroys (and thereby flushes) the queue before adm
+	 * is freed, so a pending worker never dereferences a dead adm.
+	 */
+	adm->close_wq = devm_alloc_ordered_workqueue(dev, "q6adm_close",
+						     WQ_MEM_RECLAIM);
+	if (!adm->close_wq)
+		return -ENOMEM;
 
 	return devm_of_platform_populate(dev);
 }
