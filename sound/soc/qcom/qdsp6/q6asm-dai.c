@@ -349,18 +349,27 @@ static bool q6asm_dai_stale_event(struct q6asm_dai_rtd *prtd,
 
 /*
  * Force the stream into XRUN.  snd_pcm_stop_xrun() only acts on a running
- * stream, but a pause the DSP rejected leaves ALSA in PAUSED; there it
- * returns without changing anything and the application would stay blocked
- * in snd_pcm_resume().  From any other state, set the state explicitly
- * (the core only issues a STOP trigger for a running stream, so no extra
- * stop command is sent here).
+ * stream, but a pause the DSP rejected leaves ALSA in PAUSED and a failure
+ * can arrive while the START trigger is still between its state change and
+ * its wakeup.  snd_pcm_stop() must be called with the stream lock held (the
+ * core's __snd_pcm_xrun does exactly that), so take it here and set XRUN
+ * from every state where the stream is still live.  SUSPENDED, SETUP and
+ * DISCONNECTED are left alone: forcing XRUN there would turn a system
+ * suspend or a removed device into a recoverable stream.
  */
 static void q6asm_dai_abort_stream(struct snd_pcm_substream *substream)
 {
-	if (snd_pcm_running(substream))
-		snd_pcm_stop_xrun(substream);
-	else
+	unsigned long flags;
+	snd_pcm_state_t state;
+
+	snd_pcm_stream_lock_irqsave(substream, flags);
+	state = substream->runtime->state;
+	if (state == SNDRV_PCM_STATE_RUNNING ||
+	    state == SNDRV_PCM_STATE_DRAINING ||
+	    state == SNDRV_PCM_STATE_PREPARED ||
+	    state == SNDRV_PCM_STATE_PAUSED)
 		snd_pcm_stop(substream, SNDRV_PCM_STATE_XRUN);
+	snd_pcm_stream_unlock_irqrestore(substream, flags);
 }
 
 static void event_handler(const struct q6asm_client_event *event, void *priv)
@@ -1136,10 +1145,13 @@ static int q6asm_dai_trigger(struct snd_soc_component *component,
 		int prc = 0;
 
 		/*
-		 * Keep prtd->lock across the state change, the (atomic) send
-		 * and the rollback.  Otherwise RUN_DONE can observe PAUSING
-		 * between the change and a failed send, be discarded, and
-		 * leave the stream in STARTING with no completion left.
+		 * Keep prtd->lock across the state change, the send and the
+		 * rollback.  Otherwise RUN_DONE can observe PAUSING between
+		 * the change and a failed send, be discarded, and leave the
+		 * stream in STARTING with no completion left.  The send does
+		 * not sleep on this board's APR transport (GLINK trysend only
+		 * takes spinlocks and returns -EAGAIN); it is not claimed to
+		 * be sleepable-safe on a virtio-rpmsg transport.
 		 */
 		spin_lock(&prtd->lock);
 		old = prtd->state;
