@@ -45,6 +45,8 @@ struct q6copp {
 	int channels;
 	int app_type;
 	int acdb_id;
+	/* DEVICE_OPEN succeeded; only then is DEVICE_CLOSE meaningful. */
+	bool opened;
 
 	struct aprv2_ibasic_rsp_result_t result;
 	struct kref refcount;
@@ -175,15 +177,30 @@ static void q6adm_free_copp(struct kref *ref)
 	unsigned long flags;
 	int ret;
 
-	ret = q6adm_device_close(adm, c, c->afe_port, c->copp_idx);
-	if (ret < 0)
-		dev_err(adm->dev, "Failed to close copp %d\n", ret);
+	if (c->opened) {
+		ret = q6adm_device_close(adm, c, c->afe_port, c->copp_idx);
+		if (ret < 0)
+			dev_err(adm->dev, "Failed to close copp %d\n", ret);
+	}
 
 	spin_lock_irqsave(&adm->copps_list_lock, flags);
 	clear_bit(c->copp_idx, &adm->copp_bitmap[c->afe_port]);
 	list_del(&c->node);
 	spin_unlock_irqrestore(&adm->copps_list_lock, flags);
 	kfree(c);
+}
+
+/* Caller holds copps_list_lock; no reference is taken. */
+static struct q6copp *q6adm_peek_copp(struct q6adm *adm, int port_idx,
+				      int copp_idx)
+{
+	struct q6copp *c;
+
+	list_for_each_entry(c, &adm->copps_list, node)
+		if (c->afe_port == port_idx && c->copp_idx == copp_idx)
+			return c;
+
+	return NULL;
 }
 
 static int q6adm_callback(struct apr_device *adev, const struct apr_resp_pkt *data)
@@ -194,7 +211,7 @@ static int q6adm_callback(struct apr_device *adev, const struct apr_resp_pkt *da
 	struct q6copp *copp;
 	struct q6adm *adm = dev_get_drvdata(&adev->dev);
 
-	if (!data->payload_size)
+	if (data->payload_size < sizeof(u32))
 		return 0;
 
 	copp_idx = (hdr->token) & 0XFF;
@@ -212,6 +229,10 @@ static int q6adm_callback(struct apr_device *adev, const struct apr_resp_pkt *da
 
 	switch (hdr->opcode) {
 	case APR_BASIC_RSP_RESULT: {
+		unsigned long flags;
+
+		if (data->payload_size < sizeof(*result))
+			return -EPROTO;
 		if (result->status != 0) {
 			dev_err(&adev->dev, "cmd = 0x%x return error = 0x%x\n",
 				result->opcode, result->status);
@@ -219,13 +240,19 @@ static int q6adm_callback(struct apr_device *adev, const struct apr_resp_pkt *da
 		switch (result->opcode) {
 		case ADM_CMD_DEVICE_OPEN_V5:
 		case ADM_CMD_DEVICE_CLOSE_V5:
-			list_for_each_entry(copp, &adm->copps_list, node) {
-				if ((port_idx == copp->afe_port) && (copp_idx == copp->copp_idx)) {
-					copp->result = *result;
-					wake_up(&copp->wait);
-					break;
-				}
+			/*
+			 * The opener or the kref destructor is sleeping on
+			 * copp->wait; it keeps the object alive.  Publish the
+			 * result and wake while the list lock is held so a
+			 * timed-out waiter cannot free it in between.
+			 */
+			spin_lock_irqsave(&adm->copps_list_lock, flags);
+			copp = q6adm_peek_copp(adm, port_idx, copp_idx);
+			if (copp) {
+				copp->result = *result;
+				wake_up(&copp->wait);
 			}
+			spin_unlock_irqrestore(&adm->copps_list_lock, flags);
 			break;
 		case ADM_CMD_MATRIX_MAP_ROUTINGS_V5:
 			adm->result = *result;
@@ -246,14 +273,18 @@ static int q6adm_callback(struct apr_device *adev, const struct apr_resp_pkt *da
 			u16 reserved;
 		} __packed *open = data->payload;
 
+		if (data->payload_size < sizeof(*open))
+			return -EPROTO;
+
 		copp = q6adm_find_copp(adm, port_idx, copp_idx);
 		if (!copp)
 			return 0;
 
-		if (open->copp_id == INVALID_COPP_ID) {
-			dev_err(&adev->dev, "Invalid coppid rxed %d\n",
-				open->copp_id);
-			copp->result.status = ADSP_EBADPARAM;
+		if (open->status || open->copp_id == INVALID_COPP_ID) {
+			dev_err(&adev->dev, "Invalid copp open rsp: status %u id %u\n",
+				open->status, open->copp_id);
+			copp->result.status = open->status ?
+				open->status : ADSP_EBADPARAM;
 			wake_up(&copp->wait);
 			kref_put(&copp->refcount, q6adm_free_copp);
 			break;
@@ -313,9 +344,11 @@ static struct q6copp *q6adm_find_matching_copp(struct q6adm *adm,
 	list_for_each_entry(c, &adm->copps_list, node) {
 		if ((port_id == c->afe_port) && (topology == c->topology) &&
 		    (mode == c->mode) && (rate == c->rate) &&
+		    (channel_mode == c->channels) &&
 		    (bit_width == c->bit_width) && (app_type == c->app_type)) {
 			ret = c;
 			kref_get(&c->refcount);
+			break;
 		}
 	}
 	spin_unlock_irqrestore(&adm->copps_list_lock, flags);
@@ -406,9 +439,10 @@ struct q6copp *q6adm_open(struct device *dev, int port_id, int path, int rate,
 		return ERR_CAST(copp);
 	}
 
-	list_add_tail(&copp->node, &adm->copps_list);
-	spin_unlock_irqrestore(&adm->copps_list_lock, flags);
-
+	/*
+	 * Publish a fully initialised object: a concurrent lookup must never
+	 * see a zero refcount or half-written match keys.
+	 */
 	kref_init(&copp->refcount);
 	copp->topology = topology;
 	copp->mode = perf_mode;
@@ -416,10 +450,21 @@ struct q6copp *q6adm_open(struct device *dev, int port_id, int path, int rate,
 	copp->channels = channel_mode;
 	copp->bit_width = bit_width;
 	copp->app_type = app_type;
+	/*
+	 * Mark it opened before publication; a concurrent close during the
+	 * DEVICE_OPEN round trip sends a harmless rejected close, while a
+	 * missing close after a successful open would leak the remote COPP.
+	 */
+	copp->opened = true;
+	list_add_tail(&copp->node, &adm->copps_list);
+	spin_unlock_irqrestore(&adm->copps_list_lock, flags);
 
 	ret = q6adm_device_open(adm, copp, port_id, path, topology,
 				channel_mode, bit_width, rate);
 	if (ret < 0) {
+		spin_lock_irqsave(&adm->copps_list_lock, flags);
+		copp->opened = false;
+		spin_unlock_irqrestore(&adm->copps_list_lock, flags);
 		kref_put(&copp->refcount, q6adm_free_copp);
 		return ERR_PTR(ret);
 	}
