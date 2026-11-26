@@ -347,6 +347,22 @@ static bool q6asm_dai_stale_event(struct q6asm_dai_rtd *prtd,
 	}
 }
 
+/*
+ * Force the stream into XRUN.  snd_pcm_stop_xrun() only acts on a running
+ * stream, but a pause the DSP rejected leaves ALSA in PAUSED; there it
+ * returns without changing anything and the application would stay blocked
+ * in snd_pcm_resume().  From any other state, set the state explicitly
+ * (the core only issues a STOP trigger for a running stream, so no extra
+ * stop command is sent here).
+ */
+static void q6asm_dai_abort_stream(struct snd_pcm_substream *substream)
+{
+	if (snd_pcm_running(substream))
+		snd_pcm_stop_xrun(substream);
+	else
+		snd_pcm_stop(substream, SNDRV_PCM_STATE_XRUN);
+}
+
 static void event_handler(const struct q6asm_client_event *event, void *priv)
 {
 	struct q6asm_dai_rtd *prtd = priv;
@@ -379,7 +395,7 @@ static void event_handler(const struct q6asm_client_event *event, void *priv)
 			}
 			spin_unlock(&prtd->lock);
 			if (xrun)
-				snd_pcm_stop_xrun(substream);
+				q6asm_dai_abort_stream(substream);
 			break;
 		}
 		/*
@@ -426,7 +442,7 @@ static void event_handler(const struct q6asm_client_event *event, void *priv)
 		if (elapsed)
 			snd_pcm_period_elapsed(substream);
 		if (xrun)
-			snd_pcm_stop_xrun(substream);
+			q6asm_dai_abort_stream(substream);
 		break;
 	}
 
@@ -451,7 +467,7 @@ static void event_handler(const struct q6asm_client_event *event, void *priv)
 		}
 		spin_unlock(&prtd->lock);
 		if (xrun)
-			snd_pcm_stop_xrun(substream);
+			q6asm_dai_abort_stream(substream);
 		break;
 
 	case Q6ASM_EVENT_EOS_DONE:
@@ -491,7 +507,7 @@ static void event_handler(const struct q6asm_client_event *event, void *priv)
 		if (elapsed)
 			snd_pcm_period_elapsed(substream);
 		if (xrun)
-			snd_pcm_stop_xrun(substream);
+			q6asm_dai_abort_stream(substream);
 		break;
 
 	case Q6ASM_EVENT_READ_FAILED:
@@ -515,7 +531,7 @@ static void event_handler(const struct q6asm_client_event *event, void *priv)
 		}
 		spin_unlock(&prtd->lock);
 		if (xrun)
-			snd_pcm_stop_xrun(substream);
+			q6asm_dai_abort_stream(substream);
 		break;
 
 	case Q6ASM_EVENT_WRITE_DONE:
@@ -548,7 +564,7 @@ static void event_handler(const struct q6asm_client_event *event, void *priv)
 		}
 		spin_unlock(&prtd->lock);
 		if (xrun)
-			snd_pcm_stop_xrun(substream);
+			q6asm_dai_abort_stream(substream);
 		break;
 
 	default:
@@ -692,7 +708,9 @@ static int q6asm_dai_release_remote(struct snd_soc_component *component,
 	 * stream even when the remote teardown is unresolved.
 	 */
 	q6routing_stream_close(soc_prtd->dai_link->id, substream->stream);
+	spin_lock(&prtd->lock);
 	prtd->state = Q6ASM_STREAM_IDLE;
+	spin_unlock(&prtd->lock);
 
 	if (!failed)
 		return 0;
@@ -1115,34 +1133,44 @@ static int q6asm_dai_trigger(struct snd_soc_component *component,
 	case SNDRV_PCM_TRIGGER_PAUSE_PUSH: {
 		enum stream_state old;
 		bool was_started;
+		int prc = 0;
 
+		/*
+		 * Keep prtd->lock across the state change, the (atomic) send
+		 * and the rollback.  Otherwise RUN_DONE can observe PAUSING
+		 * between the change and a failed send, be discarded, and
+		 * leave the stream in STARTING with no completion left.
+		 */
 		spin_lock(&prtd->lock);
 		old = prtd->state;
 		was_started = prtd->started;
 		if (old == Q6ASM_STREAM_RUNNING ||
-		    old == Q6ASM_STREAM_STARTING)
+		    old == Q6ASM_STREAM_STARTING) {
 			prtd->state = Q6ASM_STREAM_PAUSING;
-		prtd->started = false;
+			prtd->started = false;
+			prc = q6asm_cmd_nowait(prtd->audio_client,
+					       prtd->stream_id, CMD_PAUSE);
+			if (prc < 0) {
+				/*
+				 * The command never left the host, so the
+				 * stream is still running remotely.  Restore
+				 * both halves of the state; started=false
+				 * while RUNNING would suppress every later
+				 * period notification.
+				 */
+				prtd->state = old;
+				prtd->started = was_started;
+			}
+		}
 		spin_unlock(&prtd->lock);
 
 		if (old != Q6ASM_STREAM_RUNNING &&
 		    old != Q6ASM_STREAM_STARTING)
 			break;
-		ret = q6asm_cmd_nowait(prtd->audio_client, prtd->stream_id,
-				       CMD_PAUSE);
-		if (ret < 0) {
-			/*
-			 * The command never left the host, so the stream is
-			 * still running remotely.  Restore both halves of
-			 * the state; leaving started=false while RUNNING
-			 * would suppress every later period notification.
-			 */
+		if (prc < 0) {
 			dev_err_ratelimited(component->dev,
-					    "pause command failed %d\n", ret);
-			spin_lock(&prtd->lock);
-			prtd->state = old;
-			prtd->started = was_started;
-			spin_unlock(&prtd->lock);
+					    "pause command failed %d\n", prc);
+			ret = prc;
 		}
 		break;
 	}
@@ -1178,6 +1206,7 @@ static int q6asm_dai_open(struct snd_soc_component *component,
 
 	spin_lock_init(&prtd->lock);
 	prtd->substream = substream;
+	prtd->dev = dev;
 	prtd->j716f = pdata->j716f;
 	prtd->early_capture_start = pdata->j716f &&
 				    substream->stream == SNDRV_PCM_STREAM_CAPTURE;
@@ -1367,7 +1396,8 @@ static void compress_event_handler(const struct q6asm_client_event *event,
 
 	/* A completion for a previous mapping must not touch this stream. */
 	if (event->id >= Q6ASM_EVENT_READ_DONE &&
-	    event->generation != prtd->generation) {
+	    (event->generation != prtd->generation ||
+	     prtd->state == Q6ASM_STREAM_IDLE)) {
 		dev_dbg_ratelimited(prtd->dev,
 				    "compressed event %u for an old mapping\n",
 				    event->id);
@@ -1835,6 +1865,16 @@ static int q6asm_dai_compr_set_params(struct snd_soc_component *component,
 		return -EINVAL;
 
 	/*
+	 * Quiesce the front end before the old stream is torn down.  A
+	 * completion validated against the previous mapping may still be in
+	 * the callback; with the state idle it cannot account a fragment or
+	 * post a write into the ring being released.
+	 */
+	spin_lock(&prtd->lock);
+	prtd->state = Q6ASM_STREAM_IDLE;
+	spin_unlock(&prtd->lock);
+
+	/*
 	 * A second set_params() on the same stream must not open a second
 	 * stream or map a second time; release the previous configuration
 	 * first.
@@ -1850,7 +1890,9 @@ static int q6asm_dai_compr_set_params(struct snd_soc_component *component,
 	prtd->pcm_count = runtime->fragment_size;
 	prtd->pcm_size = runtime->fragments * runtime->fragment_size;
 	prtd->bits_per_sample = 16;
+	spin_lock(&prtd->lock);
 	prtd->state = Q6ASM_STREAM_PREPARED;
+	spin_unlock(&prtd->lock);
 
 	if (dir == SND_COMPRESS_PLAYBACK) {
 		ret = q6asm_open_write(prtd->audio_client, prtd->stream_id,
@@ -1898,8 +1940,10 @@ static int q6asm_dai_compr_set_params(struct snd_soc_component *component,
 	}
 
 	prtd->map_state = Q6ASM_MAP_CONFIRMED;
+	spin_lock(&prtd->lock);
 	prtd->generation = q6asm_get_buffer_generation(prtd->audio_client,
 						       dir);
+	spin_unlock(&prtd->lock);
 	return 0;
 
 q6_err:
