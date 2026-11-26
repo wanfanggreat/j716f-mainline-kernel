@@ -280,9 +280,22 @@ static void event_handler(uint32_t opcode, uint32_t token,
 	case ASM_CLIENT_EVENT_DATA_READ_DONE: {
 		int rerr;
 
-		pr_info_ratelimited("J716F-CAP: read done prtd=%p token=%u state=%d inflight=%u periods=%u\n",
+		pr_info_ratelimited("J716F-CAP: read done prtd=%p token=%u state=%d inflight=%u periods=%u started=%d\n",
 				    prtd, token, READ_ONCE(prtd->state),
-				    prtd->reads_inflight, prtd->periods);
+				    prtd->reads_inflight, prtd->periods,
+				    prtd->capture_started);
+		/*
+		 * ACP re-prepares a running capture stream.  The old session's
+		 * READ completions can arrive after the teardown but before the
+		 * new RUN; counting them would top the queue up with READs for
+		 * a stream that has not started yet, so the RUN_DONE would find
+		 * the queue "full" and the new stream never got its own reads.
+		 */
+		if (!prtd->capture_started) {
+			pr_info_ratelimited("J716F-CAP: late read done ignored token=%u\n",
+					    token);
+			break;
+		}
 		snd_pcm_period_elapsed(substream);
 		/*
 		 * One read just completed, so one slot in the ADSP queue freed
@@ -597,6 +610,14 @@ static int q6asm_dai_prepare(struct snd_soc_component *component,
 		 * READ was ever queued and hw_ptr stayed at 0.
 		 */
 		prtd->reads_pending = true;
+		/*
+		 * Arm this before the synchronous RUN: late completions from a
+		 * previous stream instance must be ignored (they belong to a
+		 * closed session), but completions of the reads posted by this
+		 * RUN's own RUN_DONE can land while q6asm_run() is still
+		 * waiting, and they have to be counted.
+		 */
+		prtd->capture_started = true;
 
 		pr_info_ratelimited("J716F-CAP: run prtd=%p sid=%d inflight=%u state=%d\n",
 				    prtd, prtd->session_id, prtd->reads_inflight,
@@ -605,6 +626,7 @@ static int q6asm_dai_prepare(struct snd_soc_component *component,
 		if (ret) {
 			dev_err(dev, "capture run failed %d\n", ret);
 			prtd->reads_pending = false;
+			prtd->capture_started = false;
 			prtd->state = Q6ASM_STREAM_STOPPED;
 			/*
 			 * The stream is already open and may be running: close
