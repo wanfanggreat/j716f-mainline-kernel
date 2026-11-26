@@ -93,6 +93,9 @@ struct q6adm {
 	spinlock_t copps_list_lock;
 	struct workqueue_struct *close_wq;
 	unsigned int closes_unconfirmed;
+#ifdef CONFIG_SND_SOC_QDSP6_ASM_FAULT_INJECT
+	atomic_t fault;
+#endif
 	struct aprv2_ibasic_rsp_result_t result;
 	/*
 	 * Protects result/map_pending: the RX worker must not complete a
@@ -215,10 +218,28 @@ err:
 #define Q6ADM_CLOSE_RETRIES	3
 #define Q6ADM_CLOSE_RETRY_MS	20
 
+#ifdef CONFIG_SND_SOC_QDSP6_ASM_FAULT_INJECT
+/*
+ * Debug builds only: exercises the three ways a close can end without a
+ * confirmed release.  CLOSE_FAIL persists until it is cleared so all bounded
+ * retries are consumed; the other two are one-shot.
+ */
+enum q6adm_fault {
+	Q6ADM_FAULT_NONE = 0,
+	Q6ADM_FAULT_CLOSE_FAIL,
+	Q6ADM_FAULT_CLOSE_REJECT,
+	Q6ADM_FAULT_CLOSE_TIMEOUT,
+};
+#endif
+
 static int q6adm_send_close(struct q6adm *adm, const struct q6adm_close_req *req)
 {
 	struct apr_pkt close = { };
 
+#ifdef CONFIG_SND_SOC_QDSP6_ASM_FAULT_INJECT
+	if (atomic_read(&adm->fault) == Q6ADM_FAULT_CLOSE_FAIL)
+		return -EIO;
+#endif
 	close.hdr.hdr_field = APR_HDR_FIELD(APR_MSG_TYPE_SEQ_CMD,
 					    APR_HDR_LEN(APR_HDR_SIZE),
 					    APR_PKT_VER);
@@ -343,6 +364,18 @@ static void q6adm_close_ack_locked(struct q6adm *adm, int port_idx,
 	list_for_each_entry(req, &adm->closing, node) {
 		if (req->afe_port == port_idx && req->copp_idx == copp_idx &&
 		    req->gen == gen) {
+#ifdef CONFIG_SND_SOC_QDSP6_ASM_FAULT_INJECT
+			if (atomic_cmpxchg(&adm->fault,
+					   Q6ADM_FAULT_CLOSE_TIMEOUT,
+					   Q6ADM_FAULT_NONE) ==
+			    Q6ADM_FAULT_CLOSE_TIMEOUT)
+				return;	/* simulate a lost answer */
+			if (atomic_cmpxchg(&adm->fault,
+					   Q6ADM_FAULT_CLOSE_REJECT,
+					   Q6ADM_FAULT_NONE) ==
+			    Q6ADM_FAULT_CLOSE_REJECT)
+				status = ADSP_EFAILED;
+#endif
 			req->status = status;
 			req->acked = true;
 			wake_up(&req->wait);
@@ -870,10 +903,64 @@ int q6adm_close(struct device *dev, struct q6copp *copp)
 }
 EXPORT_SYMBOL_GPL(q6adm_close);
 
+#ifdef CONFIG_SND_SOC_QDSP6_ASM_FAULT_INJECT
+static ssize_t inject_fault_show(struct device *dev,
+				 struct device_attribute *attr, char *buf)
+{
+	struct q6adm *adm = dev_get_drvdata(dev);
+	const char *name = "none";
+
+	switch (atomic_read(&adm->fault)) {
+	case Q6ADM_FAULT_CLOSE_FAIL:
+		name = "close:fail";
+		break;
+	case Q6ADM_FAULT_CLOSE_REJECT:
+		name = "close:reject";
+		break;
+	case Q6ADM_FAULT_CLOSE_TIMEOUT:
+		name = "close:timeout";
+		break;
+	}
+
+	return sysfs_emit(buf, "%s\n", name);
+}
+
+static ssize_t inject_fault_store(struct device *dev,
+				  struct device_attribute *attr,
+				  const char *buf, size_t count)
+{
+	struct q6adm *adm = dev_get_drvdata(dev);
+	unsigned int fault;
+
+	if (sysfs_streq(buf, "clear") || sysfs_streq(buf, "none"))
+		fault = Q6ADM_FAULT_NONE;
+	else if (sysfs_streq(buf, "close:fail"))
+		fault = Q6ADM_FAULT_CLOSE_FAIL;
+	else if (sysfs_streq(buf, "close:reject"))
+		fault = Q6ADM_FAULT_CLOSE_REJECT;
+	else if (sysfs_streq(buf, "close:timeout"))
+		fault = Q6ADM_FAULT_CLOSE_TIMEOUT;
+	else
+		return -EINVAL;
+
+	atomic_set(&adm->fault, fault);
+	return count;
+}
+static DEVICE_ATTR_RW(inject_fault);
+
+static void q6adm_remove_sysfs(void *data)
+{
+	device_remove_file(data, &dev_attr_inject_fault);
+}
+#endif /* CONFIG_SND_SOC_QDSP6_ASM_FAULT_INJECT */
+
 static int q6adm_probe(struct apr_device *adev)
 {
 	struct device *dev = &adev->dev;
 	struct q6adm *adm;
+#ifdef CONFIG_SND_SOC_QDSP6_ASM_FAULT_INJECT
+	int ret;
+#endif
 
 	adm = devm_kzalloc(dev, sizeof(*adm), GFP_KERNEL);
 	if (!adm)
@@ -903,6 +990,16 @@ static int q6adm_probe(struct apr_device *adev)
 						     WQ_MEM_RECLAIM);
 	if (!adm->close_wq)
 		return -ENOMEM;
+
+#ifdef CONFIG_SND_SOC_QDSP6_ASM_FAULT_INJECT
+	atomic_set(&adm->fault, Q6ADM_FAULT_NONE);
+	ret = device_create_file(dev, &dev_attr_inject_fault);
+	if (ret)
+		return ret;
+	ret = devm_add_action_or_reset(dev, q6adm_remove_sysfs, dev);
+	if (ret)
+		return ret;
+#endif
 
 	return devm_of_platform_populate(dev);
 }

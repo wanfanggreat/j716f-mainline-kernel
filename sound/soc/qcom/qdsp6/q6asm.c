@@ -402,7 +402,53 @@ struct audio_client {
 	struct device *dev;
 	/* Pre-allocated owner for a buffer the DSP may still be using. */
 	struct q6asm_held_buffer *hold_slot;
+#ifdef CONFIG_SND_SOC_QDSP6_ASM_FAULT_INJECT
+	/*
+	 * Counters that let the device tests prove which branch handled a
+	 * completion or a command response instead of inferring it from
+	 * behaviour.  Debug builds only.
+	 */
+	struct {
+		atomic_t accepted;
+		atomic_t dropped;
+		atomic_t late;
+		atomic_t unowned;
+	} stats;
+#endif
 };
+
+enum q6asm_stat {
+	Q6ASM_STAT_ACCEPTED,
+	Q6ASM_STAT_DROPPED,
+	Q6ASM_STAT_LATE,
+	Q6ASM_STAT_UNOWNED,
+};
+
+#ifdef CONFIG_SND_SOC_QDSP6_ASM_FAULT_INJECT
+static inline void q6asm_stat_inc(struct audio_client *ac,
+				  enum q6asm_stat stat)
+{
+	switch (stat) {
+	case Q6ASM_STAT_ACCEPTED:
+		atomic_inc(&ac->stats.accepted);
+		break;
+	case Q6ASM_STAT_DROPPED:
+		atomic_inc(&ac->stats.dropped);
+		break;
+	case Q6ASM_STAT_LATE:
+		atomic_inc(&ac->stats.late);
+		break;
+	case Q6ASM_STAT_UNOWNED:
+		atomic_inc(&ac->stats.unowned);
+		break;
+	}
+}
+#else
+static inline void q6asm_stat_inc(struct audio_client *ac,
+				  enum q6asm_stat stat)
+{
+}
+#endif
 
 struct q6asm {
 	struct apr_device *adev;
@@ -430,6 +476,9 @@ enum q6asm_fault {
 	Q6ASM_FAULT_RUN,
 	Q6ASM_FAULT_READ_REJECT,
 	Q6ASM_FAULT_WRITE_REJECT,
+	Q6ASM_FAULT_PAUSE,
+	Q6ASM_FAULT_PAUSE_REJECT,
+	Q6ASM_FAULT_RUN_REJECT,
 };
 
 #ifdef CONFIG_SND_SOC_QDSP6_ASM_FAULT_INJECT
@@ -443,6 +492,9 @@ static const char *const q6asm_fault_names[] = {
 	[Q6ASM_FAULT_RUN] = "run",
 	[Q6ASM_FAULT_READ_REJECT] = "readreject",
 	[Q6ASM_FAULT_WRITE_REJECT] = "writereject",
+	[Q6ASM_FAULT_PAUSE] = "pause",
+	[Q6ASM_FAULT_PAUSE_REJECT] = "pausereject",
+	[Q6ASM_FAULT_RUN_REJECT] = "runreject",
 };
 #endif
 
@@ -1020,12 +1072,14 @@ static enum q6asm_rsp_owner q6asm_cmd_rsp_claim(struct audio_client *ac,
 		owner = Q6ASM_RSP_SYNC;
 		wake_up(&rsp->wait);
 	} else if (q6asm_rsp_clear_stale_locked(rsp, opcode)) {
+		q6asm_stat_inc(ac, Q6ASM_STAT_LATE);
 		dev_dbg_ratelimited(ac->dev,
 				    "late response for retired command %#x dropped\n",
 				    opcode);
 	} else if (q6asm_rsp_async_take_locked(rsp, opcode)) {
 		owner = Q6ASM_RSP_ASYNC;
 	} else {
+		q6asm_stat_inc(ac, Q6ASM_STAT_UNOWNED);
 		dev_dbg_ratelimited(ac->dev,
 				    "unowned response %#x dropped\n", opcode);
 	}
@@ -1663,8 +1717,12 @@ static bool q6asm_complete_transfer(struct audio_client *ac, unsigned int dir,
 	notify = true;
 out:
 	spin_unlock_irqrestore(&ac->lock, flags);
-	if (notify)
+	if (notify) {
+		q6asm_stat_inc(ac, Q6ASM_STAT_ACCEPTED);
 		q6asm_notify_client(ac, &event);
+	} else {
+		q6asm_stat_inc(ac, Q6ASM_STAT_DROPPED);
+	}
 
 	return notify;
 }
@@ -1771,6 +1829,7 @@ static int32_t q6asm_stream_callback(struct apr_device *adev,
 			break;
 		case ASM_SESSION_CMD_RUN_V2: {
 			u32 status = result->status;
+			u32 injected;
 			enum q6asm_rsp_owner owner;
 
 			/*
@@ -1780,6 +1839,11 @@ static int32_t q6asm_stream_callback(struct apr_device *adev,
 			 */
 			if (status == ADSP_EALREADY)
 				status = ADSP_EOK;
+			injected = q6asm_fault_status_take(ac,
+							   Q6ASM_FAULT_RUN_REJECT,
+							   ADSP_EFAILED);
+			if (injected)
+				status = injected;
 			owner = q6asm_cmd_rsp_claim(ac, result->opcode, status, 0);
 			if (owner != Q6ASM_RSP_NONE)
 				q6asm_emit_simple(ac, Q6ASM_EVENT_RUN_DONE,
@@ -1788,10 +1852,16 @@ static int32_t q6asm_stream_callback(struct apr_device *adev,
 		}
 		case ASM_SESSION_CMD_PAUSE: {
 			u32 status = result->status;
+			u32 injected;
 			enum q6asm_rsp_owner owner;
 
 			if (status == ADSP_EALREADY)
 				status = ADSP_EOK;
+			injected = q6asm_fault_status_take(ac,
+							   Q6ASM_FAULT_PAUSE_REJECT,
+							   ADSP_EFAILED);
+			if (injected)
+				status = injected;
 			owner = q6asm_cmd_rsp_claim(ac, result->opcode, status, 0);
 			if (owner != Q6ASM_RSP_NONE)
 				q6asm_emit_simple(ac, Q6ASM_EVENT_PAUSE_DONE,
@@ -2856,6 +2926,11 @@ static int __q6asm_cmd(struct audio_client *ac, uint32_t stream_id, int cmd,
 		if (rc)
 			return rc;
 	}
+	if (cmd == CMD_PAUSE) {
+		rc = q6asm_fault_take(ac, Q6ASM_FAULT_PAUSE);
+		if (rc)
+			return rc;
+	}
 
 	q6asm_add_hdr(ac, &pkt.hdr, APR_HDR_SIZE, true, stream_id);
 
@@ -2949,10 +3024,13 @@ EXPORT_SYMBOL_GPL(q6asm_cmd_nowait);
 
 #ifdef CONFIG_SND_SOC_QDSP6_ASM_FAULT_INJECT
 /*
- * Replay a completion that belongs to the previous data-path generation.
- * The correlation code must drop it without moving hw_ptr or freeing a slot.
+ * Replay a completion for the first period of an active client.  With
+ * @fresh set, the token is valid for the current mapping, so the first
+ * delivery is accepted and an immediate second one must be rejected; with
+ * it clear the token names another generation and must be dropped.  Either
+ * way hw_ptr may only move once.
  */
-static void q6asm_inject_spurious(struct q6asm *a)
+static void q6asm_inject_completion(struct q6asm *a, bool fresh)
 {
 	struct audio_client *ac = NULL;
 	unsigned long flags;
@@ -2973,17 +3051,27 @@ static void q6asm_inject_spurious(struct q6asm *a)
 	for (dir = 0; dir < ARRAY_SIZE(ac->port); dir++) {
 		struct audio_port_data *port = &ac->port[dir];
 		unsigned long flags;
+		phys_addr_t phys;
 		u32 generation;
 
 		if (!port->buf || !port->submit || !port->num_periods)
 			continue;
 		spin_lock_irqsave(&ac->lock, flags);
-		/* Any encoded value except the current one is a stale token. */
-		generation = (q6asm_token_gen(port->generation) % Q6ASM_TOKEN_GEN_MAX) + 1;
+		generation = q6asm_token_gen(port->generation);
+		if (!fresh) {
+			/* Any encoded value except the current one is stale. */
+			generation = (generation % Q6ASM_TOKEN_GEN_MAX) + 1;
+		}
+		phys = port->buf[0].phys;
 		spin_unlock_irqrestore(&ac->lock, flags);
-		q6asm_complete_transfer(ac, dir, 0, generation, 0,
-					port->buf[0].phys, true, false, 0, 0,
-					0, 0);
+
+		q6asm_complete_transfer(ac, dir, 0, generation, 0, phys, true,
+					false, 0, 0, 0, 0);
+		if (fresh) {
+			/* The same completion again must not count twice. */
+			q6asm_complete_transfer(ac, dir, 0, generation, 0, phys,
+						true, false, 0, 0, 0, 0);
+		}
 	}
 	kref_put(&ac->refcount, q6asm_audio_client_release);
 }
@@ -3008,6 +3096,53 @@ static ssize_t held_dma_show(struct device *dev,
 }
 static DEVICE_ATTR_RO(held_dma);
 
+/*
+ * One line per active session.  The device tests use the generation to prove
+ * that a single open/remap loop crossed the 8-bit token boundary, and the
+ * counters to prove which correlation branch handled an event.
+ */
+static ssize_t session_gen_show(struct device *dev,
+				struct device_attribute *attr, char *buf)
+{
+	struct q6asm *q6asm = dev_get_drvdata(dev);
+	ssize_t len = 0;
+	int i;
+
+	for (i = 1; i <= MAX_SESSIONS; i++) {
+		struct audio_client *ac;
+		unsigned long flags;
+		u32 play, capture;
+
+		spin_lock_irqsave(&q6asm->slock, flags);
+		ac = q6asm->session[i];
+		if (ac && !kref_get_unless_zero(&ac->refcount))
+			ac = NULL;
+		spin_unlock_irqrestore(&q6asm->slock, flags);
+		if (!ac)
+			continue;
+
+		spin_lock_irqsave(&ac->lock, flags);
+		play = ac->port[SNDRV_PCM_STREAM_PLAYBACK].generation;
+		capture = ac->port[SNDRV_PCM_STREAM_CAPTURE].generation;
+		spin_unlock_irqrestore(&ac->lock, flags);
+
+		len += sysfs_emit_at(buf, len,
+				     "session %d play %u capture %u accepted %d dropped %d late %d unowned %d\n",
+				     i, play, capture,
+				     atomic_read(&ac->stats.accepted),
+				     atomic_read(&ac->stats.dropped),
+				     atomic_read(&ac->stats.late),
+				     atomic_read(&ac->stats.unowned));
+		kref_put(&ac->refcount, q6asm_audio_client_release);
+	}
+
+	if (!len)
+		len = sysfs_emit(buf, "none\n");
+
+	return len;
+}
+static DEVICE_ATTR_RO(session_gen);
+
 static ssize_t inject_fault_show(struct device *dev,
 				 struct device_attribute *attr, char *buf)
 {
@@ -3030,12 +3165,18 @@ static ssize_t inject_fault_show(struct device *dev,
 
 /*
  * Arm a one-shot failure for one teardown command.  This exists so the
- * quarantine and held-buffer paths can be exercised on real hardware:
+ * quarantine, held-buffer and state-rollback paths can be exercised on real
+ * hardware:
  *
- *   echo map:timeout   > .../inject_fault   # MAP fails, session quarantined
- *   echo close:timeout > .../inject_fault   # CMD_CLOSE fails
- *   echo unmap:reject  > .../inject_fault   # UNMAP fails after CLOSE
- *   echo clear         > .../inject_fault   # disarm
+ *   echo map:timeout    > .../inject_fault  # MAP fails, session quarantined
+ *   echo close:timeout  > .../inject_fault  # CMD_CLOSE fails
+ *   echo unmap:reject   > .../inject_fault  # UNMAP fails after CLOSE
+ *   echo pause:reject   > .../inject_fault  # CMD_PAUSE is not sent
+ *   echo pausereject:reject > .../inject_fault # DSP rejects the next PAUSE
+ *   echo runreject:reject   > .../inject_fault # DSP rejects the next RUN
+ *   echo duplicate      > .../inject_fault  # replay a completion twice
+ *   echo spurious       > .../inject_fault  # replay an old completion
+ *   echo clear          > .../inject_fault  # disarm
  *
  * "timeout" returns -ETIMEDOUT, "reject" returns -EINVAL (the value the
  * DSP uses for a refused command).  Every write needs root and affects only
@@ -3059,7 +3200,11 @@ static ssize_t inject_fault_store(struct device *dev,
 		goto store;
 
 	if (sysfs_streq(buf, "spurious")) {
-		q6asm_inject_spurious(q6asm);
+		q6asm_inject_completion(q6asm, false);
+		return count;
+	}
+	if (sysfs_streq(buf, "duplicate")) {
+		q6asm_inject_completion(q6asm, true);
 		return count;
 	}
 
@@ -3081,7 +3226,7 @@ static ssize_t inject_fault_store(struct device *dev,
 	memcpy(kind, colon, len);
 	kind[len] = '\0';
 
-	for (i = Q6ASM_FAULT_MAP; i <= Q6ASM_FAULT_WRITE_REJECT; i++)
+	for (i = Q6ASM_FAULT_MAP; i <= Q6ASM_FAULT_RUN_REJECT; i++)
 		if (sysfs_streq(op, q6asm_fault_names[i]))
 			fault = i;
 	if (fault == Q6ASM_FAULT_NONE)
@@ -3104,6 +3249,7 @@ static DEVICE_ATTR_RW(inject_fault);
 
 static void q6asm_remove_sysfs(void *data)
 {
+	device_remove_file(data, &dev_attr_session_gen);
 	device_remove_file(data, &dev_attr_inject_fault);
 	device_remove_file(data, &dev_attr_held_dma);
 }
@@ -3141,6 +3287,9 @@ static int q6asm_probe(struct apr_device *adev)
 	ret = device_create_file(dev, &dev_attr_held_dma);
 	if (ret)
 		goto remove_inject;
+	ret = device_create_file(dev, &dev_attr_session_gen);
+	if (ret)
+		goto remove_held;
 	ret = devm_add_action_or_reset(dev, q6asm_remove_sysfs, dev);
 	if (ret)
 		return ret;
@@ -3149,6 +3298,8 @@ static int q6asm_probe(struct apr_device *adev)
 	return devm_of_platform_populate(dev);
 
 #ifdef CONFIG_SND_SOC_QDSP6_ASM_FAULT_INJECT
+remove_held:
+	device_remove_file(dev, &dev_attr_held_dma);
 remove_inject:
 	device_remove_file(dev, &dev_attr_inject_fault);
 	return ret;
