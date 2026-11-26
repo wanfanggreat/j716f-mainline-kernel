@@ -286,27 +286,26 @@ static int q6asm_dai_fill_capture(struct q6asm_dai_rtd *prtd)
 }
 
 /*
- * A failed READ post (other than "the ring is full") means the stream can
- * no longer be fed.  Report it as an XRUN instead of leaving the PCM in a
- * RUNNING state that never produces data again.
+ * Post the capture ring while holding prtd->lock.  A STOP that is already
+ * in progress has moved the state away from RUNNING, so no READ can be
+ * queued after the PAUSE/EOS command.  q6asm_read() only takes the audio
+ * client lock and queues an APR packet, neither of which sleeps.
+ * Caller holds prtd->lock.
  */
-static void q6asm_dai_fill_or_fail(struct q6asm_dai_rtd *prtd,
-				   struct snd_pcm_substream *substream)
+static int q6asm_dai_fill_capture_locked(struct q6asm_dai_rtd *prtd)
 {
-	bool xrun;
-	int rc;
+	int i, rc = 0;
 
-	rc = q6asm_dai_fill_capture(prtd);
-	if (rc >= 0 || rc == -EAGAIN)
-		return;
+	if (prtd->state != Q6ASM_STREAM_RUNNING)
+		return -EAGAIN;
 
-	dev_err_ratelimited(prtd->dev, "capture read post failed: %d\n", rc);
-	spin_lock(&prtd->lock);
-	prtd->state = Q6ASM_STREAM_ERROR;
-	xrun = prtd->started;
-	spin_unlock(&prtd->lock);
-	if (xrun)
-		snd_pcm_stop_xrun(substream);
+	for (i = 0; i < prtd->periods; i++) {
+		rc = q6asm_read(prtd->audio_client, prtd->stream_id);
+		if (rc < 0)
+			break;
+	}
+
+	return rc;
 }
 
 static bool q6asm_dai_capture_active(struct q6asm_dai_rtd *prtd)
@@ -352,43 +351,74 @@ static void event_handler(const struct q6asm_client_event *event, void *priv)
 {
 	struct q6asm_dai_rtd *prtd = priv;
 	struct snd_pcm_substream *substream = prtd->substream;
-	bool elapsed = false, xrun = false, retry = false, play = false;
+	bool elapsed = false, xrun = false;
+	int rc;
 
 	if (!substream)
 		return;
 
 	switch (event->id) {
-	case Q6ASM_EVENT_RUN_DONE:
+	case Q6ASM_EVENT_RUN_DONE: {
+		bool play = false;
+
 		spin_lock(&prtd->lock);
-		if (!event->status) {
-			if (prtd->state == Q6ASM_STREAM_STARTING)
-				prtd->state = Q6ASM_STREAM_RUNNING;
-			if (prtd->started && prtd->elapsed_pending) {
-				prtd->elapsed_pending = false;
-				elapsed = true;
+		if (event->status) {
+			/*
+			 * The DSP refused the RUN, so the remote is not in
+			 * the state the front end assumed.  Fail closed
+			 * instead of leaving ALSA running an unfed stream.
+			 */
+			if (prtd->state == Q6ASM_STREAM_STARTING ||
+			    prtd->state == Q6ASM_STREAM_RUNNING ||
+			    prtd->state == Q6ASM_STREAM_PAUSING) {
+				dev_err_ratelimited(prtd->dev,
+						    "RUN rejected: %u\n",
+						    event->status);
+				prtd->state = Q6ASM_STREAM_ERROR;
+				xrun = prtd->started;
 			}
-			retry = (substream->stream ==
-				 SNDRV_PCM_STREAM_CAPTURE) &&
-				prtd->state == Q6ASM_STREAM_RUNNING;
-			play = (substream->stream ==
-				SNDRV_PCM_STREAM_PLAYBACK) &&
-			       prtd->started;
+			spin_unlock(&prtd->lock);
+			break;
+		}
+		/*
+		 * Only the transition the front end asked for may consume the
+		 * completion; a duplicate RUN_DONE must not re-arm a stream.
+		 */
+		if (prtd->state != Q6ASM_STREAM_STARTING) {
+			spin_unlock(&prtd->lock);
+			break;
+		}
+		prtd->state = Q6ASM_STREAM_RUNNING;
+		if (prtd->started && prtd->elapsed_pending) {
+			prtd->elapsed_pending = false;
+			elapsed = true;
+		}
+		if (substream->stream == SNDRV_PCM_STREAM_CAPTURE) {
+			/*
+			 * The first reads are queued here.  Doing it under
+			 * prtd->lock keeps a concurrent STOP from leaving a
+			 * READ behind the stop command.
+			 */
+			rc = q6asm_dai_fill_capture_locked(prtd);
+			if (rc < 0 && rc != -EAGAIN) {
+				dev_err_ratelimited(prtd->dev,
+						    "capture read post failed: %d\n",
+						    rc);
+				prtd->state = Q6ASM_STREAM_ERROR;
+				xrun = prtd->started;
+			}
 		} else {
-			prtd->state = Q6ASM_STREAM_ERROR;
-			xrun = prtd->started;
+			play = prtd->started;
 		}
 		spin_unlock(&prtd->lock);
-		if (retry)
-			q6asm_dai_fill_or_fail(prtd, substream);
-		if (play) {
-			int qrc = q6asm_dai_queue_playback(prtd,
-							   substream->runtime);
 
-			if (qrc < 0 && qrc != -EAGAIN) {
+		if (play) {
+			rc = q6asm_dai_queue_playback(prtd, substream->runtime);
+			if (rc < 0 && rc != -EAGAIN) {
 				spin_lock(&prtd->lock);
 				prtd->state = Q6ASM_STREAM_ERROR;
-				spin_unlock(&prtd->lock);
 				xrun = prtd->started;
+				spin_unlock(&prtd->lock);
 			}
 		}
 		if (elapsed)
@@ -396,19 +426,36 @@ static void event_handler(const struct q6asm_client_event *event, void *priv)
 		if (xrun)
 			snd_pcm_stop_xrun(substream);
 		break;
+	}
 
 	case Q6ASM_EVENT_PAUSE_DONE:
 		spin_lock(&prtd->lock);
 		if (prtd->state == Q6ASM_STREAM_PAUSING) {
-			if (!event->status)
+			if (!event->status) {
 				prtd->state = Q6ASM_STREAM_PAUSED;
-			else
-				prtd->state = Q6ASM_STREAM_RUNNING;
+			} else {
+				/*
+				 * ALSA is already paused, but the DSP kept
+				 * running.  Report an explicit failure so the
+				 * next prepare rebuilds the stream instead of
+				 * leaving a paused front end on a live remote.
+				 */
+				dev_err_ratelimited(prtd->dev,
+						    "PAUSE rejected: %u\n",
+						    event->status);
+				prtd->state = Q6ASM_STREAM_ERROR;
+				xrun = true;
+			}
 		}
 		spin_unlock(&prtd->lock);
+		if (xrun)
+			snd_pcm_stop_xrun(substream);
 		break;
 
 	case Q6ASM_EVENT_EOS_DONE:
+		if (event->status)
+			dev_err_ratelimited(prtd->dev, "EOS rejected: %u\n",
+					    event->status);
 		spin_lock(&prtd->lock);
 		if (prtd->state == Q6ASM_STREAM_STOPPING)
 			prtd->state = Q6ASM_STREAM_STOPPED;
@@ -417,22 +464,32 @@ static void event_handler(const struct q6asm_client_event *event, void *priv)
 
 	case Q6ASM_EVENT_READ_DONE:
 		spin_lock(&prtd->lock);
-		if (q6asm_dai_stale_event(prtd, event)) {
+		if (q6asm_dai_stale_event(prtd, event) ||
+		    prtd->state != Q6ASM_STREAM_RUNNING) {
 			spin_unlock(&prtd->lock);
 			break;
 		}
-		if (prtd->state == Q6ASM_STREAM_RUNNING) {
-			if (prtd->started)
-				elapsed = true;
-			else
-				prtd->elapsed_pending = true;
-			retry = true;
+		if (prtd->started)
+			elapsed = true;
+		else
+			prtd->elapsed_pending = true;
+		/*
+		 * Refill under the same lock STOP uses to leave RUNNING, so
+		 * no READ can be queued after the stop command was sent.
+		 */
+		rc = q6asm_dai_fill_capture_locked(prtd);
+		if (rc < 0 && rc != -EAGAIN) {
+			dev_err_ratelimited(prtd->dev,
+					    "capture read post failed: %d\n", rc);
+			prtd->state = Q6ASM_STREAM_ERROR;
+			elapsed = false;
+			xrun = prtd->started;
 		}
 		spin_unlock(&prtd->lock);
 		if (elapsed)
 			snd_pcm_period_elapsed(substream);
-		if (retry && q6asm_dai_capture_active(prtd))
-			q6asm_dai_fill_or_fail(prtd, substream);
+		if (xrun)
+			snd_pcm_stop_xrun(substream);
 		break;
 
 	case Q6ASM_EVENT_READ_FAILED:
@@ -447,8 +504,13 @@ static void event_handler(const struct q6asm_client_event *event, void *priv)
 			spin_unlock(&prtd->lock);
 			break;
 		}
-		prtd->state = Q6ASM_STREAM_ERROR;
-		xrun = prtd->started;
+		{
+			enum stream_state old = prtd->state;
+
+			prtd->state = Q6ASM_STREAM_ERROR;
+			xrun = prtd->started || old == Q6ASM_STREAM_PAUSED ||
+			       old == Q6ASM_STREAM_PAUSING;
+		}
 		spin_unlock(&prtd->lock);
 		if (xrun)
 			snd_pcm_stop_xrun(substream);
@@ -475,8 +537,13 @@ static void event_handler(const struct q6asm_client_event *event, void *priv)
 			spin_unlock(&prtd->lock);
 			break;
 		}
-		prtd->state = Q6ASM_STREAM_ERROR;
-		xrun = prtd->started;
+		{
+			enum stream_state old = prtd->state;
+
+			prtd->state = Q6ASM_STREAM_ERROR;
+			xrun = prtd->started || old == Q6ASM_STREAM_PAUSED ||
+			       old == Q6ASM_STREAM_PAUSING;
+		}
 		spin_unlock(&prtd->lock);
 		if (xrun)
 			snd_pcm_stop_xrun(substream);
@@ -1037,30 +1104,42 @@ static int q6asm_dai_trigger(struct snd_soc_component *component,
 			ret = q6asm_cmd_nowait(prtd->audio_client,
 					       prtd->stream_id, CMD_PAUSE);
 		if (ret < 0)
-			dev_dbg_ratelimited(component->dev,
+			dev_err_ratelimited(component->dev,
 					    "stop command failed %d\n", ret);
 		break;
 	}
 
 	case SNDRV_PCM_TRIGGER_SUSPEND:
 	case SNDRV_PCM_TRIGGER_PAUSE_PUSH: {
-		bool running;
+		enum stream_state old;
+		bool was_started;
 
 		spin_lock(&prtd->lock);
-		running = prtd->state == Q6ASM_STREAM_RUNNING ||
-			  prtd->state == Q6ASM_STREAM_STARTING;
-		if (running)
+		old = prtd->state;
+		was_started = prtd->started;
+		if (old == Q6ASM_STREAM_RUNNING ||
+		    old == Q6ASM_STREAM_STARTING)
 			prtd->state = Q6ASM_STREAM_PAUSING;
 		prtd->started = false;
 		spin_unlock(&prtd->lock);
 
-		if (!running)
+		if (old != Q6ASM_STREAM_RUNNING &&
+		    old != Q6ASM_STREAM_STARTING)
 			break;
 		ret = q6asm_cmd_nowait(prtd->audio_client, prtd->stream_id,
 				       CMD_PAUSE);
 		if (ret < 0) {
+			/*
+			 * The command never left the host, so the stream is
+			 * still running remotely.  Restore both halves of
+			 * the state; leaving started=false while RUNNING
+			 * would suppress every later period notification.
+			 */
+			dev_err_ratelimited(component->dev,
+					    "pause command failed %d\n", ret);
 			spin_lock(&prtd->lock);
-			prtd->state = Q6ASM_STREAM_RUNNING;
+			prtd->state = old;
+			prtd->started = was_started;
 			spin_unlock(&prtd->lock);
 		}
 		break;
