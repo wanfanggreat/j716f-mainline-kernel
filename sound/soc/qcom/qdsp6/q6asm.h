@@ -103,6 +103,8 @@ struct q6asm_client_event {
 	u32 len;
 	/* DSP status, valid for *_FAILED. */
 	u32 status;
+	/* Host data-path generation, valid for data events. */
+	u32 generation;
 };
 
 /*
@@ -187,4 +189,5 @@ int q6asm_map_memory_regions(unsigned int dir,
 			     size_t period_sz, unsigned int periods);
 int q6asm_unmap_memory_regions(unsigned int dir, struct audio_client *ac);
 int q6asm_get_hw_pointer(struct audio_client *ac, unsigned int dir);
+u32 q6asm_get_buffer_generation(struct audio_client *ac, unsigned int dir);
 #endif /* __Q6_ASM_H__ */

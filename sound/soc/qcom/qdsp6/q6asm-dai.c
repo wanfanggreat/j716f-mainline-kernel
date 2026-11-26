@@ -112,6 +112,8 @@ struct q6asm_dai_rtd {
 	struct audio_client *audio_client;
 	struct device *dev;
 	uint32_t stream_id;
+	/* Identity of the mapping the current stream owns; see prepare(). */
+	u32 generation;
 	uint16_t session_id;
 	enum stream_state state;
 	/* ALSA has seen the START trigger; period_elapsed is legal. */
@@ -318,6 +320,34 @@ static bool q6asm_dai_capture_active(struct q6asm_dai_rtd *prtd)
 	return active;
 }
 
+/*
+ * A data event may only act on the mapping that is current and on a stream
+ * the front end still owns.  Q6ASM validates the generation before it emits
+ * the event, but a re-prepare can install a new mapping between that check
+ * and this callback; the front end compares again under its own lock.  The
+ * state guard also keeps completions that arrive during teardown out.
+ * Caller holds prtd->lock.
+ */
+static bool q6asm_dai_stale_event(struct q6asm_dai_rtd *prtd,
+				  const struct q6asm_client_event *event)
+{
+	if (event->id < Q6ASM_EVENT_READ_DONE)
+		return false;
+	if (event->generation != prtd->generation)
+		return true;
+
+	switch (prtd->state) {
+	case Q6ASM_STREAM_PREPARED:
+	case Q6ASM_STREAM_RUNNING:
+	case Q6ASM_STREAM_STARTING:
+	case Q6ASM_STREAM_PAUSING:
+	case Q6ASM_STREAM_PAUSED:
+		return false;
+	default:
+		return true;
+	}
+}
+
 static void event_handler(const struct q6asm_client_event *event, void *priv)
 {
 	struct q6asm_dai_rtd *prtd = priv;
@@ -387,6 +417,10 @@ static void event_handler(const struct q6asm_client_event *event, void *priv)
 
 	case Q6ASM_EVENT_READ_DONE:
 		spin_lock(&prtd->lock);
+		if (q6asm_dai_stale_event(prtd, event)) {
+			spin_unlock(&prtd->lock);
+			break;
+		}
 		if (prtd->state == Q6ASM_STREAM_RUNNING) {
 			if (prtd->started)
 				elapsed = true;
@@ -409,6 +443,10 @@ static void event_handler(const struct q6asm_client_event *event, void *priv)
 		 * rebuilds the queue in order.
 		 */
 		spin_lock(&prtd->lock);
+		if (q6asm_dai_stale_event(prtd, event)) {
+			spin_unlock(&prtd->lock);
+			break;
+		}
 		prtd->state = Q6ASM_STREAM_ERROR;
 		xrun = prtd->started;
 		spin_unlock(&prtd->lock);
@@ -418,6 +456,10 @@ static void event_handler(const struct q6asm_client_event *event, void *priv)
 
 	case Q6ASM_EVENT_WRITE_DONE:
 		spin_lock(&prtd->lock);
+		if (q6asm_dai_stale_event(prtd, event)) {
+			spin_unlock(&prtd->lock);
+			break;
+		}
 		if (prtd->started)
 			elapsed = true;
 		else
@@ -429,6 +471,10 @@ static void event_handler(const struct q6asm_client_event *event, void *priv)
 
 	case Q6ASM_EVENT_WRITE_FAILED:
 		spin_lock(&prtd->lock);
+		if (q6asm_dai_stale_event(prtd, event)) {
+			spin_unlock(&prtd->lock);
+			break;
+		}
 		prtd->state = Q6ASM_STREAM_ERROR;
 		xrun = prtd->started;
 		spin_unlock(&prtd->lock);
@@ -631,6 +677,7 @@ static int q6asm_dai_prepare(struct snd_soc_component *component,
 	struct q6asm_dai_data *pdata;
 	struct device *dev = component->dev;
 	bool was_active;
+	u32 generation;
 	int ret;
 
 	pdata = snd_soc_component_get_drvdata(component);
@@ -690,6 +737,17 @@ static int q6asm_dai_prepare(struct snd_soc_component *component,
 		dev_err(dev, "Audio Start: DMA mapping failed rc = %d\n", ret);
 		return ret;
 	}
+
+	/*
+	 * Remember which data path this stream owns.  A completion that was
+	 * already validated against the previous mapping carries another
+	 * generation and is dropped by the event handler.
+	 */
+	generation = q6asm_get_buffer_generation(prtd->audio_client,
+						 substream->stream);
+	spin_lock(&prtd->lock);
+	prtd->generation = generation;
+	spin_unlock(&prtd->lock);
 
 	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
 		ret = q6asm_open_write(prtd->audio_client, prtd->stream_id,
@@ -1226,6 +1284,15 @@ static void compress_event_handler(const struct q6asm_client_event *event,
 
 	guard(spinlock_irqsave)(&prtd->lock);
 
+	/* A completion for a previous mapping must not touch this stream. */
+	if (event->id >= Q6ASM_EVENT_READ_DONE &&
+	    event->generation != prtd->generation) {
+		dev_dbg_ratelimited(prtd->dev,
+				    "compressed event %u for an old mapping\n",
+				    event->id);
+		return;
+	}
+
 	switch (event->id) {
 	case Q6ASM_EVENT_RUN_DONE:
 		if (event->status) {
@@ -1750,6 +1817,8 @@ static int q6asm_dai_compr_set_params(struct snd_soc_component *component,
 	}
 
 	prtd->map_state = Q6ASM_MAP_CONFIRMED;
+	prtd->generation = q6asm_get_buffer_generation(prtd->audio_client,
+						       dir);
 	return 0;
 
 q6_err:

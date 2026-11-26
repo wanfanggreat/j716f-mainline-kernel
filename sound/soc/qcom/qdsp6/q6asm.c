@@ -319,6 +319,41 @@ struct q6asm;
 #define Q6ASM_TOKEN_INDEX_MASK		GENMASK(7, 0)
 #define Q6ASM_TOKEN_GEN_SHIFT		16
 #define Q6ASM_TOKEN_GEN_MASK		GENMASK(23, 16)
+#define Q6ASM_TOKEN_GEN_MAX		(Q6ASM_TOKEN_GEN_MASK >> \
+					 Q6ASM_TOKEN_GEN_SHIFT)
+
+/*
+ * The data-path generation is a 32-bit host value, but only its low byte
+ * travels in the APR token.  Keep the two apart: the full value proves that
+ * a completion belongs to this mapping, the encoded byte is the part the
+ * firmware echoes back.  Comparing the full value against the decoded byte
+ * (as the first revision did) discarded every valid completion once the
+ * generation passed 255.
+ */
+static inline u32 q6asm_token_gen(u32 generation)
+{
+	return generation & Q6ASM_TOKEN_GEN_MAX;
+}
+
+/*
+ * Data-path generations are host owned and unique across clients and driver
+ * rebinds.  A client that restarted at 1 would accept a completion left in
+ * the APR queue by a destroyed client with the same session id; drawing
+ * every mapping from one module-wide counter removes that alias.  Values
+ * whose encoded byte is zero are skipped, because zero means "no
+ * generation" in the protocol.
+ */
+static atomic_t q6asm_generation_seq = ATOMIC_INIT(0);
+
+static u32 q6asm_next_generation(void)
+{
+	u32 generation = (u32)atomic_inc_return(&q6asm_generation_seq);
+
+	if (!q6asm_token_gen(generation))
+		generation = (u32)atomic_inc_return(&q6asm_generation_seq);
+
+	return generation;
+}
 
 struct audio_client {
 	int session;
@@ -1127,9 +1162,7 @@ int q6asm_map_memory_regions(unsigned int dir, struct audio_client *ac,
 	 * stream can never move this ring's hw_ptr or free its slots.
 	 */
 	spin_lock_irqsave(&ac->lock, flags);
-	ac->port[dir].generation++;
-	if (!ac->port[dir].generation)
-		ac->port[dir].generation = 1;
+	ac->port[dir].generation = q6asm_next_generation();
 	memset(ac->port[dir].submit, 0,
 	       sizeof(*ac->port[dir].submit) * ac->port[dir].num_periods);
 	ac->port[dir].dsp_buf = 0;
@@ -1259,6 +1292,33 @@ int q6asm_get_hw_pointer(struct audio_client *ac, unsigned int dir)
 }
 EXPORT_SYMBOL_GPL(q6asm_get_hw_pointer);
 
+/**
+ * q6asm_get_buffer_generation() - identity of the current data path
+ *
+ * @ac: audio client
+ * @dir: playback or capture port
+ *
+ * The front end records this value after a mapping and compares it with the
+ * generation carried by a completion event.  An event that was validated
+ * just before a re-prepare installed a new mapping is then dropped instead
+ * of advancing the new stream.
+ */
+u32 q6asm_get_buffer_generation(struct audio_client *ac, unsigned int dir)
+{
+	unsigned long flags;
+	u32 generation;
+
+	if (dir >= ARRAY_SIZE(ac->port))
+		return 0;
+
+	spin_lock_irqsave(&ac->lock, flags);
+	generation = ac->port[dir].generation;
+	spin_unlock_irqrestore(&ac->lock, flags);
+
+	return generation;
+}
+EXPORT_SYMBOL_GPL(q6asm_get_buffer_generation);
+
 static void q6asm_notify_client(struct audio_client *ac,
 				const struct q6asm_client_event *event)
 {
@@ -1316,10 +1376,12 @@ static bool q6asm_complete_transfer(struct audio_client *ac, unsigned int dir,
 		goto out;
 	/*
 	 * Only firmware shown to echo the token's generation byte may use it
-	 * as a discriminator; other boards keep the historical matching.
+	 * as a discriminator; other boards keep the historical matching.  The
+	 * decoded byte is compared with the encoded half of submit->generation,
+	 * never with the full host value.
 	 */
 	if ((ac->flags & Q6ASM_CLIENT_TOKEN_GENERATION) &&
-	    submit->generation != generation)
+	    q6asm_token_gen(submit->generation) != generation)
 		goto out;
 	if (stream_id && submit->stream_id != stream_id)
 		goto out;
@@ -1363,6 +1425,8 @@ static bool q6asm_complete_transfer(struct audio_client *ac, unsigned int dir,
 			Q6ASM_EVENT_READ_DONE : Q6ASM_EVENT_WRITE_DONE;
 		event.len = len ? min(len, submit->len) : submit->len;
 	}
+	/* Let the front end drop an event that outlived a re-prepare. */
+	event.generation = port->generation;
 	notify = true;
 out:
 	spin_unlock_irqrestore(&ac->lock, flags);
@@ -1398,7 +1462,7 @@ static void q6asm_data_failed(struct audio_client *ac, unsigned int dir,
 	spin_lock_irqsave(&ac->lock, flags);
 	cur_gen = port->generation;
 	if ((ac->flags & Q6ASM_CLIENT_TOKEN_GENERATION) &&
-	    generation != cur_gen) {
+	    q6asm_token_gen(cur_gen) != generation) {
 		/* A stale or unusable token must not fail a live period. */
 		found = false;
 	} else if (port->submit && port->num_periods) {
@@ -1425,8 +1489,8 @@ static void q6asm_data_failed(struct audio_client *ac, unsigned int dir,
 	dev_dbg_ratelimited(ac->dev,
 			    "data rejection token %#x: failing period %u\n",
 			    token, index);
-	q6asm_complete_transfer(ac, dir, index, cur_gen, stream_id, 0, false,
-				false, 0, 0, 0, status);
+	q6asm_complete_transfer(ac, dir, index, q6asm_token_gen(cur_gen),
+				stream_id, 0, false, false, 0, 0, 0, status);
 }
 
 static int32_t q6asm_stream_callback(struct apr_device *adev,
@@ -2365,7 +2429,7 @@ static int q6asm_post_transfer(struct audio_client *ac, unsigned int dir,
 	}
 
 	ab = &port->buf[index];
-	token = (port->generation << Q6ASM_TOKEN_GEN_SHIFT) |
+	token = (q6asm_token_gen(port->generation) << Q6ASM_TOKEN_GEN_SHIFT) |
 		(index & Q6ASM_TOKEN_INDEX_MASK);
 	pkt->hdr.token = token;
 
@@ -2517,9 +2581,7 @@ static void q6asm_reset_buf_state(struct audio_client *ac)
 		port = &ac->port[dir];
 		if (!port->submit)
 			continue;
-		port->generation++;
-		if (!port->generation)
-			port->generation = 1;
+		port->generation = q6asm_next_generation();
 		memset(port->submit, 0,
 		       sizeof(*port->submit) * port->num_periods);
 		port->dsp_buf = 0;
@@ -2645,9 +2707,8 @@ static void q6asm_inject_spurious(struct q6asm *a)
 		if (!port->buf || !port->submit || !port->num_periods)
 			continue;
 		spin_lock_irqsave(&ac->lock, flags);
-		generation = (port->generation + 1) & 0xff;
-		if (!generation)
-			generation = 0xff;
+		/* Any encoded value except the current one is a stale token. */
+		generation = (q6asm_token_gen(port->generation) % Q6ASM_TOKEN_GEN_MAX) + 1;
 		spin_unlock_irqrestore(&ac->lock, flags);
 		q6asm_complete_transfer(ac, dir, 0, generation, 0,
 					port->buf[0].phys, true, false, 0, 0,
