@@ -19,9 +19,6 @@
 #define ASM_CLIENT_EVENT_CMD_RUN_DONE		0x1008
 #define ASM_CLIENT_EVENT_DATA_WRITE_DONE	0x1009
 #define ASM_CLIENT_EVENT_DATA_READ_DONE		0x100a
-#define ASM_WRITE_TOKEN_MASK			GENMASK(15, 0)
-#define ASM_WRITE_TOKEN_LEN_MASK		GENMASK(31, 16)
-#define ASM_WRITE_TOKEN_LEN_SHIFT		16
 
 enum {
 	LEGACY_PCM_MODE = 0,
@@ -88,18 +85,53 @@ struct q6asm_ape_cfg {
 	u32 seek_table_present;
 };
 
-typedef void (*q6asm_cb) (uint32_t opcode, uint32_t token,
-			  void *payload, void *priv);
+/*
+ * Events delivered to the front-end driver.  Data events are only sent after
+ * the Q6ASM layer has matched the completion to a posted READ/WRITE, so the
+ * front end never has to decode an APR token or payload itself.
+ */
+enum q6asm_client_event_id {
+	Q6ASM_EVENT_RUN_DONE,
+	Q6ASM_EVENT_PAUSE_DONE,
+	Q6ASM_EVENT_EOS_DONE,
+	Q6ASM_EVENT_READ_DONE,
+	Q6ASM_EVENT_READ_FAILED,
+	Q6ASM_EVENT_WRITE_DONE,
+	Q6ASM_EVENT_WRITE_FAILED,
+};
+
+struct q6asm_client_event {
+	enum q6asm_client_event_id id;
+	u32 stream_id;
+	/* Period index inside the mapped ring, valid for data events. */
+	u32 index;
+	/* Bytes the DSP accepted for the transfer, valid for *_DONE. */
+	u32 len;
+	/* DSP status, valid for *_FAILED. */
+	u32 status;
+};
+
+/*
+ * The kona ADSP reports the full ASM_DATA_EVENT_READ_DONE_V2 payload
+ * (status, address, handle, size, timestamps and seq_id).  Validate it
+ * instead of trusting the token alone; other firmware that only sends the
+ * first three words keeps working because seq_id is then not consulted.
+ */
+#define Q6ASM_CLIENT_STRICT_CAPTURE	BIT(0)
+
+typedef void (*q6asm_cb) (const struct q6asm_client_event *event, void *priv);
 struct audio_client;
 struct snd_dma_buffer;
 struct audio_client *q6asm_audio_client_alloc(struct device *dev,
 					      q6asm_cb cb, void *priv,
 					      int session_id, int perf_mode);
+void q6asm_audio_client_set_flags(struct audio_client *ac, unsigned int flags);
 void q6asm_audio_client_clear_callback(struct audio_client *ac);
 void q6asm_audio_client_free(struct audio_client *ac);
 void q6asm_quarantine_session(struct audio_client *ac);
 void q6asm_hold_buffer(struct audio_client *ac, struct snd_dma_buffer *dma,
 		       u32 session);
+int q6asm_dma_device_register(struct device *dev);
 bool q6asm_session_is_quarantined(struct audio_client *ac);
 int q6asm_write_async(struct audio_client *ac, uint32_t stream_id, uint32_t len,
 		      uint32_t msw_ts, uint32_t lsw_ts, uint32_t wflags);
