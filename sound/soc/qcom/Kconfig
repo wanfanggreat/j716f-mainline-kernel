@@ -104,10 +104,13 @@ config SND_SOC_QDSP6_ASM_FAULT_INJECT
 	depends on SND_SOC_QDSP6_ASM
 	help
 	  Add a per-device inject_fault file that makes the next MAP,
-	  CMD_CLOSE or UNMAP command fail once, so the session quarantine and
-	  held-buffer paths can be exercised on real hardware.  Debug only:
-	  the knob is inert unless armed by root and does not belong in a
-	  production kernel.
+	  CMD_CLOSE, UNMAP, RUN or PAUSE command fail once, that can reject a
+	  RUN/PAUSE answer, replay a completion (duplicate or from an old
+	  generation), or swallow the MAP CMDRSP so the command times out and
+	  its opcode is retired.  This lets the session quarantine,
+	  held-buffer, state-rollback and response-correlation paths be
+	  exercised on real hardware.  Debug only: the knob is inert unless
+	  armed by root and does not belong in a production kernel.
 
 config SND_SOC_QDSP6_APM_DAI
 	tristate

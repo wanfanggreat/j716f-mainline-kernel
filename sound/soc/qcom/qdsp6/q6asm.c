@@ -333,8 +333,10 @@ struct q6asm_cmd_rsp {
 	bool overflow;
 	/* A CLOSE answer is owed but could not be recorded in the table. */
 	bool close_owed;
-	/* ADSP instance the retirements belong to; an SSR start voids them. */
+	/* ADSP instance the retirements belong to; an SSR event voids them. */
 	u32 epoch;
+	/* Epoch captured when this command was armed, for the timeout check. */
+	u32 wait_epoch;
 	bool pending;
 	bool done;
 };
@@ -542,7 +544,10 @@ struct q6asm_global {
 	struct srcu_notifier_head *ssr_head;
 	bool adsp_offline;
 	bool reclaim_registered;
-	/* Bumped on every AFTER_POWERUP: a restarted ADSP owes no answers. */
+	/*
+	 * Bumped on AFTER_SHUTDOWN and AFTER_POWERUP: a stopped or restarted
+	 * ADSP owes no answers to the instance the retirements belong to.
+	 */
 	u32 ssr_epoch;
 	unsigned int leaked_buffers;
 	size_t leaked_bytes;
@@ -630,6 +635,18 @@ static bool q6asm_fault_drop(struct audio_client *ac, unsigned int fault)
 
 	return drop;
 }
+
+/* Disarm @fault if a real answer arrived before the one it targets. */
+static void q6asm_fault_clear(struct audio_client *ac, unsigned int fault)
+{
+	struct q6asm *a = ac->q6asm;
+	unsigned long flags;
+
+	spin_lock_irqsave(&a->slock, flags);
+	if (a->fault == fault)
+		a->fault = Q6ASM_FAULT_NONE;
+	spin_unlock_irqrestore(&a->slock, flags);
+}
 #else
 static inline int q6asm_fault_take(struct audio_client *ac, unsigned int fault)
 {
@@ -646,6 +663,11 @@ static inline bool q6asm_fault_drop(struct audio_client *ac,
 				    unsigned int fault)
 {
 	return false;
+}
+
+static inline void q6asm_fault_clear(struct audio_client *ac,
+				     unsigned int fault)
+{
 }
 #endif
 
@@ -1087,6 +1109,7 @@ static int q6asm_cmd_rsp_arm(struct audio_client *ac, u32 opcode)
 			rsp->opcode = opcode;
 			rsp->status = 0;
 			rsp->handle = 0;
+			rsp->wait_epoch = rsp->epoch;
 			rsp->done = false;
 			rsp->pending = true;
 			rc = 0;
@@ -1258,7 +1281,7 @@ static int q6asm_send_cmd_sync(struct audio_client *ac, struct apr_pkt *pkt,
 		*handle = rsp->handle;
 	if (!done) {
 		rsp->pending = false;
-		if (rsp->epoch == READ_ONCE(q6asm_global.ssr_epoch)) {
+		if (rsp->wait_epoch == READ_ONCE(q6asm_global.ssr_epoch)) {
 			q6asm_rsp_mark_stale_locked(rsp, expected);
 		} else {
 			/*
@@ -2161,14 +2184,18 @@ static int q6asm_srvc_callback(struct apr_device *adev,
 			/*
 			 * A status-0 basic result only acknowledges the command;
 			 * the mapping handle arrives in the CMDRSP.  A non-zero
-			 * status is the real answer and fails the wait.
+			 * status is the real answer and fails the wait.  If a
+			 * dropmap injection was armed, this real answer must not
+			 * leave it behind for a later session.
 			 */
-			if (result->status)
+			if (result->status) {
+				q6asm_fault_clear(ac, Q6ASM_FAULT_DROP_MAP);
 				q6asm_cmd_rsp_claim(ac, result->opcode,
 						    result->status, 0);
-			else
+			} else {
 				dev_dbg(ac->dev,
 					"MAP accepted without a handle, waiting for the response\n");
+			}
 			break;
 		case ASM_CMD_SHARED_MEM_UNMAP_REGIONS:
 			q6asm_cmd_rsp_claim(ac, result->opcode,
@@ -3306,6 +3333,8 @@ static ssize_t inject_fault_show(struct device *dev,
  *   echo runreject:reject   > .../inject_fault # DSP rejects the next RUN
  *   echo duplicate      > .../inject_fault  # replay a completion twice
  *   echo spurious       > .../inject_fault  # replay an old completion
+ *   echo dropmap        > .../inject_fault  # swallow the next MAP CMDRSP
+ *                                           # (times out and retires MAP)
  *   echo clear          > .../inject_fault  # disarm
  *
  * "timeout" returns -ETIMEDOUT, "reject" returns -EINVAL (the value the
