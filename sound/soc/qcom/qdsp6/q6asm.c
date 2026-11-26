@@ -1654,6 +1654,21 @@ EXPORT_SYMBOL_GPL(q6asm_audio_client_free);
  */
 void q6asm_quarantine_session(struct audio_client *ac)
 {
+	/*
+	 * A stop or restart after the failed command was armed already
+	 * discarded the remote state (AFTER_SHUTDOWN clears the table); the
+	 * timeout is only the host noticing late.  Latching the session then
+	 * would make it unusable even though nothing of the old instance
+	 * survives.
+	 */
+	if (READ_ONCE(ac->rsp.wait_epoch) !=
+	    READ_ONCE(q6asm_global.ssr_epoch)) {
+		dev_dbg(ac->dev,
+			"session %d: ADSP epoch changed, quarantine skipped\n",
+			ac->session);
+		return;
+	}
+
 	mutex_lock(&q6asm_global.lock);
 	set_bit(ac->session, q6asm_global.session_quarantine);
 	mutex_unlock(&q6asm_global.lock);
@@ -2295,6 +2310,12 @@ struct audio_client *q6asm_audio_client_alloc(struct device *dev, q6asm_cb cb,
 
 	init_waitqueue_head(&ac->rsp.wait);
 	spin_lock_init(&ac->rsp.lock);
+	/*
+	 * A client that has not armed a command yet belongs to the current
+	 * instance; the quarantine guard compares this value.
+	 */
+	ac->rsp.epoch = READ_ONCE(q6asm_global.ssr_epoch);
+	ac->rsp.wait_epoch = ac->rsp.epoch;
 	mutex_init(&ac->cmd_lock);
 	mutex_init(&ac->cb_lock);
 	spin_lock_init(&ac->lock);
