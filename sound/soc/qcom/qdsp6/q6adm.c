@@ -45,10 +45,12 @@ struct q6copp {
 	int channels;
 	int app_type;
 	int acdb_id;
-	/* DEVICE_OPEN succeeded; only then is DEVICE_CLOSE meaningful. */
-	bool opened;
 	/* The CMDRSP delivered the COPP id; the basic ACK alone does not. */
 	bool id_valid;
+	/* The DSP accepted DEVICE_OPEN but never delivered a COPP id. */
+	bool acked;
+	/* Generation carried in the token; rejects older COPP's responses. */
+	u8 gen;
 	/* Opcode of the command currently waiting on copp->wait, or 0. */
 	u32 pending_opcode;
 
@@ -73,6 +75,8 @@ struct q6adm {
 	 */
 	spinlock_t result_lock;
 	bool map_pending;
+	u32 map_gen;
+	u8 copp_gen;
 	struct mutex lock;
 	wait_queue_head_t matrix_map_wait;
 };
@@ -149,7 +153,8 @@ static int q6adm_apr_send_copp_pkt(struct q6adm *adm, struct q6copp *copp,
 	 * Wait for the id, or for a rejection.
 	 */
 	ret = wait_event_timeout(copp->wait,
-				 copp->id_valid || copp->result.status > 0,
+				 READ_ONCE(copp->id_valid) ||
+				 READ_ONCE(copp->result.status) > 0,
 				 msecs_to_jiffies(TIMEOUT_MS));
 	if (!ret) {
 		/*
@@ -158,15 +163,15 @@ static int q6adm_apr_send_copp_pkt(struct q6adm *adm, struct q6copp *copp,
 		 * this, a firmware that only sends the basic ACK would make
 		 * every open time out with the same generic message.
 		 */
-		if (copp->result.opcode == pkt->hdr.opcode)
+		if (READ_ONCE(copp->result.opcode) == pkt->hdr.opcode)
 			dev_err(dev,
 				"DEVICE_OPEN acked without a COPP id (CMDRSP missing or unmatched)\n");
 		else
 			dev_err(dev, "ADM copp cmd timedout\n");
 		ret = -ETIMEDOUT;
-	} else if (copp->result.status > 0) {
-		dev_err(dev, "DSP returned error[%d]\n",
-			copp->result.status);
+	} else if (READ_ONCE(copp->result.status) > 0) {
+		dev_err(dev, "DSP returned error[%u]\n",
+			READ_ONCE(copp->result.status));
 		ret = -EINVAL;
 	} else {
 		ret = 0;
@@ -190,7 +195,8 @@ static int q6adm_device_close(struct q6adm *adm, struct q6copp *copp)
 	close.hdr.pkt_size = sizeof(close);
 	close.hdr.src_port = copp->afe_port;
 	close.hdr.dest_port = copp->id;
-	close.hdr.token = copp->afe_port << 16 | copp->copp_idx;
+	close.hdr.token = copp->afe_port << 16 | (copp->gen << 8) |
+			 copp->copp_idx;
 	close.hdr.opcode = ADM_CMD_DEVICE_CLOSE_V5;
 
 	/*
@@ -215,38 +221,52 @@ static void q6adm_free_copp(struct kref *ref)
 	 * close no longer needs the list entry to find its response.
 	 */
 	spin_lock_irqsave(&adm->copps_list_lock, flags);
-	clear_bit(c->copp_idx, &adm->copp_bitmap[c->afe_port]);
 	list_del(&c->node);
 	spin_unlock_irqrestore(&adm->copps_list_lock, flags);
 
-	if (c->opened) {
-		if (c->id_valid) {
-			ret = q6adm_device_close(adm, c);
-			if (ret < 0)
-				dev_err(adm->dev, "Failed to close copp %d: %d\n",
-					c->copp_idx, ret);
-		} else {
+	if (c->id_valid) {
+		ret = q6adm_device_close(adm, c);
+		if (ret < 0) {
+			dev_err(adm->dev, "Failed to close copp %d: %d\n",
+				c->copp_idx, ret);
 			/*
-			 * The DSP may have opened the device even though its
-			 * CMDRSP never reached us.  There is no id to close
-			 * with, so the COPP stays until the ADSP restarts.
+			 * The command never left the host; the DSP COPP stays
+			 * until the ADSP restarts.  Counted by its warning.
 			 */
 			dev_warn_ratelimited(adm->dev,
-					     "COPP %d left open on the DSP: no id\n",
+					     "COPP %d left open on the DSP: close send failed\n",
 					     c->copp_idx);
 		}
+	} else if (c->acked) {
+		/*
+		 * The DSP accepted DEVICE_OPEN but its CMDRSP never reached
+		 * us.  There is no id to close with, so the COPP stays until
+		 * the ADSP restarts.
+		 */
+		dev_warn_ratelimited(adm->dev,
+				     "COPP %d left open on the DSP: acked without an id\n",
+				     c->copp_idx);
 	}
+
+	/*
+	 * Keep the index reserved until the close packet is queued, so a new
+	 * DEVICE_OPEN cannot overtake the close for the same token.
+	 */
+	spin_lock_irqsave(&adm->copps_list_lock, flags);
+	clear_bit(c->copp_idx, &adm->copp_bitmap[c->afe_port]);
+	spin_unlock_irqrestore(&adm->copps_list_lock, flags);
 	kfree(c);
 }
 
 /* Caller holds copps_list_lock; no reference is taken. */
 static struct q6copp *q6adm_peek_copp(struct q6adm *adm, int port_idx,
-				      int copp_idx)
+				      int copp_idx, u8 gen)
 {
 	struct q6copp *c;
 
 	list_for_each_entry(c, &adm->copps_list, node)
-		if (c->afe_port == port_idx && c->copp_idx == copp_idx)
+		if (c->afe_port == port_idx && c->copp_idx == copp_idx &&
+		    c->gen == gen)
 			return c;
 
 	return NULL;
@@ -259,12 +279,14 @@ static int q6adm_callback(struct apr_device *adev, const struct apr_resp_pkt *da
 	const struct apr_hdr *hdr = &data->hdr;
 	struct q6copp *copp;
 	struct q6adm *adm = dev_get_drvdata(&adev->dev);
+	u8 gen;
 
 	if (data->payload_size < sizeof(u32))
 		return 0;
 
 	copp_idx = (hdr->token) & 0XFF;
 	port_idx = ((hdr->token) >> 16) & 0xFF;
+	gen = ((hdr->token) >> 8) & 0xFF;
 	if (port_idx < 0 || port_idx >= AFE_MAX_PORTS) {
 		dev_err(&adev->dev, "Invalid port idx %d token %d\n",
 		       port_idx, hdr->token);
@@ -296,9 +318,12 @@ static int q6adm_callback(struct apr_device *adev, const struct apr_resp_pkt *da
 			 * timed-out waiter cannot free it in between.
 			 */
 			spin_lock_irqsave(&adm->copps_list_lock, flags);
-			copp = q6adm_peek_copp(adm, port_idx, copp_idx);
+			copp = q6adm_peek_copp(adm, port_idx, copp_idx, gen);
 			if (copp && copp->pending_opcode == result->opcode) {
 				copp->result = *result;
+				if (result->opcode == ADM_CMD_DEVICE_OPEN_V5 &&
+				    !result->status)
+					copp->acked = true;
 				wake_up(&copp->wait);
 			}
 			spin_unlock_irqrestore(&adm->copps_list_lock, flags);
@@ -312,7 +337,8 @@ static int q6adm_callback(struct apr_device *adev, const struct apr_resp_pkt *da
 			 * timed-out map is dropped.
 			 */
 			spin_lock_irqsave(&adm->result_lock, flags);
-			if (adm->map_pending) {
+			if (adm->map_pending &&
+			    hdr->token == (adm->map_gen << 8)) {
 				adm->result = *result;
 				adm->map_pending = false;
 				wake_up(&adm->matrix_map_wait);
@@ -340,7 +366,7 @@ static int q6adm_callback(struct apr_device *adev, const struct apr_resp_pkt *da
 			return -EPROTO;
 
 		spin_lock_irqsave(&adm->copps_list_lock, flags);
-		copp = q6adm_peek_copp(adm, port_idx, copp_idx);
+		copp = q6adm_peek_copp(adm, port_idx, copp_idx, gen);
 		if (!copp || copp->pending_opcode != ADM_CMD_DEVICE_OPEN_V5) {
 			dev_warn_ratelimited(&adev->dev,
 					     "unexpected DEVICE_OPEN rsp for COPP %d:%d\n",
@@ -389,6 +415,7 @@ static struct q6copp *q6adm_alloc_copp(struct q6adm *adm, int port_idx)
 	set_bit(idx, &adm->copp_bitmap[port_idx]);
 	c->copp_idx = idx;
 	c->afe_port = port_idx;
+	c->gen = adm->copp_gen++;
 	c->adm = adm;
 
 	init_waitqueue_head(&c->wait);
@@ -446,7 +473,7 @@ static int q6adm_device_open(struct q6adm *adm, struct q6copp *copp,
 	pkt->hdr.pkt_size = pkt_size;
 	pkt->hdr.src_port = afe_port;
 	pkt->hdr.dest_port = afe_port;
-	pkt->hdr.token = port_id << 16 | copp->copp_idx;
+	pkt->hdr.token = port_id << 16 | (copp->gen << 8) | copp->copp_idx;
 	pkt->hdr.opcode = ADM_CMD_DEVICE_OPEN_V5;
 	open->flags = ADM_LEGACY_DEVICE_SESSION;
 	open->mode_of_operation = path;
@@ -520,20 +547,15 @@ struct q6copp *q6adm_open(struct device *dev, int port_id, int path, int rate,
 	copp->bit_width = bit_width;
 	copp->app_type = app_type;
 	/*
-	 * Mark it opened before publication; a concurrent close during the
-	 * DEVICE_OPEN round trip sends a harmless rejected close, while a
-	 * missing close after a successful open would leak the remote COPP.
+	 * Publish the COPP before the DEVICE_OPEN round trip: the APR RX
+	 * worker must be able to find it by token when the response arrives.
 	 */
-	copp->opened = true;
 	list_add_tail(&copp->node, &adm->copps_list);
 	spin_unlock_irqrestore(&adm->copps_list_lock, flags);
 
 	ret = q6adm_device_open(adm, copp, port_id, path, topology,
 				channel_mode, bit_width, rate);
 	if (ret < 0) {
-		spin_lock_irqsave(&adm->copps_list_lock, flags);
-		copp->opened = false;
-		spin_unlock_irqrestore(&adm->copps_list_lock, flags);
 		kref_put(&copp->refcount, q6adm_free_copp);
 		return ERR_PTR(ret);
 	}
@@ -630,13 +652,13 @@ int q6adm_matrix_map(struct device *dev, int path,
 		if (!copp)
 			return -EINVAL;
 
-		if (!copp->id_valid) {
+		if (!READ_ONCE(copp->id_valid)) {
 			/* The DEVICE_OPEN CMDRSP has not arrived yet. */
 			kref_put(&copp->refcount, q6adm_free_copp);
 			return -EAGAIN;
 		}
 
-		copps_list[i] = copp->id;
+		copps_list[i] = READ_ONCE(copp->id);
 		kref_put(&copp->refcount, q6adm_free_copp);
 	}
 
@@ -644,6 +666,10 @@ int q6adm_matrix_map(struct device *dev, int path,
 	spin_lock_irqsave(&adm->result_lock, flags);
 	adm->result.status = 0;
 	adm->result.opcode = 0;
+	adm->map_gen++;
+	if (!adm->map_gen)
+		adm->map_gen++;
+	pkt->hdr.token = adm->map_gen << 8;
 	adm->map_pending = true;
 	spin_unlock_irqrestore(&adm->result_lock, flags);
 

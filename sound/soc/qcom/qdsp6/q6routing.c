@@ -391,6 +391,20 @@ static struct msm_routing_data routing_data = {
 	.lock = __MUTEX_INITIALIZER(routing_data.lock),
 };
 
+static void q6routing_close_session_copps(struct msm_routing_data *data,
+					  struct session_data *session)
+{
+	unsigned long j;
+
+	for_each_set_bit(j, &session->copp_map, MAX_COPPS_PER_PORT) {
+		if (session->copps[j]) {
+			q6adm_close(data->dev, session->copps[j]);
+			session->copps[j] = NULL;
+		}
+	}
+	session->copp_map = 0;
+}
+
 /**
  * q6routing_stream_open() - Register a new stream for route setup
  *
@@ -442,6 +456,7 @@ int q6routing_stream_open(int fedai_id, int perf_mode,
 			  perf_mode, session->bits_per_sample, 0, 0);
 	if (IS_ERR_OR_NULL(copp)) {
 		ret = copp ? PTR_ERR(copp) : -EINVAL;
+		q6routing_close_session_copps(data, session);
 		session->fedai_id = -1;
 		goto unlock;
 	}
@@ -480,15 +495,7 @@ int q6routing_stream_open(int fedai_id, int perf_mode,
 			 * call, or the rest would become unreachable once
 			 * fedai_id is cleared.
 			 */
-			for_each_set_bit(j, &session->copp_map,
-					 MAX_COPPS_PER_PORT) {
-				if (session->copps[j]) {
-					q6adm_close(data->dev,
-						    session->copps[j]);
-					session->copps[j] = NULL;
-				}
-			}
-			session->copp_map = 0;
+			q6routing_close_session_copps(data, session);
 			session->fedai_id = -1;
 		}
 	}
@@ -585,6 +592,13 @@ static int msm_routing_put_audio_mixer(struct snd_kcontrol *kcontrol,
 		return -ENODEV;
 
 	mutex_lock(&data->lock);
+	if (data->sessions[session_id].copp_map) {
+		dev_err(data->dev,
+			"cannot change the port of a routed session %d\n",
+			session_id);
+		mutex_unlock(&data->lock);
+		return -EBUSY;
+	}
 	if (ucontrol->value.integer.value[0]) {
 		if (data->sessions[session_id].port_id != be_id) {
 			data->sessions[session_id].port_id = be_id;
