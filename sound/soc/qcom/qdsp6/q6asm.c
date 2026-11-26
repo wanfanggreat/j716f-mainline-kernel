@@ -304,15 +304,41 @@ struct audio_port_data {
  * One synchronous command at a time per client.  The APR RX worker writes
  * the response fields while the caller sleeps in wait_event_timeout(); the
  * lock covers the fields, the waitqueue is only woken under it.
+ *
+ * A response is only allowed to complete the command that owns it.  When a
+ * synchronous command times out its response may still arrive, so the
+ * opcode is retired: a later command of the same opcode is refused until
+ * that response has been consumed or a confirmed CLOSE has retired the
+ * session.  Fire-and-forget commands need a credit for the same reason, so
+ * their responses cannot be mistaken for a synchronous waiter (or the other
+ * way round) and a duplicate cannot drive a state event a second time.
  */
+#define Q6ASM_RSP_STALE_MAX	4
+#define Q6ASM_RSP_ASYNC_MAX	4
+
 struct q6asm_cmd_rsp {
 	spinlock_t lock;
 	wait_queue_head_t wait;
 	u32 opcode;
 	u32 status;
 	u32 handle;
+	/* Opcodes whose answer never arrived. */
+	u32 stale[Q6ASM_RSP_STALE_MAX];
+	/* In-flight fire-and-forget commands, one entry per opcode. */
+	struct {
+		u32 opcode;
+		u32 count;
+	} async[Q6ASM_RSP_ASYNC_MAX];
+	/* Too many unanswered opcodes to track: refuse all new commands. */
+	bool overflow;
 	bool pending;
 	bool done;
+};
+
+enum q6asm_rsp_owner {
+	Q6ASM_RSP_NONE = 0,
+	Q6ASM_RSP_SYNC,
+	Q6ASM_RSP_ASYNC,
 };
 
 struct q6asm;
@@ -808,18 +834,138 @@ static inline void q6asm_add_hdr(struct audio_client *ac, struct apr_hdr *hdr,
  * so an asynchronous READ/WRITE result or a late answer cannot complete or
  * corrupt a newer command.
  */
-static void q6asm_cmd_rsp_arm(struct audio_client *ac, u32 opcode)
+/* All q6asm_rsp_*_locked() helpers require rsp->lock. */
+static bool q6asm_rsp_stale_locked(struct q6asm_cmd_rsp *rsp, u32 opcode)
+{
+	int i;
+
+	for (i = 0; i < Q6ASM_RSP_STALE_MAX; i++)
+		if (rsp->stale[i] == opcode)
+			return true;
+
+	return false;
+}
+
+static void q6asm_rsp_mark_stale_locked(struct q6asm_cmd_rsp *rsp, u32 opcode)
+{
+	int i, slot = -1;
+
+	if (q6asm_rsp_stale_locked(rsp, opcode))
+		return;
+
+	for (i = 0; i < Q6ASM_RSP_STALE_MAX; i++) {
+		if (!rsp->stale[i]) {
+			slot = i;
+			break;
+		}
+	}
+
+	if (slot < 0) {
+		rsp->overflow = true;
+		return;
+	}
+	rsp->stale[slot] = opcode;
+}
+
+static bool q6asm_rsp_clear_stale_locked(struct q6asm_cmd_rsp *rsp, u32 opcode)
+{
+	int i;
+
+	for (i = 0; i < Q6ASM_RSP_STALE_MAX; i++) {
+		if (rsp->stale[i] == opcode) {
+			rsp->stale[i] = 0;
+			return true;
+		}
+	}
+
+	return false;
+}
+
+static bool q6asm_rsp_async_locked(struct q6asm_cmd_rsp *rsp, u32 opcode)
+{
+	int i;
+
+	for (i = 0; i < Q6ASM_RSP_ASYNC_MAX; i++)
+		if (rsp->async[i].opcode == opcode && rsp->async[i].count)
+			return true;
+
+	return false;
+}
+
+static int q6asm_rsp_async_begin_locked(struct q6asm_cmd_rsp *rsp, u32 opcode)
+{
+	int i, slot = -1;
+
+	for (i = 0; i < Q6ASM_RSP_ASYNC_MAX; i++) {
+		if (rsp->async[i].opcode == opcode) {
+			rsp->async[i].count++;
+			return 0;
+		}
+		if (!rsp->async[i].opcode && slot < 0)
+			slot = i;
+	}
+
+	if (slot < 0)
+		return -EBUSY;
+
+	rsp->async[slot].opcode = opcode;
+	rsp->async[slot].count = 1;
+	return 0;
+}
+
+static void q6asm_rsp_async_end_locked(struct q6asm_cmd_rsp *rsp, u32 opcode)
+{
+	int i;
+
+	for (i = 0; i < Q6ASM_RSP_ASYNC_MAX; i++) {
+		if (rsp->async[i].opcode == opcode) {
+			if (--rsp->async[i].count == 0)
+				rsp->async[i].opcode = 0;
+			return;
+		}
+	}
+}
+
+static bool q6asm_rsp_async_take_locked(struct q6asm_cmd_rsp *rsp, u32 opcode)
+{
+	int i;
+
+	for (i = 0; i < Q6ASM_RSP_ASYNC_MAX; i++) {
+		if (rsp->async[i].opcode == opcode && rsp->async[i].count) {
+			if (--rsp->async[i].count == 0)
+				rsp->async[i].opcode = 0;
+			return true;
+		}
+	}
+
+	return false;
+}
+
+static int q6asm_cmd_rsp_arm(struct audio_client *ac, u32 opcode)
 {
 	struct q6asm_cmd_rsp *rsp = &ac->rsp;
 	unsigned long flags;
+	int rc = 0;
 
 	spin_lock_irqsave(&rsp->lock, flags);
-	rsp->opcode = opcode;
-	rsp->status = 0;
-	rsp->handle = 0;
-	rsp->done = false;
-	rsp->pending = true;
+	if (rsp->overflow || q6asm_rsp_stale_locked(rsp, opcode) ||
+	    q6asm_rsp_async_locked(rsp, opcode)) {
+		/*
+		 * An answer for this opcode is still owed (or its owner can
+		 * no longer be told apart), so a new command must not reuse
+		 * the opcode: the late response would complete it.
+		 */
+		rc = -EIO;
+	} else {
+		rsp->opcode = opcode;
+		rsp->status = 0;
+		rsp->handle = 0;
+		rsp->done = false;
+		rsp->pending = true;
+	}
 	spin_unlock_irqrestore(&rsp->lock, flags);
+
+	return rc;
 }
 
 static void q6asm_cmd_rsp_disarm(struct audio_client *ac)
@@ -833,16 +979,37 @@ static void q6asm_cmd_rsp_disarm(struct audio_client *ac)
 }
 
 /*
- * Returns true when the response belonged to the waiting command.  A basic
- * MAP result with status 0 is an "accepted" notice, not the mapping result,
- * so the caller passes it only when it carries a real failure.
+ * A confirmed CLOSE ends the stream, and the ADSP answers the commands of
+ * one session in order.  Every earlier response has therefore been consumed
+ * (or is the one still owed and about to be delivered), so the stream's
+ * opcodes may be used again on the next session.
  */
-static bool q6asm_cmd_rsp_complete(struct audio_client *ac, u32 opcode,
-				   u32 status, u32 handle)
+static void q6asm_cmd_rsp_forget_stream(struct audio_client *ac)
 {
 	struct q6asm_cmd_rsp *rsp = &ac->rsp;
 	unsigned long flags;
-	bool matched = false;
+
+	spin_lock_irqsave(&rsp->lock, flags);
+	memset(rsp->stale, 0, sizeof(rsp->stale));
+	memset(rsp->async, 0, sizeof(rsp->async));
+	rsp->overflow = false;
+	spin_unlock_irqrestore(&rsp->lock, flags);
+}
+
+/*
+ * Attribute one response to its owner.  A timed-out opcode consumes its late
+ * answer, a fire-and-forget command consumes one credit, and a duplicate or
+ * otherwise unowned response changes nothing.  A basic MAP result with
+ * status 0 is an "accepted" notice, not the mapping result, so the caller
+ * passes it only when it carries a real failure.
+ */
+static enum q6asm_rsp_owner q6asm_cmd_rsp_claim(struct audio_client *ac,
+						u32 opcode, u32 status,
+						u32 handle)
+{
+	struct q6asm_cmd_rsp *rsp = &ac->rsp;
+	unsigned long flags;
+	enum q6asm_rsp_owner owner = Q6ASM_RSP_NONE;
 
 	spin_lock_irqsave(&rsp->lock, flags);
 	if (rsp->pending && rsp->opcode == opcode) {
@@ -850,12 +1017,49 @@ static bool q6asm_cmd_rsp_complete(struct audio_client *ac, u32 opcode,
 		rsp->handle = handle;
 		rsp->done = true;
 		rsp->pending = false;
-		matched = true;
+		owner = Q6ASM_RSP_SYNC;
 		wake_up(&rsp->wait);
+	} else if (q6asm_rsp_clear_stale_locked(rsp, opcode)) {
+		dev_dbg_ratelimited(ac->dev,
+				    "late response for retired command %#x dropped\n",
+				    opcode);
+	} else if (q6asm_rsp_async_take_locked(rsp, opcode)) {
+		owner = Q6ASM_RSP_ASYNC;
+	} else {
+		dev_dbg_ratelimited(ac->dev,
+				    "unowned response %#x dropped\n", opcode);
 	}
 	spin_unlock_irqrestore(&rsp->lock, flags);
 
-	return matched;
+	return owner;
+}
+
+/* Reserve a credit before sending so a fast response cannot arrive first. */
+static int q6asm_cmd_rsp_async_begin(struct audio_client *ac, u32 opcode)
+{
+	struct q6asm_cmd_rsp *rsp = &ac->rsp;
+	unsigned long flags;
+	int rc;
+
+	spin_lock_irqsave(&rsp->lock, flags);
+	if (rsp->overflow || q6asm_rsp_stale_locked(rsp, opcode) ||
+	    (rsp->pending && rsp->opcode == opcode))
+		rc = -EIO;
+	else
+		rc = q6asm_rsp_async_begin_locked(rsp, opcode);
+	spin_unlock_irqrestore(&rsp->lock, flags);
+
+	return rc;
+}
+
+static void q6asm_cmd_rsp_async_end(struct audio_client *ac, u32 opcode)
+{
+	struct q6asm_cmd_rsp *rsp = &ac->rsp;
+	unsigned long flags;
+
+	spin_lock_irqsave(&rsp->lock, flags);
+	q6asm_rsp_async_end_locked(rsp, opcode);
+	spin_unlock_irqrestore(&rsp->lock, flags);
 }
 
 static int q6asm_send_cmd_sync(struct audio_client *ac, struct apr_pkt *pkt,
@@ -869,7 +1073,13 @@ static int q6asm_send_cmd_sync(struct audio_client *ac, struct apr_pkt *pkt,
 	int rc;
 
 	mutex_lock(&ac->cmd_lock);
-	q6asm_cmd_rsp_arm(ac, expected);
+	rc = q6asm_cmd_rsp_arm(ac, expected);
+	if (rc < 0) {
+		dev_err_ratelimited(ac->dev,
+				    "CMD %#x refused: an earlier answer is still owed\n",
+				    expected);
+		goto out;
+	}
 
 	rc = apr_send_pkt(a->adev, pkt);
 	if (rc < 0) {
@@ -889,12 +1099,16 @@ static int q6asm_send_cmd_sync(struct audio_client *ac, struct apr_pkt *pkt,
 	status = rsp->status;
 	if (handle)
 		*handle = rsp->handle;
-	if (!done)
+	if (!done) {
 		rsp->pending = false;
+		q6asm_rsp_mark_stale_locked(rsp, expected);
+	}
 	spin_unlock_irqrestore(&rsp->lock, flags);
 
 	if (!done) {
-		dev_err(ac->dev, "CMD %#x timeout\n", pkt->hdr.opcode);
+		dev_err(ac->dev,
+			"CMD %#x timeout; its response is retired\n",
+			pkt->hdr.opcode);
 		rc = -ETIMEDOUT;
 	} else if (status) {
 		dev_err(ac->dev,
@@ -1557,6 +1771,7 @@ static int32_t q6asm_stream_callback(struct apr_device *adev,
 			break;
 		case ASM_SESSION_CMD_RUN_V2: {
 			u32 status = result->status;
+			enum q6asm_rsp_owner owner;
 
 			/*
 			 * The ADSP answers ADSP_EALREADY when the session is
@@ -1565,33 +1780,40 @@ static int32_t q6asm_stream_callback(struct apr_device *adev,
 			 */
 			if (status == ADSP_EALREADY)
 				status = ADSP_EOK;
-			q6asm_cmd_rsp_complete(ac, result->opcode, status, 0);
-			q6asm_emit_simple(ac, Q6ASM_EVENT_RUN_DONE, stream_id,
-					  status);
+			owner = q6asm_cmd_rsp_claim(ac, result->opcode, status, 0);
+			if (owner != Q6ASM_RSP_NONE)
+				q6asm_emit_simple(ac, Q6ASM_EVENT_RUN_DONE,
+						  stream_id, status);
 			break;
 		}
 		case ASM_SESSION_CMD_PAUSE: {
 			u32 status = result->status;
+			enum q6asm_rsp_owner owner;
 
 			if (status == ADSP_EALREADY)
 				status = ADSP_EOK;
-			q6asm_cmd_rsp_complete(ac, result->opcode, status, 0);
-			q6asm_emit_simple(ac, Q6ASM_EVENT_PAUSE_DONE,
-					  stream_id, status);
+			owner = q6asm_cmd_rsp_claim(ac, result->opcode, status, 0);
+			if (owner != Q6ASM_RSP_NONE)
+				q6asm_emit_simple(ac, Q6ASM_EVENT_PAUSE_DONE,
+						  stream_id, status);
 			break;
 		}
-		case ASM_DATA_CMD_EOS:
-			q6asm_cmd_rsp_complete(ac, result->opcode,
-					       result->status, 0);
-			q6asm_emit_simple(ac, Q6ASM_EVENT_EOS_DONE, stream_id,
-					  result->status);
+		case ASM_DATA_CMD_EOS: {
+			enum q6asm_rsp_owner owner;
+
+			owner = q6asm_cmd_rsp_claim(ac, result->opcode,
+						    result->status, 0);
+			if (owner != Q6ASM_RSP_NONE)
+				q6asm_emit_simple(ac, Q6ASM_EVENT_EOS_DONE,
+						  stream_id, result->status);
 			break;
+		}
 		case ASM_STREAM_CMD_CLOSE:
 		case ASM_SESSION_CMD_SUSPEND:
 		case ASM_STREAM_CMD_FLUSH:
 		case ASM_STREAM_CMD_FLUSH_READBUFS:
-			q6asm_cmd_rsp_complete(ac, result->opcode,
-					       result->status, 0);
+			q6asm_cmd_rsp_claim(ac, result->opcode,
+					    result->status, 0);
 			break;
 		case ASM_STREAM_CMD_OPEN_WRITE_V3:
 		case ASM_STREAM_CMD_OPEN_READ_V3:
@@ -1600,8 +1822,8 @@ static int32_t q6asm_stream_callback(struct apr_device *adev,
 		case ASM_DATA_CMD_MEDIA_FMT_UPDATE_V2:
 		case ASM_DATA_CMD_REMOVE_INITIAL_SILENCE:
 		case ASM_DATA_CMD_REMOVE_TRAILING_SILENCE:
-			q6asm_cmd_rsp_complete(ac, result->opcode,
-					       result->status, 0);
+			q6asm_cmd_rsp_claim(ac, result->opcode,
+					    result->status, 0);
 			break;
 		default:
 			dev_dbg_ratelimited(ac->dev,
@@ -1756,15 +1978,15 @@ static int q6asm_srvc_callback(struct apr_device *adev,
 			 * status is the real answer and fails the wait.
 			 */
 			if (result->status)
-				q6asm_cmd_rsp_complete(ac, result->opcode,
-						       result->status, 0);
+				q6asm_cmd_rsp_claim(ac, result->opcode,
+						    result->status, 0);
 			else
 				dev_dbg(ac->dev,
 					"MAP accepted without a handle, waiting for the response\n");
 			break;
 		case ASM_CMD_SHARED_MEM_UNMAP_REGIONS:
-			q6asm_cmd_rsp_complete(ac, result->opcode,
-					       result->status, 0);
+			q6asm_cmd_rsp_claim(ac, result->opcode,
+					    result->status, 0);
 			break;
 		default:
 			dev_dbg_ratelimited(ac->dev,
@@ -1776,13 +1998,13 @@ static int q6asm_srvc_callback(struct apr_device *adev,
 	case ASM_CMDRSP_SHARED_MEM_MAP_REGIONS:
 		if (data->payload_size < sizeof(u32))
 			break;
-		q6asm_cmd_rsp_complete(ac, ASM_CMD_SHARED_MEM_MAP_REGIONS, 0,
-				       result->opcode);
+		q6asm_cmd_rsp_claim(ac, ASM_CMD_SHARED_MEM_MAP_REGIONS, 0,
+				    result->opcode);
 		break;
 	case ASM_CMD_SHARED_MEM_UNMAP_REGIONS:
 		/* Some firmware echoes the command opcode as its answer. */
-		q6asm_cmd_rsp_complete(ac, ASM_CMD_SHARED_MEM_UNMAP_REGIONS, 0,
-				       0);
+		q6asm_cmd_rsp_claim(ac, ASM_CMD_SHARED_MEM_UNMAP_REGIONS, 0,
+				    0);
 		break;
 	default:
 		dev_dbg_ratelimited(ac->dev, "unexpected map-session opcode %#x\n",
@@ -2018,9 +2240,23 @@ static int __q6asm_run(struct audio_client *ac, uint32_t stream_id,
 	if (wait) {
 		rc = q6asm_ac_send_cmd_sync(ac, pkt);
 	} else {
+		/*
+		 * Reserve the response before the send: the basic result can
+		 * arrive on the APR worker as soon as the packet is queued.
+		 */
+		rc = q6asm_cmd_rsp_async_begin(ac, pkt->hdr.opcode);
+		if (rc < 0) {
+			dev_err_ratelimited(ac->dev,
+					    "nowait RUN refused: an earlier answer is still owed\n");
+			return rc;
+		}
 		rc = apr_send_pkt(ac->adev, pkt);
-		if (rc == pkt_size)
+		if (rc == pkt_size) {
 			rc = 0;
+		} else {
+			q6asm_cmd_rsp_async_end(ac, pkt->hdr.opcode);
+			rc = rc < 0 ? rc : -EIO;
+		}
 	}
 
 	return rc;
@@ -2650,14 +2886,30 @@ static int __q6asm_cmd(struct audio_client *ac, uint32_t stream_id, int cmd,
 		/*
 		 * apr_send_pkt() reports the packet size on success; the
 		 * callers use zero for "accepted" and negative for errors.
+		 * Reserve the response before sending, or an immediate basic
+		 * result would find no owner.
 		 */
+		rc = q6asm_cmd_rsp_async_begin(ac, pkt.hdr.opcode);
+		if (rc < 0)
+			return rc;
 		rc = apr_send_pkt(ac->adev, &pkt);
-		return rc < 0 ? rc : 0;
+		if (rc < 0) {
+			q6asm_cmd_rsp_async_end(ac, pkt.hdr.opcode);
+			return rc;
+		}
+		if (rc != pkt.hdr.pkt_size) {
+			q6asm_cmd_rsp_async_end(ac, pkt.hdr.opcode);
+			return -EIO;
+		}
+		return 0;
 	}
 
 	rc = q6asm_ac_send_cmd_sync(ac, &pkt);
 	if (rc < 0)
 		return rc;
+
+	if (cmd == CMD_CLOSE)
+		q6asm_cmd_rsp_forget_stream(ac);
 
 	if (cmd == CMD_FLUSH)
 		q6asm_reset_buf_state(ac);
