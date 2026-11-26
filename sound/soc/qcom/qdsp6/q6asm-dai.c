@@ -351,11 +351,12 @@ static bool q6asm_dai_stale_event(struct q6asm_dai_rtd *prtd,
  * Force the stream into XRUN.  snd_pcm_stop_xrun() only acts on a running
  * stream, but a pause the DSP rejected leaves ALSA in PAUSED and a failure
  * can arrive while the START trigger is still between its state change and
- * its wakeup.  snd_pcm_stop() must be called with the stream lock held (the
- * core's __snd_pcm_xrun does exactly that), so take it here and set XRUN
- * from every state where the stream is still live.  SUSPENDED, SETUP and
- * DISCONNECTED are left alone: forcing XRUN there would turn a system
- * suspend or a removed device into a recoverable stream.
+ * its wakeup.  snd_pcm_stop() requires the stream lock (the core's
+ * __snd_pcm_xrun() runs with it held; snd_pcm_stop_xrun() is the wrapper
+ * that takes it), so take the lock here and set XRUN from every state where
+ * the stream is still live.  SUSPENDED, SETUP and DISCONNECTED are left
+ * alone: forcing XRUN there would turn a system suspend or a removed device
+ * into a recoverable stream.
  */
 static void q6asm_dai_abort_stream(struct snd_pcm_substream *substream)
 {
@@ -855,6 +856,19 @@ static int q6asm_dai_prepare(struct snd_soc_component *component,
 				      prtd->bits_per_sample);
 	if (ret < 0) {
 		dev_err(dev, "q6asm_open failed %d\n", ret);
+		/*
+		 * A lost or malformed answer means the DSP may have opened
+		 * the stream anyway.  There is no confirmed stream to close,
+		 * so retire the session rather than let a later client reuse
+		 * it.  The remote stream (if any) is reclaimed by the ADSP
+		 * restart; this is a protocol limitation, not a host leak.
+		 */
+		if (ret == -ETIMEDOUT || ret == -EPROTO) {
+			dev_err(dev,
+				"open result unknown; session %d quarantined\n",
+				prtd->stream_id);
+			q6asm_quarantine_session(prtd->audio_client);
+		}
 		goto err_unmap;
 	}
 	prtd->stream_opened = true;
@@ -1150,7 +1164,8 @@ static int q6asm_dai_trigger(struct snd_soc_component *component,
 		 * the change and a failed send, be discarded, and leave the
 		 * stream in STARTING with no completion left.  The send does
 		 * not sleep on this board's APR transport (GLINK trysend only
-		 * takes spinlocks and returns -EAGAIN); it is not claimed to
+		 * takes spinlocks and returns -EAGAIN when the TX pipe is full
+		 * or -EBUSY when no RX intent is free); it is not claimed to
 		 * be sleepable-safe on a virtio-rpmsg transport.
 		 */
 		spin_lock(&prtd->lock);
