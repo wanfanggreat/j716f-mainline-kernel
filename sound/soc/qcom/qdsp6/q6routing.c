@@ -474,9 +474,21 @@ int q6routing_stream_open(int fedai_id, int perf_mode,
 			dev_err(data->dev,
 				"ADM matrix map failed for stream %d: %d\n",
 				stream_id, ret);
-			q6adm_close(data->dev, session->copps[copp_idx]);
-			session->copps[copp_idx] = NULL;
-			clear_bit(copp_idx, &session->copp_map);
+			/*
+			 * The whole session's route is unusable now.  Close
+			 * every COPP it holds, not just the one added by this
+			 * call, or the rest would become unreachable once
+			 * fedai_id is cleared.
+			 */
+			for_each_set_bit(j, &session->copp_map,
+					 MAX_COPPS_PER_PORT) {
+				if (session->copps[j]) {
+					q6adm_close(data->dev,
+						    session->copps[j]);
+					session->copps[j] = NULL;
+				}
+			}
+			session->copp_map = 0;
 			session->fedai_id = -1;
 		}
 	}

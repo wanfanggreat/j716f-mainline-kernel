@@ -3,22 +3,13 @@
 #define __Q6_ASM_H__
 #include "q6dsp-common.h"
 
-/* ASM client callback events */
+/* Commands issued through q6asm_cmd()/q6asm_cmd_nowait(). */
 #define CMD_PAUSE			0x0001
-#define ASM_CLIENT_EVENT_CMD_PAUSE_DONE		0x1001
 #define CMD_FLUSH				0x0002
-#define ASM_CLIENT_EVENT_CMD_FLUSH_DONE		0x1002
 #define CMD_EOS				0x0003
-#define ASM_CLIENT_EVENT_CMD_EOS_DONE		0x1003
 #define CMD_CLOSE				0x0004
-#define ASM_CLIENT_EVENT_CMD_CLOSE_DONE		0x1004
 #define CMD_OUT_FLUSH				0x0005
-#define ASM_CLIENT_EVENT_CMD_OUT_FLUSH_DONE	0x1005
 #define CMD_SUSPEND				0x0006
-#define ASM_CLIENT_EVENT_CMD_SUSPEND_DONE	0x1006
-#define ASM_CLIENT_EVENT_CMD_RUN_DONE		0x1008
-#define ASM_CLIENT_EVENT_DATA_WRITE_DONE	0x1009
-#define ASM_CLIENT_EVENT_DATA_READ_DONE		0x100a
 
 enum {
 	LEGACY_PCM_MODE = 0,
@@ -93,7 +84,10 @@ struct q6asm_ape_cfg {
 enum q6asm_client_event_id {
 	Q6ASM_EVENT_RUN_DONE,
 	Q6ASM_EVENT_PAUSE_DONE,
+	/* The DSP accepted the EOS command. */
 	Q6ASM_EVENT_EOS_DONE,
+	/* The DSP rendered the last buffer (ASM_DATA_EVENT_RENDERED_EOS). */
+	Q6ASM_EVENT_EOS_RENDERED,
 	Q6ASM_EVENT_READ_DONE,
 	Q6ASM_EVENT_READ_FAILED,
 	Q6ASM_EVENT_WRITE_DONE,
@@ -118,6 +112,12 @@ struct q6asm_client_event {
  * first three words keeps working because seq_id is then not consulted.
  */
 #define Q6ASM_CLIENT_STRICT_CAPTURE	BIT(0)
+/*
+ * The token's byte 2 carries the data-path generation.  Only firmware that
+ * has been shown to echo that byte unchanged may rely on it; other boards
+ * keep the historical token-only matching.
+ */
+#define Q6ASM_CLIENT_TOKEN_GENERATION	BIT(1)
 
 typedef void (*q6asm_cb) (const struct q6asm_client_event *event, void *priv);
 struct audio_client;
@@ -129,7 +129,7 @@ void q6asm_audio_client_set_flags(struct audio_client *ac, unsigned int flags);
 void q6asm_audio_client_clear_callback(struct audio_client *ac);
 void q6asm_audio_client_free(struct audio_client *ac);
 void q6asm_quarantine_session(struct audio_client *ac);
-void q6asm_hold_buffer(struct audio_client *ac, struct snd_dma_buffer *dma,
+bool q6asm_hold_buffer(struct audio_client *ac, struct snd_dma_buffer *dma,
 		       u32 session);
 int q6asm_dma_device_register(struct device *dev);
 bool q6asm_session_is_quarantined(struct audio_client *ac);

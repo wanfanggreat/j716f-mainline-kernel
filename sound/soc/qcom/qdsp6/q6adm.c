@@ -559,6 +559,12 @@ int q6adm_matrix_map(struct device *dev, int path,
 		if (!copp)
 			return -EINVAL;
 
+		if (!copp->id) {
+			/* The DEVICE_OPEN response has not arrived yet. */
+			kref_put(&copp->refcount, q6adm_free_copp);
+			return -EAGAIN;
+		}
+
 		copps_list[i] = copp->id;
 		kref_put(&copp->refcount, q6adm_free_copp);
 	}

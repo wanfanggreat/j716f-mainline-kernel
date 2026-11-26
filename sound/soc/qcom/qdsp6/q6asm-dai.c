@@ -111,11 +111,7 @@ struct q6asm_dai_rtd {
 	uint16_t source; /* Encoding source bit mask */
 	struct audio_client *audio_client;
 	struct device *dev;
-	uint32_t next_track_stream_id;
-	bool next_track;
 	uint32_t stream_id;
-	/* Stream closed with a nowait CLOSE at a gapless switch. */
-	uint32_t prev_stream_id;
 	uint16_t session_id;
 	enum stream_state state;
 	/* ALSA has seen the START trigger; period_elapsed is legal. */
@@ -271,6 +267,9 @@ static const struct snd_compr_codec_caps q6asm_compr_caps = {
 	.descriptor[0].formats = 0,
 };
 
+static int q6asm_dai_queue_playback(struct q6asm_dai_rtd *prtd,
+				    struct snd_pcm_runtime *runtime);
+
 static int q6asm_dai_fill_capture(struct q6asm_dai_rtd *prtd)
 {
 	int i, rc = 0;
@@ -323,7 +322,7 @@ static void event_handler(const struct q6asm_client_event *event, void *priv)
 {
 	struct q6asm_dai_rtd *prtd = priv;
 	struct snd_pcm_substream *substream = prtd->substream;
-	bool elapsed = false, xrun = false, retry = false;
+	bool elapsed = false, xrun = false, retry = false, play = false;
 
 	if (!substream)
 		return;
@@ -341,6 +340,9 @@ static void event_handler(const struct q6asm_client_event *event, void *priv)
 			retry = (substream->stream ==
 				 SNDRV_PCM_STREAM_CAPTURE) &&
 				prtd->state == Q6ASM_STREAM_RUNNING;
+			play = (substream->stream ==
+				SNDRV_PCM_STREAM_PLAYBACK) &&
+			       prtd->started;
 		} else {
 			prtd->state = Q6ASM_STREAM_ERROR;
 			xrun = prtd->started;
@@ -348,6 +350,17 @@ static void event_handler(const struct q6asm_client_event *event, void *priv)
 		spin_unlock(&prtd->lock);
 		if (retry)
 			q6asm_dai_fill_or_fail(prtd, substream);
+		if (play) {
+			int qrc = q6asm_dai_queue_playback(prtd,
+							   substream->runtime);
+
+			if (qrc < 0 && qrc != -EAGAIN) {
+				spin_lock(&prtd->lock);
+				prtd->state = Q6ASM_STREAM_ERROR;
+				spin_unlock(&prtd->lock);
+				xrun = prtd->started;
+			}
+		}
 		if (elapsed)
 			snd_pcm_period_elapsed(substream);
 		if (xrun)
@@ -559,12 +572,15 @@ static int q6asm_dai_release_remote(struct snd_soc_component *component,
 		ret = -EIO;
 	}
 
-	if (!failed) {
-		q6routing_stream_close(soc_prtd->dai_link->id,
-				       substream->stream);
-		prtd->state = Q6ASM_STREAM_IDLE;
+	/*
+	 * The routing table is host-only state and must not outlive the
+	 * stream even when the remote teardown is unresolved.
+	 */
+	q6routing_stream_close(soc_prtd->dai_link->id, substream->stream);
+	prtd->state = Q6ASM_STREAM_IDLE;
+
+	if (!failed)
 		return 0;
-	}
 
 	prtd->teardown_failed = true;
 	prtd->needs_hold = true;
@@ -582,22 +598,27 @@ static void q6asm_dai_hold_pcm_buffer(struct snd_pcm_substream *substream,
 {
 	struct snd_pcm_runtime *runtime = substream->runtime;
 	struct snd_dma_buffer *dma = runtime->dma_buffer_p;
-	bool dynamic;
+	bool dynamic, held;
 
 	if (prtd->dma_held || !dma)
 		return;
 
 	dynamic = dma != &substream->dma_buffer;
-	q6asm_hold_buffer(prtd->audio_client, dma, prtd->session_id);
+	held = q6asm_hold_buffer(prtd->audio_client, dma, prtd->session_id);
 	prtd->dma_held = true;
 
 	if (dynamic) {
-		/* ALSA would free this at hw_free; the hold record owns it now. */
+		/* ALSA would free this at hw_free; detach it in every case. */
 		runtime->dma_buffer_p = NULL;
 		runtime->dma_area = NULL;
 		runtime->dma_addr = 0;
 		runtime->dma_bytes = 0;
-		kfree(dma);
+		if (held)
+			kfree(dma);
+	} else if (!held) {
+		/* Keep the pages mapped but out of ALSA's free path. */
+		dma->area = NULL;
+		dma->bytes = 0;
 	}
 }
 
@@ -768,24 +789,17 @@ err_unmap:
 	return ret;
 }
 
-static int q6asm_dai_ack(struct snd_soc_component *component,
-			 struct snd_pcm_substream *substream)
+/*
+ * Queue the periods the application has already written but the DSP has not
+ * seen.  Caller holds prtd->lock; a completion can arrive as soon as the
+ * packet is queued, so queue_ptr advances only after a successful send.
+ */
+static int q6asm_dai_queue_playback_locked(struct q6asm_dai_rtd *prtd,
+					   struct snd_pcm_runtime *runtime)
 {
-	struct snd_pcm_runtime *runtime = substream->runtime;
-	struct q6asm_dai_rtd *prtd = runtime->private_data;
 	snd_pcm_uframes_t appl, qp, delta, boundary;
 	unsigned int avail;
-	bool running;
-	int i, rc;
-
-	if (substream->stream != SNDRV_PCM_STREAM_PLAYBACK)
-		return 0;
-
-	spin_lock(&prtd->lock);
-	running = prtd->state == Q6ASM_STREAM_RUNNING;
-	spin_unlock(&prtd->lock);
-	if (!running)
-		return 0;
+	int i, rc, ret = 0;
 
 	if (!runtime->period_size || !runtime->periods)
 		return 0;
@@ -794,43 +808,71 @@ static int q6asm_dai_ack(struct snd_soc_component *component,
 	if (!boundary)
 		return -EINVAL;
 
-	/*
-	 * appl_ptr wraps at runtime->boundary; a plain subtraction can
-	 * underflow and make the loop below queue an unbounded number of
-	 * periods under the PCM stream lock.
-	 */
-	appl = runtime->control->appl_ptr;
+	appl = READ_ONCE(runtime->control->appl_ptr);
 	qp = prtd->queue_ptr;
 	if (qp >= boundary)
 		qp %= boundary;
 
 	delta = (appl >= qp) ? appl - qp : boundary - qp + appl;
 	if (delta > runtime->buffer_size) {
-		dev_warn_ratelimited(component->dev,
-				     "J716F: ack delta %lu > buffer %lu, clamping\n",
+		dev_warn_ratelimited(prtd->dev,
+				     "J716F: queue delta %lu > buffer %lu, clamping\n",
 				     (unsigned long)delta,
 				     (unsigned long)runtime->buffer_size);
 		delta = runtime->buffer_size;
 	}
 
 	avail = delta / runtime->period_size;
+	if (avail > runtime->periods)
+		avail = runtime->periods;
 	if (!avail)
 		return 0;
 
 	for (i = 0; i < (int)avail; i++) {
 		rc = q6asm_write_async(prtd->audio_client, prtd->stream_id,
 				       prtd->pcm_count, 0, 0, 0);
-		if (rc < 0)
+		if (rc < 0) {
+			ret = rc;
 			break;
+		}
 		prtd->queue_ptr = (qp + runtime->period_size) % boundary;
 		qp = prtd->queue_ptr;
 	}
 
 	/* A full ring is not an error; the next completion frees a slot. */
-	if (rc == -EAGAIN)
+	if (ret == -EAGAIN)
 		return 0;
 
-	return rc;
+	return ret;
+}
+
+static int q6asm_dai_queue_playback(struct q6asm_dai_rtd *prtd,
+				    struct snd_pcm_runtime *runtime)
+{
+	unsigned long flags;
+	int ret;
+
+	spin_lock_irqsave(&prtd->lock, flags);
+	if (prtd->state != Q6ASM_STREAM_RUNNING) {
+		spin_unlock_irqrestore(&prtd->lock, flags);
+		return 0;
+	}
+	ret = q6asm_dai_queue_playback_locked(prtd, runtime);
+	spin_unlock_irqrestore(&prtd->lock, flags);
+
+	return ret;
+}
+
+static int q6asm_dai_ack(struct snd_soc_component *component,
+			 struct snd_pcm_substream *substream)
+{
+	struct snd_pcm_runtime *runtime = substream->runtime;
+	struct q6asm_dai_rtd *prtd = runtime->private_data;
+
+	if (substream->stream != SNDRV_PCM_STREAM_PLAYBACK)
+		return 0;
+
+	return q6asm_dai_queue_playback(prtd, runtime);
 }
 
 static int q6asm_dai_trigger(struct snd_soc_component *component,
@@ -1009,10 +1051,13 @@ static int q6asm_dai_open(struct snd_soc_component *component,
 		kfree(prtd);
 		return ret;
 	}
-	if (pdata->j716f &&
-	    substream->stream == SNDRV_PCM_STREAM_CAPTURE)
-		q6asm_audio_client_set_flags(prtd->audio_client,
-					     Q6ASM_CLIENT_STRICT_CAPTURE);
+	if (pdata->j716f) {
+		unsigned int flags = Q6ASM_CLIENT_TOKEN_GENERATION;
+
+		if (substream->stream == SNDRV_PCM_STREAM_CAPTURE)
+			flags |= Q6ASM_CLIENT_STRICT_CAPTURE;
+		q6asm_audio_client_set_flags(prtd->audio_client, flags);
+	}
 
 	/* DSP expects stream id from 1 */
 	prtd->stream_id = 1;
@@ -1086,8 +1131,6 @@ static int q6asm_dai_hw_free(struct snd_soc_component *component,
 {
 	struct snd_pcm_runtime *runtime = substream->runtime;
 	struct q6asm_dai_rtd *prtd = runtime->private_data;
-	int ret;
-
 	if (!prtd || !prtd->audio_client)
 		return 0;
 
@@ -1096,7 +1139,7 @@ static int q6asm_dai_hw_free(struct snd_soc_component *component,
 	prtd->elapsed_pending = false;
 	spin_unlock(&prtd->lock);
 
-	ret = q6asm_dai_release_remote(component, substream, prtd);
+	q6asm_dai_release_remote(component, substream, prtd);
 	if (prtd->needs_hold) {
 		q6asm_dai_hold_pcm_buffer(substream, prtd);
 		prtd->needs_hold = false;
@@ -1210,19 +1253,14 @@ static void compress_event_handler(const struct q6asm_client_event *event,
 			dev_warn_ratelimited(prtd->dev,
 					     "compressed EOS rejected: %u\n",
 					     event->status);
-		if (prtd->notify_on_drain) {
-			if (substream->partial_drain) {
-				/*
-				 * Close the old stream and make it stale; keep
-				 * its id so teardown can confirm the close.
-				 */
-				prtd->prev_stream_id = prtd->stream_id;
-				q6asm_cmd_nowait(prtd->audio_client,
-						 prtd->stream_id, CMD_CLOSE);
-				/* Valid stream ids start from 1. */
-				prtd->stream_id = (prtd->stream_id == 1 ? 2 : 1);
-			}
+		break;
 
+	case Q6ASM_EVENT_EOS_RENDERED:
+		/*
+		 * Drain completes when the DSP has rendered the last buffer,
+		 * not when it accepted the EOS command.
+		 */
+		if (prtd->notify_on_drain) {
 			snd_compr_drain_notify(prtd->cstream);
 			prtd->notify_on_drain = false;
 		}
@@ -1246,13 +1284,13 @@ static void compress_event_handler(const struct q6asm_client_event *event,
 		if (prtd->bytes_received - prtd->bytes_sent > prtd->pcm_count) {
 			bytes_to_write = prtd->pcm_count;
 		} else {
-			if (substream->partial_drain || prtd->notify_on_drain)
+			if (prtd->notify_on_drain)
 				is_last_buffer = true;
 			bytes_to_write = prtd->bytes_received - prtd->bytes_sent;
 		}
 
 		if (bytes_to_write) {
-			if (substream->partial_drain && is_last_buffer) {
+			if (is_last_buffer) {
 				wflags |= ASM_LAST_BUFFER_FLAG;
 				q6asm_stream_remove_trailing_silence(prtd->audio_client,
 						     prtd->stream_id,
@@ -1377,32 +1415,6 @@ static bool q6asm_dai_compr_teardown(struct snd_soc_component *component,
 		}
 	}
 
-	if (prtd->next_track_stream_id) {
-		ret = q6asm_cmd(ac, prtd->next_track_stream_id, CMD_CLOSE);
-		if (ret < 0) {
-			dev_err(component->dev,
-				"J716F: compr gapless CMD_CLOSE failed %d\n", ret);
-			q6asm_quarantine_session(ac);
-			failed = true;
-		} else {
-			prtd->next_track_stream_id = 0;
-		}
-	}
-
-	if (prtd->prev_stream_id) {
-		/*
-		 * This id was closed with a nowait CLOSE at a gapless switch.
-		 * A rejection here means there is no such stream left (the
-		 * asynchronous close already ran); it cannot leak anything.
-		 */
-		ret = q6asm_cmd(ac, prtd->prev_stream_id, CMD_CLOSE);
-		if (ret < 0)
-			dev_warn(component->dev,
-				 "J716F: gapless stream %u was already closed (%d)\n",
-				 prtd->prev_stream_id, ret);
-		prtd->prev_stream_id = 0;
-	}
-
 	if (!failed && prtd->map_state == Q6ASM_MAP_CONFIRMED) {
 		ret = q6asm_unmap_memory_regions(dir, ac);
 		if (ret < 0) {
@@ -1448,10 +1460,14 @@ static int q6asm_dai_compr_free(struct snd_soc_component *component,
 			prtd->teardown_unknown = true;
 
 		if (prtd->teardown_unknown && !prtd->dma_held) {
-			q6asm_hold_buffer(prtd->audio_client, &prtd->dma_buffer,
-					  prtd->stream_id);
-			prtd->dma_held = true;
-		} else if (!prtd->dma_held) {
+			if (q6asm_hold_buffer(prtd->audio_client,
+					      &prtd->dma_buffer,
+					      prtd->session_id))
+				prtd->dma_held = true;
+			else
+				dev_err(component->dev,
+					"J716F: cannot hold the compressed DMA buffer; leaving the pages\n");
+		} else if (!prtd->teardown_unknown) {
 			snd_dma_free_pages(&prtd->dma_buffer);
 		}
 		q6asm_audio_client_free(prtd->audio_client);
@@ -1760,36 +1776,14 @@ static int q6asm_dai_compr_set_metadata(struct snd_soc_component *component,
 
 	switch (metadata->key) {
 	case SNDRV_COMPRESS_ENCODER_PADDING:
+		spin_lock(&prtd->lock);
 		prtd->trailing_samples_drop = metadata->value[0];
+		spin_unlock(&prtd->lock);
 		break;
 	case SNDRV_COMPRESS_ENCODER_DELAY:
+		spin_lock(&prtd->lock);
 		prtd->initial_samples_drop = metadata->value[0];
-		if (prtd->next_track_stream_id) {
-			ret = q6asm_open_write(prtd->audio_client,
-					       prtd->next_track_stream_id,
-					       prtd->codec.id,
-					       prtd->codec.profile,
-					       prtd->bits_per_sample,
-				       true);
-			if (ret < 0) {
-				dev_err(component->dev, "q6asm_open_write failed\n");
-				return ret;
-			}
-			ret = __q6asm_dai_compr_set_codec_params(component, stream,
-								 &prtd->codec,
-								 prtd->next_track_stream_id);
-			if (ret < 0) {
-				dev_err(component->dev, "q6asm_open_write failed\n");
-				return ret;
-			}
-
-			ret = q6asm_stream_remove_initial_silence(prtd->audio_client,
-						    prtd->next_track_stream_id,
-						    prtd->initial_samples_drop);
-			prtd->next_track_stream_id = 0;
-
-		}
-
+		spin_unlock(&prtd->lock);
 		break;
 	default:
 		ret = -EINVAL;
@@ -1847,13 +1841,19 @@ static int q6asm_dai_compr_trigger(struct snd_soc_component *component,
 		ret = q6asm_cmd_nowait(prtd->audio_client, prtd->stream_id,
 				       CMD_PAUSE);
 		break;
-	case SND_COMPR_TRIGGER_NEXT_TRACK:
-		prtd->next_track = true;
-		prtd->next_track_stream_id = (prtd->stream_id == 1 ? 2 : 1);
-		break;
 	case SND_COMPR_TRIGGER_DRAIN:
-	case SND_COMPR_TRIGGER_PARTIAL_DRAIN:
+		spin_lock(&prtd->lock);
 		prtd->notify_on_drain = true;
+		spin_unlock(&prtd->lock);
+		break;
+	case SND_COMPR_TRIGGER_NEXT_TRACK:
+	case SND_COMPR_TRIGGER_PARTIAL_DRAIN:
+		/*
+		 * The stream-id rotation needs a second OPEN and a MAP that
+		 * this driver has never validated on the kona firmware.
+		 * Refuse it instead of writing to an id that was never opened.
+		 */
+		ret = -EOPNOTSUPP;
 		break;
 	default:
 		ret = -EINVAL;
@@ -1909,15 +1909,6 @@ static int q6asm_compr_copy(struct snd_soc_component *component,
 	bytes_received = prtd->bytes_received;
 	temp_bytes_received = bytes_received;
 
-	/**
-	 * Make sure that next track data pointer is aligned at 32 bit boundary
-	 * This is a Mandatory requirement from DSP data buffers alignment
-	 */
-	if (prtd->next_track) {
-		bytes_received = ALIGN(prtd->bytes_received, prtd->pcm_count);
-		temp_bytes_received = bytes_received;
-	}
-
 	app_pointer = do_div(temp_bytes_received, prtd->pcm_size);
 	dstn = prtd->dma_buffer.area + app_pointer;
 
@@ -1942,12 +1933,6 @@ static int q6asm_compr_copy(struct snd_soc_component *component,
 		bytes_in_flight = 0;
 	} else {
 		bytes_in_flight = prtd->bytes_received - prtd->copied_total;
-	}
-
-	if (prtd->next_track) {
-		prtd->next_track = false;
-		prtd->copied_total = ALIGN(prtd->copied_total, prtd->pcm_count);
-		prtd->bytes_sent = ALIGN(prtd->bytes_sent, prtd->pcm_count);
 	}
 
 	prtd->bytes_received = bytes_received + count;
