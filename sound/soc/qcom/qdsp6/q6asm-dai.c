@@ -256,6 +256,8 @@ static void event_handler(uint32_t opcode, uint32_t token,
 					       prtd->stream_id) == 0)
 					prtd->reads_inflight++;
 			}
+			pr_info_ratelimited("J716F-CAP: run posted inflight=%u periods=%u\n",
+					    prtd->reads_inflight, prtd->periods);
 		}
 		break;
 	case ASM_CLIENT_EVENT_CMD_EOS_DONE:
@@ -266,7 +268,12 @@ static void event_handler(uint32_t opcode, uint32_t token,
 		atomic_dec_if_positive(&prtd->write_inflight);
 		snd_pcm_period_elapsed(substream);
 		break;
-	case ASM_CLIENT_EVENT_DATA_READ_DONE:
+	case ASM_CLIENT_EVENT_DATA_READ_DONE: {
+		int rerr;
+
+		pr_info_ratelimited("J716F-CAP: read done state=%d inflight=%u periods=%u\n",
+				    READ_ONCE(prtd->state), prtd->reads_inflight,
+				    prtd->periods);
 		snd_pcm_period_elapsed(substream);
 		/*
 		 * One read just completed, so one slot in the ADSP queue freed
@@ -279,13 +286,18 @@ static void event_handler(uint32_t opcode, uint32_t token,
 			prtd->reads_inflight--;
 		while (READ_ONCE(prtd->state) == Q6ASM_STREAM_RUNNING &&
 		       prtd->reads_inflight < prtd->periods) {
-			if (q6asm_read(prtd->audio_client,
-				       prtd->stream_id) != 0)
+			rerr = q6asm_read(prtd->audio_client, prtd->stream_id);
+			if (rerr) {
+				pr_info_ratelimited("J716F-CAP: requeue failed %d state=%d inflight=%u\n",
+						    rerr, READ_ONCE(prtd->state),
+						    prtd->reads_inflight);
 				break;
+			}
 			prtd->reads_inflight++;
 		}
 
 		break;
+	}
 	default:
 		break;
 	}
