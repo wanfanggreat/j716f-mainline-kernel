@@ -592,20 +592,27 @@ static int msm_routing_put_audio_mixer(struct snd_kcontrol *kcontrol,
 		return -ENODEV;
 
 	mutex_lock(&data->lock);
-	if (data->sessions[session_id].copp_map) {
-		dev_err(data->dev,
-			"cannot change the port of a routed session %d\n",
-			session_id);
-		mutex_unlock(&data->lock);
-		return -EBUSY;
-	}
 	if (ucontrol->value.integer.value[0]) {
 		if (data->sessions[session_id].port_id != be_id) {
+			if (data->sessions[session_id].copp_map) {
+				dev_err(data->dev,
+					"cannot change the port of a routed session %d\n",
+					session_id);
+				mutex_unlock(&data->lock);
+				return -EBUSY;
+			}
 			data->sessions[session_id].port_id = be_id;
 			changed = true;
 		}
 	} else {
 		if (data->sessions[session_id].port_id == be_id) {
+			if (data->sessions[session_id].copp_map) {
+				dev_err(data->dev,
+					"cannot unroute a session with COPPs %d\n",
+					session_id);
+				mutex_unlock(&data->lock);
+				return -EBUSY;
+			}
 			data->sessions[session_id].port_id = -1;
 			changed = true;
 		}

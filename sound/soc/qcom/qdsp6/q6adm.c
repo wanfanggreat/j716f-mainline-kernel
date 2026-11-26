@@ -77,6 +77,8 @@ struct q6adm {
 	bool map_pending;
 	u32 map_gen;
 	u8 copp_gen;
+	/* J716F firmware is verified to echo token bits 8-15. */
+	bool token_gen;
 	struct mutex lock;
 	wait_queue_head_t matrix_map_wait;
 };
@@ -195,8 +197,9 @@ static int q6adm_device_close(struct q6adm *adm, struct q6copp *copp)
 	close.hdr.pkt_size = sizeof(close);
 	close.hdr.src_port = copp->afe_port;
 	close.hdr.dest_port = copp->id;
-	close.hdr.token = copp->afe_port << 16 | (copp->gen << 8) |
-			 copp->copp_idx;
+	close.hdr.token = copp->afe_port << 16 | copp->copp_idx;
+	if (adm->token_gen)
+		close.hdr.token |= copp->gen << 8;
 	close.hdr.opcode = ADM_CMD_DEVICE_CLOSE_V5;
 
 	/*
@@ -266,7 +269,7 @@ static struct q6copp *q6adm_peek_copp(struct q6adm *adm, int port_idx,
 
 	list_for_each_entry(c, &adm->copps_list, node)
 		if (c->afe_port == port_idx && c->copp_idx == copp_idx &&
-		    c->gen == gen)
+		    (!adm->token_gen || c->gen == gen))
 			return c;
 
 	return NULL;
@@ -338,7 +341,8 @@ static int q6adm_callback(struct apr_device *adev, const struct apr_resp_pkt *da
 			 */
 			spin_lock_irqsave(&adm->result_lock, flags);
 			if (adm->map_pending &&
-			    hdr->token == (adm->map_gen << 8)) {
+			    (!adm->token_gen ||
+			     hdr->token == (adm->map_gen << 8))) {
 				adm->result = *result;
 				adm->map_pending = false;
 				wake_up(&adm->matrix_map_wait);
@@ -473,7 +477,9 @@ static int q6adm_device_open(struct q6adm *adm, struct q6copp *copp,
 	pkt->hdr.pkt_size = pkt_size;
 	pkt->hdr.src_port = afe_port;
 	pkt->hdr.dest_port = afe_port;
-	pkt->hdr.token = port_id << 16 | (copp->gen << 8) | copp->copp_idx;
+	pkt->hdr.token = port_id << 16 | copp->copp_idx;
+	if (adm->token_gen)
+		pkt->hdr.token |= copp->gen << 8;
 	pkt->hdr.opcode = ADM_CMD_DEVICE_OPEN_V5;
 	open->flags = ADM_LEGACY_DEVICE_SESSION;
 	open->mode_of_operation = path;
@@ -666,10 +672,11 @@ int q6adm_matrix_map(struct device *dev, int path,
 	spin_lock_irqsave(&adm->result_lock, flags);
 	adm->result.status = 0;
 	adm->result.opcode = 0;
-	adm->map_gen++;
+	/* The generation lives in token bits 8-15; keep the port byte 0. */
+	adm->map_gen = (adm->map_gen + 1) & 0xFF;
 	if (!adm->map_gen)
-		adm->map_gen++;
-	pkt->hdr.token = adm->map_gen << 8;
+		adm->map_gen = 1;
+	pkt->hdr.token = adm->token_gen ? adm->map_gen << 8 : 0;
 	adm->map_pending = true;
 	spin_unlock_irqrestore(&adm->result_lock, flags);
 
@@ -737,6 +744,8 @@ static int q6adm_probe(struct apr_device *adev)
 	adm->apr = adev;
 	dev_set_drvdata(dev, adm);
 	adm->dev = dev;
+	adm->token_gen = IS_ENABLED(CONFIG_OF) &&
+			 of_machine_is_compatible("lenovo,j716f");
 	q6core_get_svc_api_info(adev->svc_id, &adm->ainfo);
 	mutex_init(&adm->lock);
 	spin_lock_init(&adm->result_lock);
