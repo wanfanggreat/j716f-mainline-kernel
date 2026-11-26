@@ -331,6 +331,8 @@ struct q6asm_cmd_rsp {
 	} async[Q6ASM_RSP_ASYNC_MAX];
 	/* Too many unanswered opcodes to track: refuse all new commands. */
 	bool overflow;
+	/* ADSP instance the retirements belong to; an SSR start voids them. */
+	u32 epoch;
 	bool pending;
 	bool done;
 };
@@ -536,6 +538,8 @@ struct q6asm_global {
 	struct srcu_notifier_head *ssr_head;
 	bool adsp_offline;
 	bool reclaim_registered;
+	/* Bumped on every AFTER_POWERUP: a restarted ADSP owes no answers. */
+	u32 ssr_epoch;
 	unsigned int leaked_buffers;
 	size_t leaked_bytes;
 };
@@ -751,6 +755,7 @@ static int q6asm_ssr_notify(struct notifier_block *nb, unsigned long event,
 	case QCOM_SSR_AFTER_POWERUP:
 		mutex_lock(&q6asm_global.lock);
 		q6asm_global.adsp_offline = false;
+		q6asm_global.ssr_epoch++;
 		mutex_unlock(&q6asm_global.lock);
 		break;
 	case QCOM_SSR_AFTER_SHUTDOWN:
@@ -921,11 +926,20 @@ static void q6asm_rsp_mark_stale_locked(struct q6asm_cmd_rsp *rsp, u32 opcode)
 
 static bool q6asm_rsp_clear_stale_locked(struct q6asm_cmd_rsp *rsp, u32 opcode)
 {
-	int i;
+	int i, j;
 
 	for (i = 0; i < Q6ASM_RSP_STALE_MAX; i++) {
 		if (rsp->stale[i] == opcode) {
 			rsp->stale[i] = 0;
+			/*
+			 * The latch means "the table is full", not "it was
+			 * once full": once every owed answer has arrived the
+			 * client may send commands again.
+			 */
+			for (j = 0; j < Q6ASM_RSP_STALE_MAX; j++)
+				if (rsp->stale[j])
+					return true;
+			rsp->overflow = false;
 			return true;
 		}
 	}
@@ -993,6 +1007,23 @@ static bool q6asm_rsp_async_take_locked(struct q6asm_cmd_rsp *rsp, u32 opcode)
 	return false;
 }
 
+/*
+ * A restarted ADSP owes no answers to the previous instance, so retirements
+ * and credits recorded before the restart are meaningless.  Compare the
+ * epoch recorded when a command was armed; the caller holds rsp->lock.
+ */
+static void q6asm_rsp_sync_epoch_locked(struct q6asm_cmd_rsp *rsp)
+{
+	u32 epoch = READ_ONCE(q6asm_global.ssr_epoch);
+
+	if (rsp->epoch != epoch) {
+		memset(rsp->stale, 0, sizeof(rsp->stale));
+		memset(rsp->async, 0, sizeof(rsp->async));
+		rsp->overflow = false;
+		rsp->epoch = epoch;
+	}
+}
+
 static int q6asm_cmd_rsp_arm(struct audio_client *ac, u32 opcode)
 {
 	struct q6asm_cmd_rsp *rsp = &ac->rsp;
@@ -1000,7 +1031,15 @@ static int q6asm_cmd_rsp_arm(struct audio_client *ac, u32 opcode)
 	int rc = 0;
 
 	spin_lock_irqsave(&rsp->lock, flags);
-	if (rsp->overflow || q6asm_rsp_stale_locked(rsp, opcode) ||
+	q6asm_rsp_sync_epoch_locked(rsp);
+	/*
+	 * CLOSE is the recovery path: allow it even when the table overflowed,
+	 * because a confirmed CLOSE retires every owed opcode.  A retired
+	 * CLOSE itself is still refused; its answer may never arrive and the
+	 * caller quarantines the session instead.
+	 */
+	if ((rsp->overflow && opcode != ASM_STREAM_CMD_CLOSE) ||
+	    q6asm_rsp_stale_locked(rsp, opcode) ||
 	    q6asm_rsp_async_locked(rsp, opcode)) {
 		/*
 		 * An answer for this opcode is still owed (or its owner can
@@ -1045,6 +1084,7 @@ static void q6asm_cmd_rsp_forget_stream(struct audio_client *ac)
 	memset(rsp->stale, 0, sizeof(rsp->stale));
 	memset(rsp->async, 0, sizeof(rsp->async));
 	rsp->overflow = false;
+	rsp->epoch = READ_ONCE(q6asm_global.ssr_epoch);
 	spin_unlock_irqrestore(&rsp->lock, flags);
 }
 
@@ -1062,6 +1102,7 @@ static enum q6asm_rsp_owner q6asm_cmd_rsp_claim(struct audio_client *ac,
 	struct q6asm_cmd_rsp *rsp = &ac->rsp;
 	unsigned long flags;
 	enum q6asm_rsp_owner owner = Q6ASM_RSP_NONE;
+	bool late = false, unowned = false;
 
 	spin_lock_irqsave(&rsp->lock, flags);
 	if (rsp->pending && rsp->opcode == opcode) {
@@ -1072,18 +1113,25 @@ static enum q6asm_rsp_owner q6asm_cmd_rsp_claim(struct audio_client *ac,
 		owner = Q6ASM_RSP_SYNC;
 		wake_up(&rsp->wait);
 	} else if (q6asm_rsp_clear_stale_locked(rsp, opcode)) {
+		late = true;
+	} else if (q6asm_rsp_async_take_locked(rsp, opcode)) {
+		owner = Q6ASM_RSP_ASYNC;
+	} else {
+		unowned = true;
+	}
+	spin_unlock_irqrestore(&rsp->lock, flags);
+
+	/* Logging outside the IRQ-off section keeps the APR hot path short. */
+	if (late) {
 		q6asm_stat_inc(ac, Q6ASM_STAT_LATE);
 		dev_dbg_ratelimited(ac->dev,
 				    "late response for retired command %#x dropped\n",
 				    opcode);
-	} else if (q6asm_rsp_async_take_locked(rsp, opcode)) {
-		owner = Q6ASM_RSP_ASYNC;
-	} else {
+	} else if (unowned) {
 		q6asm_stat_inc(ac, Q6ASM_STAT_UNOWNED);
 		dev_dbg_ratelimited(ac->dev,
 				    "unowned response %#x dropped\n", opcode);
 	}
-	spin_unlock_irqrestore(&rsp->lock, flags);
 
 	return owner;
 }
@@ -1096,6 +1144,7 @@ static int q6asm_cmd_rsp_async_begin(struct audio_client *ac, u32 opcode)
 	int rc;
 
 	spin_lock_irqsave(&rsp->lock, flags);
+	q6asm_rsp_sync_epoch_locked(rsp);
 	if (rsp->overflow || q6asm_rsp_stale_locked(rsp, opcode) ||
 	    (rsp->pending && rsp->opcode == opcode))
 		rc = -EIO;
@@ -1112,6 +1161,8 @@ static void q6asm_cmd_rsp_async_end(struct audio_client *ac, u32 opcode)
 	unsigned long flags;
 
 	spin_lock_irqsave(&rsp->lock, flags);
+	/* A failed send after a restart has no credit to give back. */
+	q6asm_rsp_sync_epoch_locked(rsp);
 	q6asm_rsp_async_end_locked(rsp, opcode);
 	spin_unlock_irqrestore(&rsp->lock, flags);
 }
@@ -1155,7 +1206,12 @@ static int q6asm_send_cmd_sync(struct audio_client *ac, struct apr_pkt *pkt,
 		*handle = rsp->handle;
 	if (!done) {
 		rsp->pending = false;
-		q6asm_rsp_mark_stale_locked(rsp, expected);
+		/*
+		 * A restart during the wait means the answer will never
+		 * arrive; the opcode is not owed by the new instance.
+		 */
+		if (rsp->epoch == READ_ONCE(q6asm_global.ssr_epoch))
+			q6asm_rsp_mark_stale_locked(rsp, expected);
 	}
 	spin_unlock_irqrestore(&rsp->lock, flags);
 
@@ -1634,6 +1690,9 @@ static void q6asm_emit_simple(struct audio_client *ac,
  * to the current data-path generation and it names the submitted stream and
  * buffer.  Anything else (a duplicate, an answer from a closed stream, a
  * stale token) is dropped before it can move hw_ptr or free a slot.
+ *
+ * @generation is the byte decoded from the token; the full host value lives
+ * in submit->generation and is compared separately.
  */
 static bool q6asm_complete_transfer(struct audio_client *ac, unsigned int dir,
 				    u32 index, u32 generation, u32 stream_id,
@@ -2901,6 +2960,12 @@ static void q6asm_reset_buf_state(struct audio_client *ac)
 	struct audio_port_data *port;
 	int dir;
 
+	/*
+	 * A flush starts a new data-path instance so completions for the
+	 * flushed buffers cannot be matched to the rebuilt ring.  The front
+	 * end caches the generation after a mapping; it must re-read
+	 * q6asm_get_buffer_generation() after issuing CMD_FLUSH.
+	 */
 	guard(spinlock_irqsave)(&ac->lock);
 	for (dir = 0; dir < ARRAY_SIZE(ac->port); dir++) {
 		port = &ac->port[dir];
@@ -3057,6 +3122,11 @@ static void q6asm_inject_completion(struct q6asm *a, bool fresh)
 		if (!port->buf || !port->submit || !port->num_periods)
 			continue;
 		spin_lock_irqsave(&ac->lock, flags);
+		/* Re-check under the lock: release clears both pointers. */
+		if (!port->buf || !port->submit || !port->num_periods) {
+			spin_unlock_irqrestore(&ac->lock, flags);
+			continue;
+		}
 		generation = q6asm_token_gen(port->generation);
 		if (!fresh) {
 			/* Any encoded value except the current one is stale. */
