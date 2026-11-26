@@ -235,7 +235,6 @@ static void event_handler(uint32_t opcode, uint32_t token,
 {
 	struct q6asm_dai_rtd *prtd = priv;
 	struct snd_pcm_substream *substream = prtd->substream;
-	unsigned int i;
 
 	if (!substream)
 		return;
@@ -251,10 +250,20 @@ static void event_handler(uint32_t opcode, uint32_t token,
 		if (substream->stream == SNDRV_PCM_STREAM_CAPTURE &&
 		    prtd->reads_pending) {
 			prtd->reads_pending = false;
-			for (i = 0; i < prtd->periods; i++) {
+			/*
+			 * Count the slot before the send: the ADSP can complete
+			 * a READ before q6asm_read() returns, and the completion
+			 * handler would then decrement a slot that was never
+			 * counted.  Stop at periods so a duplicated RUN_DONE
+			 * cannot post the same ring slots twice.
+			 */
+			while (prtd->reads_inflight < prtd->periods) {
+				prtd->reads_inflight++;
 				if (q6asm_read(prtd->audio_client,
-					       prtd->stream_id) == 0)
-					prtd->reads_inflight++;
+					       prtd->stream_id) != 0) {
+					prtd->reads_inflight--;
+					break;
+				}
 			}
 			pr_info_ratelimited("J716F-CAP: run posted inflight=%u periods=%u\n",
 					    prtd->reads_inflight, prtd->periods);
@@ -286,14 +295,15 @@ static void event_handler(uint32_t opcode, uint32_t token,
 			prtd->reads_inflight--;
 		while (READ_ONCE(prtd->state) == Q6ASM_STREAM_RUNNING &&
 		       prtd->reads_inflight < prtd->periods) {
+			prtd->reads_inflight++;
 			rerr = q6asm_read(prtd->audio_client, prtd->stream_id);
 			if (rerr) {
+				prtd->reads_inflight--;
 				pr_info_ratelimited("J716F-CAP: requeue failed %d state=%d inflight=%u\n",
 						    rerr, READ_ONCE(prtd->state),
 						    prtd->reads_inflight);
 				break;
 			}
-			prtd->reads_inflight++;
 		}
 
 		break;
