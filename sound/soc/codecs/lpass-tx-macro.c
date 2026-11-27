@@ -626,18 +626,6 @@ static int tx_macro_mclk_enable(struct tx_macro *tx,
 
 	if (mclk_enable) {
 		if (tx->tx_mclk_users == 0) {
-			/*
-			 * Lenovo J716F: sync the cache BEFORE enabling the
-			 * clocks. regcache_sync() writes every cached register
-			 * back, and the reset defaults for FREQ_MCLK (0x090),
-			 * MCLK_CONTROL (0x000) and FS_CNT_CONTROL (0x004) are
-			 * all 0x00 - so running it after the enables turned
-			 * the TX macro MCLK straight back off and the
-			 * decimators produced digital silence.
-			 */
-			regcache_mark_dirty(regmap);
-			regcache_sync(regmap);
-
 			/* 9.6MHz MCLK, set value 0x00 if other frequency */
 			regmap_update_bits(regmap, CDC_TX_TOP_CSR_FREQ_MCLK, 0x01, 0x01);
 			regmap_update_bits(regmap, CDC_TX_CLK_RST_CTRL_MCLK_CONTROL,
@@ -1019,19 +1007,6 @@ static int tx_macro_enable_dec(struct snd_soc_dapm_widget *w,
 					      CDC_TXn_PGA_MUTE_MASK, 0x1);
 		break;
 	case SND_SOC_DAPM_POST_PMU:
-		/*
-		 * Lenovo J716F: make sure the TX macro MCLK is actually
-		 * running once the decimator is powered. tx_macro_mclk_event()
-		 * enables it in its PRE_PMU, but that runs before the DAPM
-		 * register writes of this widget, and any later
-		 * regcache_sync()/write can drop MCLK_CONTROL (0x000) back to
-		 * its 0x00 default. Without the MCLK the decimator shifts out
-		 * silence.
-		 */
-		snd_soc_component_update_bits(component,
-					      CDC_TX_CLK_RST_CTRL_MCLK_CONTROL,
-					      CDC_TX_MCLK_EN_MASK,
-					      CDC_TX_MCLK_ENABLE);
 		snd_soc_component_write_field(component, tx_vol_ctl_reg,
 					     CDC_TXn_CLK_EN_MASK, 0x1);
 		if (!is_amic_enabled(component, tx, decimator)) {
@@ -1242,22 +1217,10 @@ static int tx_macro_hw_params(struct snd_pcm_substream *substream,
 		return -EINVAL;
 	}
 
-	for_each_set_bit(decimator, &tx->active_ch_mask[dai->id], TX_MACRO_DEC_MAX) {
+	for_each_set_bit(decimator, &tx->active_ch_mask[dai->id], TX_MACRO_DEC_MAX)
 		snd_soc_component_update_bits(component, CDC_TXn_TX_PATH_CTL(decimator),
 					      CDC_TXn_PCM_RATE_MASK,
 					      tx_fs_rate);
-		/*
-		 * Lenovo J716F: hw_params() runs after the DAPM POST_PMU that
-		 * sets CLK_EN, and the regmap update above is a
-		 * read-modify-write of the cached value. When the cache still
-		 * held the pre-power-up value the write cleared CLK_EN again,
-		 * leaving TX PATH_CTL at 0x04 (rate only) instead of 0x24, and
-		 * the decimator produced silence. Re-assert CLK_EN here.
-		 */
-		snd_soc_component_update_bits(component, CDC_TXn_TX_PATH_CTL(decimator),
-					      CDC_TXn_CLK_EN_MASK,
-					      CDC_TXn_CLK_EN_MASK);
-	}
 	return 0;
 }
 
@@ -1293,26 +1256,14 @@ static int tx_macro_digital_mute(struct snd_soc_dai *dai, int mute, int stream)
 
 	decimator = tx->active_decimator[dai->id];
 
-	/*
-	 * Lenovo J716F: the decimator clock must stay enabled while the
-	 * stream runs. Touching PATH_CTL here is a read-modify-write of the
-	 * regmap cache; if the cached value predates the DAPM power-up the
-	 * write drops CLK_EN again and the decimator goes silent. Re-assert
-	 * both bits explicitly.
-	 */
 	if (mute)
-		snd_soc_component_update_bits(component,
+		snd_soc_component_write_field(component,
 					      CDC_TXn_TX_PATH_CTL(decimator),
-					      CDC_TXn_PGA_MUTE_MASK |
-					      CDC_TXn_CLK_EN_MASK,
-					      CDC_TXn_PGA_MUTE_MASK |
-					      CDC_TXn_CLK_EN_MASK);
+					      CDC_TXn_PGA_MUTE_MASK, 0x1);
 	else
 		snd_soc_component_update_bits(component,
 					      CDC_TXn_TX_PATH_CTL(decimator),
-					      CDC_TXn_PGA_MUTE_MASK |
-					      CDC_TXn_CLK_EN_MASK,
-					      CDC_TXn_CLK_EN_MASK);
+					      CDC_TXn_PGA_MUTE_MASK, 0x0);
 
 	return 0;
 }
