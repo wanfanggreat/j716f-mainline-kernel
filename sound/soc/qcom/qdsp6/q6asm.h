@@ -3,13 +3,25 @@
 #define __Q6_ASM_H__
 #include "q6dsp-common.h"
 
-/* Commands issued through q6asm_cmd()/q6asm_cmd_nowait(). */
+/* ASM client callback events */
 #define CMD_PAUSE			0x0001
+#define ASM_CLIENT_EVENT_CMD_PAUSE_DONE		0x1001
 #define CMD_FLUSH				0x0002
+#define ASM_CLIENT_EVENT_CMD_FLUSH_DONE		0x1002
 #define CMD_EOS				0x0003
+#define ASM_CLIENT_EVENT_CMD_EOS_DONE		0x1003
 #define CMD_CLOSE				0x0004
+#define ASM_CLIENT_EVENT_CMD_CLOSE_DONE		0x1004
 #define CMD_OUT_FLUSH				0x0005
+#define ASM_CLIENT_EVENT_CMD_OUT_FLUSH_DONE	0x1005
 #define CMD_SUSPEND				0x0006
+#define ASM_CLIENT_EVENT_CMD_SUSPEND_DONE	0x1006
+#define ASM_CLIENT_EVENT_CMD_RUN_DONE		0x1008
+#define ASM_CLIENT_EVENT_DATA_WRITE_DONE	0x1009
+#define ASM_CLIENT_EVENT_DATA_READ_DONE		0x100a
+#define ASM_WRITE_TOKEN_MASK			GENMASK(15, 0)
+#define ASM_WRITE_TOKEN_LEN_MASK		GENMASK(31, 16)
+#define ASM_WRITE_TOKEN_LEN_SHIFT		16
 
 enum {
 	LEGACY_PCM_MODE = 0,
@@ -76,65 +88,13 @@ struct q6asm_ape_cfg {
 	u32 seek_table_present;
 };
 
-/*
- * Events delivered to the front-end driver.  Data events are only sent after
- * the Q6ASM layer has matched the completion to a posted READ/WRITE, so the
- * front end never has to decode an APR token or payload itself.
- */
-enum q6asm_client_event_id {
-	Q6ASM_EVENT_RUN_DONE,
-	Q6ASM_EVENT_PAUSE_DONE,
-	/* The DSP accepted the EOS command. */
-	Q6ASM_EVENT_EOS_DONE,
-	/* The DSP rendered the last buffer (ASM_DATA_EVENT_RENDERED_EOS). */
-	Q6ASM_EVENT_EOS_RENDERED,
-	Q6ASM_EVENT_READ_DONE,
-	Q6ASM_EVENT_READ_FAILED,
-	Q6ASM_EVENT_WRITE_DONE,
-	Q6ASM_EVENT_WRITE_FAILED,
-};
-
-struct q6asm_client_event {
-	enum q6asm_client_event_id id;
-	u32 stream_id;
-	/* Period index inside the mapped ring, valid for data events. */
-	u32 index;
-	/* Bytes the DSP accepted for the transfer, valid for *_DONE. */
-	u32 len;
-	/* DSP status, valid for *_FAILED. */
-	u32 status;
-	/* Host data-path generation, valid for data events. */
-	u32 generation;
-};
-
-/*
- * The kona ADSP reports the full ASM_DATA_EVENT_READ_DONE_V2 payload
- * (status, address, handle, size, timestamps and seq_id).  Validate it
- * instead of trusting the token alone; other firmware that only sends the
- * first three words keeps working because seq_id is then not consulted.
- */
-#define Q6ASM_CLIENT_STRICT_CAPTURE	BIT(0)
-/*
- * The token's byte 2 carries the data-path generation.  Only firmware that
- * has been shown to echo that byte unchanged may rely on it; other boards
- * keep the historical token-only matching.
- */
-#define Q6ASM_CLIENT_TOKEN_GENERATION	BIT(1)
-
-typedef void (*q6asm_cb) (const struct q6asm_client_event *event, void *priv);
+typedef void (*q6asm_cb) (uint32_t opcode, uint32_t token,
+			  void *payload, void *priv);
 struct audio_client;
-struct snd_dma_buffer;
 struct audio_client *q6asm_audio_client_alloc(struct device *dev,
 					      q6asm_cb cb, void *priv,
 					      int session_id, int perf_mode);
-void q6asm_audio_client_set_flags(struct audio_client *ac, unsigned int flags);
-void q6asm_audio_client_clear_callback(struct audio_client *ac);
 void q6asm_audio_client_free(struct audio_client *ac);
-void q6asm_quarantine_session(struct audio_client *ac);
-bool q6asm_hold_buffer(struct audio_client *ac, struct snd_dma_buffer *dma,
-		       u32 session);
-int q6asm_dma_device_register(struct device *dev);
-bool q6asm_session_is_quarantined(struct audio_client *ac);
 int q6asm_write_async(struct audio_client *ac, uint32_t stream_id, uint32_t len,
 		      uint32_t msw_ts, uint32_t lsw_ts, uint32_t wflags);
 int q6asm_open_write(struct audio_client *ac, uint32_t stream_id,
@@ -189,5 +149,4 @@ int q6asm_map_memory_regions(unsigned int dir,
 			     size_t period_sz, unsigned int periods);
 int q6asm_unmap_memory_regions(unsigned int dir, struct audio_client *ac);
 int q6asm_get_hw_pointer(struct audio_client *ac, unsigned int dir);
-u32 q6asm_get_buffer_generation(struct audio_client *ac, unsigned int dir);
 #endif /* __Q6_ASM_H__ */

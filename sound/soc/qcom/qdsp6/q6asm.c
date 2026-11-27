@@ -7,24 +7,17 @@
 #include <linux/wait.h>
 #include <linux/module.h>
 #include <linux/atomic.h>
-#include <linux/bitops.h>
-#include <linux/list.h>
-#include <sound/pcm.h>
 #include <linux/soc/qcom/apr.h>
 #include <linux/device.h>
 #include <linux/of_platform.h>
 #include <linux/spinlock.h>
 #include <linux/kref.h>
-#include <linux/notifier.h>
-#include <linux/remoteproc.h>
-#include <linux/remoteproc/qcom_rproc.h>
 #include <linux/of.h>
 #include <uapi/sound/asound.h>
 #include <uapi/sound/compress_params.h>
 #include <linux/delay.h>
 #include <linux/slab.h>
 #include <linux/mm.h>
-#include <linux/string.h>
 #include "q6asm.h"
 #include "q6core.h"
 #include "q6dsp-errno.h"
@@ -206,29 +199,11 @@ struct asm_data_cmd_read_v2 {
 	u32                  seq_id;
 } __packed;
 
-/*
- * ASM_DATA_EVENT_READ_DONE_V2 carries eleven words on the kona ADSP:
- * status, address, map handle, actual size, offset, timestamps, flags,
- * frame count and the seq_id that was submitted with the READ.  A firmware
- * that only sends the first three words is still accepted: the token then
- * identifies the period, exactly as before.
- */
 struct asm_data_cmd_read_v2_done {
 	u32	status;
 	u32	buf_addr_lsw;
 	u32	buf_addr_msw;
-	u32	mem_map_handle;
-	u32	buf_size;
-	u32	offset;
-	u32	lsw_ts;
-	u32	msw_ts;
-	u32	flags;
-	u32	num_frames;
-	u32	seq_id;
 };
-
-#define Q6ASM_READ_DONE_MIN	12
-#define Q6ASM_READ_DONE_FULL	44
 
 struct asm_stream_cmd_open_read_v3 {
 	u32                    mode_flags;
@@ -269,671 +244,40 @@ struct audio_buffer {
 	uint32_t size;		/* size of buffer */
 };
 
-/*
- * Accounting for one period that has been handed to the ADSP.  A completion
- * is only accepted while its slot is in flight, its stream matches and the
- * generation the host put in the token is still the current one.  The ADSP
- * echoes the token's byte 2 (bits 16-23); the vendor kernel uses that byte
- * for its buffer index, so it is a safe host-owned field.
- */
-struct q6asm_submit {
-	u32 generation;
-	u32 stream_id;
-	u32 len;
-	phys_addr_t phys;
-	bool in_flight;
-	/* Completed but not yet counted (a later period completed first). */
-	bool done;
-};
-
 struct audio_port_data {
 	struct audio_buffer *buf;
-	struct q6asm_submit *submit;
 	uint32_t num_periods;
 	uint32_t dsp_buf;
 	uint32_t mem_map_handle;
-	/* Data-path instance; bumped whenever a new mapping is installed. */
-	uint32_t generation;
-	/* Next period index that may complete; completions are ring-ordered. */
-	uint32_t next_done;
-	uint32_t failures;
 	atomic_t hw_ptr;
 };
-
-/*
- * One synchronous command at a time per client.  The APR RX worker writes
- * the response fields while the caller sleeps in wait_event_timeout(); the
- * lock covers the fields, the waitqueue is only woken under it.
- *
- * A response is only allowed to complete the command that owns it.  When a
- * synchronous command times out its response may still arrive, so the
- * opcode is retired: a later command of the same opcode is refused until
- * that response has been consumed or a confirmed CLOSE has retired the
- * session.  Fire-and-forget commands need a credit for the same reason, so
- * their responses cannot be mistaken for a synchronous waiter (or the other
- * way round) and a duplicate cannot drive a state event a second time.
- */
-#define Q6ASM_RSP_STALE_MAX	4
-#define Q6ASM_RSP_ASYNC_MAX	4
-
-struct q6asm_cmd_rsp {
-	spinlock_t lock;
-	wait_queue_head_t wait;
-	u32 opcode;
-	u32 status;
-	u32 handle;
-	/* Opcodes whose answer never arrived. */
-	u32 stale[Q6ASM_RSP_STALE_MAX];
-	/* In-flight fire-and-forget commands, one entry per opcode. */
-	struct {
-		u32 opcode;
-		u32 count;
-	} async[Q6ASM_RSP_ASYNC_MAX];
-	/* Too many unanswered opcodes to track: refuse all new commands. */
-	bool overflow;
-	/* A CLOSE answer is owed but could not be recorded in the table. */
-	bool close_owed;
-	/* ADSP instance the retirements belong to; an SSR event voids them. */
-	u32 epoch;
-	/* Epoch captured when this command was armed, for the timeout check. */
-	u32 wait_epoch;
-	bool pending;
-	bool done;
-};
-
-enum q6asm_rsp_owner {
-	Q6ASM_RSP_NONE = 0,
-	Q6ASM_RSP_SYNC,
-	Q6ASM_RSP_ASYNC,
-};
-
-struct q6asm;
-
-#define Q6ASM_TOKEN_INDEX_MASK		GENMASK(7, 0)
-#define Q6ASM_TOKEN_GEN_SHIFT		16
-#define Q6ASM_TOKEN_GEN_MASK		GENMASK(23, 16)
-#define Q6ASM_TOKEN_GEN_MAX		(Q6ASM_TOKEN_GEN_MASK >> \
-					 Q6ASM_TOKEN_GEN_SHIFT)
-
-/*
- * The data-path generation is a 32-bit host value, but only its low byte
- * travels in the APR token.  Keep the two apart: the full value proves that
- * a completion belongs to this mapping, the encoded byte is the part the
- * firmware echoes back.  Comparing the full value against the decoded byte
- * (as the first revision did) discarded every valid completion once the
- * generation passed 255.
- */
-static inline u32 q6asm_token_gen(u32 generation)
-{
-	return generation & Q6ASM_TOKEN_GEN_MAX;
-}
-
-/*
- * Data-path generations are host owned and unique across clients and driver
- * rebinds.  A client that restarted at 1 would accept a completion left in
- * the APR queue by a destroyed client with the same session id; drawing
- * every mapping from one module-wide counter removes that alias.  Values
- * whose encoded byte is zero are skipped, because zero means "no
- * generation" in the protocol.
- */
-static atomic_t q6asm_generation_seq = ATOMIC_INIT(0);
-
-static u32 q6asm_next_generation(void)
-{
-	u32 generation = (u32)atomic_inc_return(&q6asm_generation_seq);
-
-	if (!q6asm_token_gen(generation))
-		generation = (u32)atomic_inc_return(&q6asm_generation_seq);
-
-	return generation;
-}
-
-struct audio_client {
-	int session;
-	q6asm_cb cb;
-	void *priv;
-	unsigned int flags;
-	uint32_t io_mode;
-	struct apr_device *adev;
-	struct mutex cmd_lock;
-	/* APR RX callbacks execute in a workqueue. */
-	struct mutex cb_lock;
-	spinlock_t lock;
-	struct kref refcount;
-	/* idx:1 out port, 0: in port */
-	struct audio_port_data port[2];
-	struct q6asm_cmd_rsp rsp;
-	int perf_mode;
-	struct q6asm *q6asm;
-	struct device *dev;
-	/* Pre-allocated owner for a buffer the DSP may still be using. */
-	struct q6asm_held_buffer *hold_slot;
-#ifdef CONFIG_SND_SOC_QDSP6_ASM_FAULT_INJECT
-	/*
-	 * Counters that let the device tests prove which branch handled a
-	 * completion or a command response instead of inferring it from
-	 * behaviour.  Debug builds only.
-	 */
-	struct {
-		atomic_t accepted;
-		atomic_t dropped;
-		atomic_t late;
-		atomic_t unowned;
-	} stats;
-#endif
-};
-
-enum q6asm_stat {
-	Q6ASM_STAT_ACCEPTED,
-	Q6ASM_STAT_DROPPED,
-	Q6ASM_STAT_LATE,
-	Q6ASM_STAT_UNOWNED,
-};
-
-#ifdef CONFIG_SND_SOC_QDSP6_ASM_FAULT_INJECT
-static inline void q6asm_stat_inc(struct audio_client *ac,
-				  enum q6asm_stat stat)
-{
-	switch (stat) {
-	case Q6ASM_STAT_ACCEPTED:
-		atomic_inc(&ac->stats.accepted);
-		break;
-	case Q6ASM_STAT_DROPPED:
-		atomic_inc(&ac->stats.dropped);
-		break;
-	case Q6ASM_STAT_LATE:
-		atomic_inc(&ac->stats.late);
-		break;
-	case Q6ASM_STAT_UNOWNED:
-		atomic_inc(&ac->stats.unowned);
-		break;
-	}
-}
-#else
-static inline void q6asm_stat_inc(struct audio_client *ac,
-				  enum q6asm_stat stat)
-{
-}
-#endif
 
 struct q6asm {
 	struct apr_device *adev;
 	struct device *dev;
 	struct q6core_svc_api_info ainfo;
+	wait_queue_head_t mem_wait;
 	spinlock_t slock;
 	struct audio_client *session[MAX_SESSIONS + 1];
-#ifdef CONFIG_SND_SOC_QDSP6_ASM_FAULT_INJECT
-	/*
-	 * One-shot error injection (J716F debug aid).  A root user writes
-	 * inject_fault in sysfs; the next matching operation fails.
-	 */
-	unsigned int fault;
-	bool fault_timeout;
-#endif
 };
 
-enum q6asm_fault {
-	Q6ASM_FAULT_NONE = 0,
-	Q6ASM_FAULT_MAP,
-	Q6ASM_FAULT_CLOSE,
-	Q6ASM_FAULT_UNMAP,
-	Q6ASM_FAULT_READ,
-	Q6ASM_FAULT_WRITE,
-	Q6ASM_FAULT_RUN,
-	Q6ASM_FAULT_READ_REJECT,
-	Q6ASM_FAULT_WRITE_REJECT,
-	Q6ASM_FAULT_PAUSE,
-	Q6ASM_FAULT_PAUSE_REJECT,
-	Q6ASM_FAULT_RUN_REJECT,
-	Q6ASM_FAULT_DUPLICATE,
-	Q6ASM_FAULT_DROP_MAP,
-};
-
-#ifdef CONFIG_SND_SOC_QDSP6_ASM_FAULT_INJECT
-static const char *const q6asm_fault_names[] = {
-	[Q6ASM_FAULT_NONE] = "none",
-	[Q6ASM_FAULT_MAP] = "map",
-	[Q6ASM_FAULT_CLOSE] = "close",
-	[Q6ASM_FAULT_UNMAP] = "unmap",
-	[Q6ASM_FAULT_READ] = "read",
-	[Q6ASM_FAULT_WRITE] = "write",
-	[Q6ASM_FAULT_RUN] = "run",
-	[Q6ASM_FAULT_READ_REJECT] = "readreject",
-	[Q6ASM_FAULT_WRITE_REJECT] = "writereject",
-	[Q6ASM_FAULT_PAUSE] = "pause",
-	[Q6ASM_FAULT_PAUSE_REJECT] = "pausereject",
-	[Q6ASM_FAULT_RUN_REJECT] = "runreject",
-	[Q6ASM_FAULT_DUPLICATE] = "duplicate",
-	[Q6ASM_FAULT_DROP_MAP] = "dropmap",
-};
-#endif
-
-/*
- * Compressed-audio buffers whose remote ownership is unknown after a failed
- * teardown are moved here.  The record is allocated together with the audio
- * client so the failure path never has to allocate memory.  The list is
- * module scoped on purpose: a q6asm device removal (APR rebind, ADSP reset)
- * must not lose the only record of a buffer the DSP may still access.
- */
-struct q6asm_held_buffer {
-	struct list_head node;
-	struct snd_dma_buffer dma;
-	/* Referenced until the pages are released or the device is gone. */
+struct audio_client {
+	int session;
+	q6asm_cb cb;
+	void *priv;
+	uint32_t io_mode;
+	struct apr_device *adev;
+	struct mutex cmd_lock;
+	spinlock_t lock;
+	struct kref refcount;
+	/* idx:1 out port, 0: in port */
+	struct audio_port_data port[2];
+	wait_queue_head_t cmd_wait;
+	struct aprv2_ibasic_rsp_result_t result;
+	int perf_mode;
+	struct q6asm *q6asm;
 	struct device *dev;
-	u32 session;
-	/* The owning device was removed before the ADSP stopped. */
-	bool dev_gone;
 };
-
-/*
- * The ADSP is shared by every q6asm instance, so a driver rebind does not
- * reset remote sessions.  Quarantined ids and held buffers are therefore
- * module state, released only when the remoteproc reports that the ADSP
- * actually stopped.
- */
-typedef void *(*q6asm_ssr_register_fn)(const char *name,
-				      struct notifier_block *nb);
-typedef int (*q6asm_ssr_unregister_fn)(void *notify,
-				      struct notifier_block *nb);
-
-struct q6asm_global {
-	struct mutex lock;
-	q6asm_ssr_register_fn ssr_register;
-	q6asm_ssr_unregister_fn ssr_unregister;
-	unsigned long session_quarantine[BITS_TO_LONGS(MAX_SESSIONS + 1)];
-	struct list_head held_buffers;
-	struct notifier_block ssr_nb;
-	struct srcu_notifier_head *ssr_head;
-	bool adsp_offline;
-	bool reclaim_registered;
-	/*
-	 * Bumped on AFTER_SHUTDOWN and AFTER_POWERUP: a stopped or restarted
-	 * ADSP owes no answers to the instance the retirements belong to.
-	 */
-	u32 ssr_epoch;
-	unsigned int leaked_buffers;
-	size_t leaked_bytes;
-};
-
-static struct q6asm_global q6asm_global = {
-	.lock = __MUTEX_INITIALIZER(q6asm_global.lock),
-	.held_buffers = LIST_HEAD_INIT(q6asm_global.held_buffers),
-	.adsp_offline = false,
-};
-
-/* SSR name the audio DSP registers on every supported remoteproc. */
-static const char q6asm_ssr_name[] = "lpass";
-
-#ifdef CONFIG_SND_SOC_QDSP6_ASM_FAULT_INJECT
-/*
- * Consume a pending injection for @fault.  Returns 0 when nothing is armed
- * for this operation, else the errno the caller should fail with.
- */
-static int q6asm_fault_take(struct audio_client *ac, unsigned int fault)
-{
-	struct q6asm *a = ac->q6asm;
-	unsigned long flags;
-	int rc = 0;
-
-	spin_lock_irqsave(&a->slock, flags);
-	if (a->fault == fault) {
-		a->fault = Q6ASM_FAULT_NONE;
-		rc = a->fault_timeout ? -ETIMEDOUT : -EINVAL;
-	}
-	spin_unlock_irqrestore(&a->slock, flags);
-
-	if (rc)
-		dev_err(ac->dev,
-			"J716F: injected %s failure on session %d\n",
-			q6asm_fault_names[fault], ac->session);
-
-	return rc;
-}
-
-/*
- * Consume a pending "DSP rejects this transfer" injection and report the
- * status the front end should see.  The command itself is not modified, so
- * this exercises the real completion-correlation path.
- */
-static u32 q6asm_fault_status_take(struct audio_client *ac, unsigned int fault,
-				   u32 status)
-{
-	struct q6asm *a = ac->q6asm;
-	unsigned long flags;
-	u32 rc = 0;
-
-	spin_lock_irqsave(&a->slock, flags);
-	if (a->fault == fault) {
-		a->fault = Q6ASM_FAULT_NONE;
-		rc = status;
-	}
-	spin_unlock_irqrestore(&a->slock, flags);
-
-	if (rc)
-		dev_err(ac->dev,
-			"J716F: injected %s rejection on session %d\n",
-			q6asm_fault_names[fault], ac->session);
-
-	return rc;
-}
-
-/* Swallow the next answer of @fault so the command runs into its timeout. */
-static bool q6asm_fault_drop(struct audio_client *ac, unsigned int fault)
-{
-	struct q6asm *a = ac->q6asm;
-	unsigned long flags;
-	bool drop = false;
-
-	spin_lock_irqsave(&a->slock, flags);
-	if (a->fault == fault) {
-		a->fault = Q6ASM_FAULT_NONE;
-		drop = true;
-	}
-	spin_unlock_irqrestore(&a->slock, flags);
-
-	if (drop)
-		dev_err(ac->dev, "J716F: injected %s drop on session %d\n",
-			q6asm_fault_names[fault], ac->session);
-
-	return drop;
-}
-
-/* Disarm @fault if a real answer arrived before the one it targets. */
-static void q6asm_fault_clear(struct audio_client *ac, unsigned int fault)
-{
-	struct q6asm *a = ac->q6asm;
-	unsigned long flags;
-
-	spin_lock_irqsave(&a->slock, flags);
-	if (a->fault == fault)
-		a->fault = Q6ASM_FAULT_NONE;
-	spin_unlock_irqrestore(&a->slock, flags);
-}
-#else
-static inline int q6asm_fault_take(struct audio_client *ac, unsigned int fault)
-{
-	return 0;
-}
-
-static inline u32 q6asm_fault_status_take(struct audio_client *ac,
-					  unsigned int fault, u32 status)
-{
-	return 0;
-}
-
-static inline bool q6asm_fault_drop(struct audio_client *ac,
-				    unsigned int fault)
-{
-	return false;
-}
-
-static inline void q6asm_fault_clear(struct audio_client *ac,
-				     unsigned int fault)
-{
-}
-#endif
-
-/**
- * q6asm_hold_buffer() - take ownership of a buffer the DSP may still use
- *
- * @ac: audio client the buffer was mapped through
- * @dma: buffer to keep alive; it is left detached on return
- * @session: session id the buffer was mapped for, for diagnostics
- *
- * Called when CMD_CLOSE or UNMAP failed, so the host can no longer tell
- * whether the ADSP still reads or writes the pages.  The buffer moves to a
- * module-wide list that outlives the APR device, and is freed only when the
- * remoteproc reports that the ADSP actually stopped.  The record itself was
- * allocated with the client, so this path cannot fail for lack of memory.
- *
- * A reference on the owning device keeps its IOMMU domain alive, so the
- * pages stay mapped (and unreachable to the host allocator) until the stop
- * notification or the device removal.
- */
-bool q6asm_hold_buffer(struct audio_client *ac, struct snd_dma_buffer *dma,
-		       u32 session)
-{
-	struct q6asm_held_buffer *held = ac->hold_slot;
-
-	if (!held)
-		held = kzalloc_obj(*held);
-	if (!held) {
-		dev_err(ac->dev,
-			"J716F: no memory to hold the session %u DMA buffer\n",
-			session);
-		return false;
-	}
-	/* Take ownership of the pre-allocated record before any failure path. */
-	ac->hold_slot = NULL;
-	if (!dma->dev.dev) {
-		dev_err(ac->dev,
-			"J716F: the session %u DMA buffer has no device\n",
-			session);
-		kfree(held);
-		return false;
-	}
-
-	held->dma = *dma;
-	held->dev = dma->dev.dev;
-	held->session = session;
-	held->dev_gone = false;
-	INIT_LIST_HEAD(&held->node);
-	get_device(held->dev);
-
-	mutex_lock(&q6asm_global.lock);
-	list_add_tail(&held->node, &q6asm_global.held_buffers);
-	mutex_unlock(&q6asm_global.lock);
-
-	/* The held record owns the pages now; do not free them again. */
-	dma->area = NULL;
-	dma->bytes = 0;
-	dev_warn(ac->dev,
-		 "J716F: holding DMA buffer for session %u until the ADSP stops\n",
-		 session);
-	return true;
-}
-EXPORT_SYMBOL_GPL(q6asm_hold_buffer);
-
-/*
- * The IOMMU domain is detached while the device is deleted, so a held
- * buffer can no longer be returned through the DMA API afterwards.  If the
- * ADSP is already down, free now (the device is still alive); otherwise mark
- * the record so the stop handler accounts it as lost instead of freeing
- * pages through a dead device.
- */
-static void q6asm_dma_device_remove(void *data)
-{
-	struct device *dev = data;
-	struct q6asm_held_buffer *held, *tmp;
-	LIST_HEAD(gone);
-
-	mutex_lock(&q6asm_global.lock);
-	list_for_each_entry_safe(held, tmp, &q6asm_global.held_buffers, node) {
-		if (held->dev != dev)
-			continue;
-		list_del(&held->node);
-		if (q6asm_global.adsp_offline) {
-			snd_dma_free_pages(&held->dma);
-			put_device(held->dev);
-			kfree(held);
-		} else {
-			/*
-			 * Keep the record for the stop handler to account, but
-			 * the pages can no longer be freed through this device.
-			 */
-			held->dev_gone = true;
-			list_add_tail(&held->node, &gone);
-		}
-	}
-	list_splice(&gone, &q6asm_global.held_buffers);
-	mutex_unlock(&q6asm_global.lock);
-}
-
-/**
- * q6asm_dma_device_register() - watch a device used for audio DMA
- *
- * @dev: device whose buffers may be handed to q6asm_hold_buffer()
- *
- * Registers a devres action that resolves held buffers before the device's
- * IOMMU domain disappears.  The front-end driver calls this once per device
- * that can own an audio DMA buffer.
- */
-int q6asm_dma_device_register(struct device *dev)
-{
-	return devm_add_action_or_reset(dev, q6asm_dma_device_remove, dev);
-}
-EXPORT_SYMBOL_GPL(q6asm_dma_device_register);
-
-/*
- * AFTER_SHUTDOWN is emitted from the remoteproc unprepare stage, i.e. after
- * the remote has been halted.  That is the only point at which the host may
- * conclude that the ADSP no longer accesses audio DMA memory.  Sessions
- * quarantined by a failed teardown become usable again here, not on a mere
- * driver rebind.
- *
- * The audio DSP is the "lpass" subsystem on every remoteproc descriptor that
- * this driver serves.  Check the name carried by the event so a future alias
- * cannot let an unrelated remote stop free audio DMA or clear isolation.
- */
-static int q6asm_ssr_notify(struct notifier_block *nb, unsigned long event,
-			    void *data)
-{
-	const struct qcom_ssr_notify_data *notify = data;
-	struct q6asm_held_buffer *held, *tmp;
-	unsigned int freed = 0, lost = 0;
-	size_t lost_bytes = 0;
-
-	if (!notify || !notify->name || strcmp(notify->name, q6asm_ssr_name))
-		return NOTIFY_DONE;
-
-	switch (event) {
-	case QCOM_SSR_AFTER_POWERUP:
-		mutex_lock(&q6asm_global.lock);
-		q6asm_global.adsp_offline = false;
-		WRITE_ONCE(q6asm_global.ssr_epoch,
-			   q6asm_global.ssr_epoch + 1);
-		mutex_unlock(&q6asm_global.lock);
-		break;
-	case QCOM_SSR_AFTER_SHUTDOWN:
-		mutex_lock(&q6asm_global.lock);
-		q6asm_global.adsp_offline = true;
-		/*
-		 * No answer from the stopped instance can arrive any more, so
-		 * its retirements are void from this point, not only once a
-		 * new instance powers up.
-		 */
-		WRITE_ONCE(q6asm_global.ssr_epoch,
-			   q6asm_global.ssr_epoch + 1);
-		bitmap_zero(q6asm_global.session_quarantine,
-			    MAX_SESSIONS + 1);
-		list_for_each_entry_safe(held, tmp, &q6asm_global.held_buffers,
-					 node) {
-			list_del(&held->node);
-			if (held->dev_gone) {
-				lost++;
-				lost_bytes += held->dma.bytes;
-				q6asm_global.leaked_buffers++;
-				q6asm_global.leaked_bytes += held->dma.bytes;
-			} else {
-				snd_dma_free_pages(&held->dma);
-				freed++;
-			}
-			put_device(held->dev);
-			kfree(held);
-		}
-		mutex_unlock(&q6asm_global.lock);
-		pr_info("q6asm: ADSP stopped: released %u held DMA buffer(s), %u already orphaned by a removed device (%zu bytes)\n",
-			freed, lost, lost_bytes);
-		break;
-	default:
-		break;
-	}
-
-	return NOTIFY_OK;
-}
-
-/*
- * Registering and unregistering must not take q6asm_global.lock.  Removing
- * an SRCU notifier waits for a callback that is already running, and that
- * callback takes q6asm_global.lock to clear the quarantine; holding the
- * state lock across the removal would therefore wait for itself.  A
- * separate mutex serializes the two operations instead.
- */
-static DEFINE_MUTEX(q6asm_reclaim_lock);
-
-static void q6asm_reclaim_register(void)
-{
-	struct srcu_notifier_head *head;
-
-	mutex_lock(&q6asm_reclaim_lock);
-	if (q6asm_global.reclaim_registered)
-		goto out;
-
-	if (!q6asm_global.ssr_register) {
-		q6asm_global.ssr_register =
-			symbol_get(qcom_register_ssr_notifier);
-		q6asm_global.ssr_unregister =
-			symbol_get(qcom_unregister_ssr_notifier);
-		if (!q6asm_global.ssr_register ||
-		    !q6asm_global.ssr_unregister) {
-			if (q6asm_global.ssr_register)
-				symbol_put(qcom_register_ssr_notifier);
-			if (q6asm_global.ssr_unregister)
-				symbol_put(qcom_unregister_ssr_notifier);
-			q6asm_global.ssr_register = NULL;
-			q6asm_global.ssr_unregister = NULL;
-			pr_err("q6asm: qcom_common is not available; ADSP stop events cannot be followed\n");
-			goto out;
-		}
-	}
-
-	q6asm_global.ssr_nb.notifier_call = q6asm_ssr_notify;
-	head = q6asm_global.ssr_register(q6asm_ssr_name,
-					 &q6asm_global.ssr_nb);
-	if (IS_ERR(head)) {
-		pr_err("q6asm: cannot follow %s stop events: %ld\n",
-		       q6asm_ssr_name, PTR_ERR(head));
-		/*
-		 * Nothing is registered, so no callback can be running and the
-		 * symbol references can be dropped again.  Isolation stays
-		 * fail-closed without them.
-		 */
-		symbol_put(qcom_register_ssr_notifier);
-		symbol_put(qcom_unregister_ssr_notifier);
-		q6asm_global.ssr_register = NULL;
-		q6asm_global.ssr_unregister = NULL;
-		goto out;
-	}
-
-	q6asm_global.ssr_head = head;
-	q6asm_global.reclaim_registered = true;
-out:
-	mutex_unlock(&q6asm_reclaim_lock);
-}
-
-static void q6asm_reclaim_unregister(void)
-{
-	mutex_lock(&q6asm_reclaim_lock);
-	if (q6asm_global.reclaim_registered) {
-		/*
-		 * The removal waits for a running callback, which only needs
-		 * q6asm_global.lock, so it must not be held here.
-		 */
-		q6asm_global.ssr_unregister(q6asm_global.ssr_head,
-					    &q6asm_global.ssr_nb);
-		q6asm_global.ssr_head = NULL;
-		q6asm_global.reclaim_registered = false;
-	}
-	if (q6asm_global.ssr_register) {
-		symbol_put(qcom_register_ssr_notifier);
-		q6asm_global.ssr_register = NULL;
-	}
-	if (q6asm_global.ssr_unregister) {
-		symbol_put(qcom_unregister_ssr_notifier);
-		q6asm_global.ssr_unregister = NULL;
-	}
-	mutex_unlock(&q6asm_reclaim_lock);
-}
 
 static inline void q6asm_add_hdr(struct audio_client *ac, struct apr_hdr *hdr,
 				 uint32_t pkt_size, bool cmd_flg,
@@ -947,380 +291,49 @@ static inline void q6asm_add_hdr(struct audio_client *ac, struct apr_hdr *hdr,
 		hdr->token = ac->session;
 }
 
-/*
- * A synchronous command is correlated with the response that names it:
- * result->opcode for a basic response, or the command opcode for a MAP
- * CMDRSP.  Responses for anything else never touch this command's result,
- * so an asynchronous READ/WRITE result or a late answer cannot complete or
- * corrupt a newer command.
- */
-/* All q6asm_rsp_*_locked() helpers require rsp->lock. */
-static bool q6asm_rsp_stale_locked(struct q6asm_cmd_rsp *rsp, u32 opcode)
+static int q6asm_apr_send_session_pkt(struct q6asm *a, struct audio_client *ac,
+				      struct apr_pkt *pkt, uint32_t rsp_opcode)
 {
-	int i;
-
-	for (i = 0; i < Q6ASM_RSP_STALE_MAX; i++)
-		if (rsp->stale[i] == opcode)
-			return true;
-
-	return false;
-}
-
-static void q6asm_rsp_mark_stale_locked(struct q6asm_cmd_rsp *rsp, u32 opcode)
-{
-	int i, slot = -1;
-
-	if (q6asm_rsp_stale_locked(rsp, opcode))
-		return;
-
-	for (i = 0; i < Q6ASM_RSP_STALE_MAX; i++) {
-		if (!rsp->stale[i]) {
-			slot = i;
-			break;
-		}
-	}
-
-	if (slot < 0) {
-		/*
-		 * The table cannot name the opcode, so the client stays
-		 * fail-closed until a confirmed CLOSE or a restart.  CLOSE
-		 * itself is let through by the arm path; remember that its
-		 * answer is also owed so a second CLOSE is not accepted.
-		 */
-		rsp->overflow = true;
-		if (opcode == ASM_STREAM_CMD_CLOSE)
-			rsp->close_owed = true;
-		return;
-	}
-	rsp->stale[slot] = opcode;
-}
-
-static bool q6asm_rsp_clear_stale_locked(struct q6asm_cmd_rsp *rsp, u32 opcode)
-{
-	int i;
-
-	for (i = 0; i < Q6ASM_RSP_STALE_MAX; i++) {
-		if (rsp->stale[i] == opcode) {
-			rsp->stale[i] = 0;
-			return true;
-		}
-	}
-
-	return false;
-}
-
-static bool q6asm_rsp_async_locked(struct q6asm_cmd_rsp *rsp, u32 opcode)
-{
-	int i;
-
-	for (i = 0; i < Q6ASM_RSP_ASYNC_MAX; i++)
-		if (rsp->async[i].opcode == opcode && rsp->async[i].count)
-			return true;
-
-	return false;
-}
-
-static int q6asm_rsp_async_begin_locked(struct q6asm_cmd_rsp *rsp, u32 opcode)
-{
-	int i, slot = -1;
-
-	for (i = 0; i < Q6ASM_RSP_ASYNC_MAX; i++) {
-		if (rsp->async[i].opcode == opcode) {
-			rsp->async[i].count++;
-			return 0;
-		}
-		if (!rsp->async[i].opcode && slot < 0)
-			slot = i;
-	}
-
-	if (slot < 0)
-		return -EBUSY;
-
-	rsp->async[slot].opcode = opcode;
-	rsp->async[slot].count = 1;
-	return 0;
-}
-
-static void q6asm_rsp_async_end_locked(struct q6asm_cmd_rsp *rsp, u32 opcode)
-{
-	int i;
-
-	for (i = 0; i < Q6ASM_RSP_ASYNC_MAX; i++) {
-		if (rsp->async[i].opcode == opcode) {
-			if (--rsp->async[i].count == 0)
-				rsp->async[i].opcode = 0;
-			return;
-		}
-	}
-}
-
-static bool q6asm_rsp_async_take_locked(struct q6asm_cmd_rsp *rsp, u32 opcode)
-{
-	int i;
-
-	for (i = 0; i < Q6ASM_RSP_ASYNC_MAX; i++) {
-		if (rsp->async[i].opcode == opcode && rsp->async[i].count) {
-			if (--rsp->async[i].count == 0)
-				rsp->async[i].opcode = 0;
-			return true;
-		}
-	}
-
-	return false;
-}
-
-/*
- * A restarted ADSP owes no answers to the previous instance, so retirements
- * and credits recorded before the restart are meaningless.  Compare the
- * epoch recorded when a command was armed; the caller holds rsp->lock.
- */
-static void q6asm_rsp_sync_epoch_locked(struct q6asm_cmd_rsp *rsp)
-{
-	u32 epoch = READ_ONCE(q6asm_global.ssr_epoch);
-
-	if (rsp->epoch != epoch) {
-		memset(rsp->stale, 0, sizeof(rsp->stale));
-		memset(rsp->async, 0, sizeof(rsp->async));
-		rsp->overflow = false;
-		rsp->close_owed = false;
-		rsp->epoch = epoch;
-	}
-}
-
-static int q6asm_cmd_rsp_arm(struct audio_client *ac, u32 opcode)
-{
-	struct q6asm_cmd_rsp *rsp = &ac->rsp;
-	unsigned long flags;
-	int attempt, rc = -EIO;
-
-	for (attempt = 0; attempt < 2; attempt++) {
-		spin_lock_irqsave(&rsp->lock, flags);
-		q6asm_rsp_sync_epoch_locked(rsp);
-		/*
-		 * CLOSE is the recovery path: allow it even when the table
-		 * overflowed, because a confirmed CLOSE retires every owed
-		 * opcode.  A CLOSE whose own answer is owed (recorded or not)
-		 * is still refused; the caller quarantines the session then.
-		 */
-		if ((rsp->overflow && opcode != ASM_STREAM_CMD_CLOSE) ||
-		    (opcode == ASM_STREAM_CMD_CLOSE && rsp->close_owed) ||
-		    q6asm_rsp_stale_locked(rsp, opcode) ||
-		    q6asm_rsp_async_locked(rsp, opcode)) {
-			rc = -EIO;
-		} else {
-			rsp->opcode = opcode;
-			rsp->status = 0;
-			rsp->handle = 0;
-			rsp->wait_epoch = rsp->epoch;
-			rsp->done = false;
-			rsp->pending = true;
-			rc = 0;
-		}
-		spin_unlock_irqrestore(&rsp->lock, flags);
-
-		/*
-		 * A restart between the epoch sync and the checks would make a
-		 * void retirement reject a command the new instance never saw.
-		 * Retry once; the loop is bounded so a restart storm cannot
-		 * spin here.
-		 */
-		if (!rc || READ_ONCE(q6asm_global.ssr_epoch) ==
-			   READ_ONCE(rsp->epoch))
-			break;
-	}
-
-	return rc;
-}
-
-static void q6asm_cmd_rsp_disarm(struct audio_client *ac)
-{
-	struct q6asm_cmd_rsp *rsp = &ac->rsp;
-	unsigned long flags;
-
-	spin_lock_irqsave(&rsp->lock, flags);
-	rsp->pending = false;
-	spin_unlock_irqrestore(&rsp->lock, flags);
-}
-
-/*
- * A confirmed CLOSE ends the stream, and the ADSP answers the commands of
- * one session in order.  Every earlier response has therefore been consumed
- * (or is the one still owed and about to be delivered), so the stream's
- * opcodes may be used again on the next session.
- */
-static void q6asm_cmd_rsp_forget_stream(struct audio_client *ac)
-{
-	struct q6asm_cmd_rsp *rsp = &ac->rsp;
-	unsigned long flags;
-
-	spin_lock_irqsave(&rsp->lock, flags);
-	memset(rsp->stale, 0, sizeof(rsp->stale));
-	memset(rsp->async, 0, sizeof(rsp->async));
-	rsp->overflow = false;
-	rsp->close_owed = false;
-	rsp->epoch = READ_ONCE(q6asm_global.ssr_epoch);
-	spin_unlock_irqrestore(&rsp->lock, flags);
-}
-
-/*
- * Attribute one response to its owner.  A timed-out opcode consumes its late
- * answer, a fire-and-forget command consumes one credit, and a duplicate or
- * otherwise unowned response changes nothing.  A basic MAP result with
- * status 0 is an "accepted" notice, not the mapping result, so the caller
- * passes it only when it carries a real failure.
- */
-static enum q6asm_rsp_owner q6asm_cmd_rsp_claim(struct audio_client *ac,
-						u32 opcode, u32 status,
-						u32 handle)
-{
-	struct q6asm_cmd_rsp *rsp = &ac->rsp;
-	unsigned long flags;
-	enum q6asm_rsp_owner owner = Q6ASM_RSP_NONE;
-	bool late = false, unowned = false;
-
-	spin_lock_irqsave(&rsp->lock, flags);
-	/* Any answer for CLOSE proves one close command was executed. */
-	if (opcode == ASM_STREAM_CMD_CLOSE)
-		rsp->close_owed = false;
-	if (rsp->pending && rsp->opcode == opcode) {
-		rsp->status = status;
-		rsp->handle = handle;
-		rsp->done = true;
-		rsp->pending = false;
-		owner = Q6ASM_RSP_SYNC;
-		wake_up(&rsp->wait);
-	} else if (q6asm_rsp_clear_stale_locked(rsp, opcode)) {
-		late = true;
-	} else if (q6asm_rsp_async_take_locked(rsp, opcode)) {
-		owner = Q6ASM_RSP_ASYNC;
-	} else {
-		unowned = true;
-	}
-	spin_unlock_irqrestore(&rsp->lock, flags);
-
-	/* Logging outside the IRQ-off section keeps the APR hot path short. */
-	if (late) {
-		q6asm_stat_inc(ac, Q6ASM_STAT_LATE);
-		dev_dbg_ratelimited(ac->dev,
-				    "late response for retired command %#x dropped\n",
-				    opcode);
-	} else if (unowned) {
-		q6asm_stat_inc(ac, Q6ASM_STAT_UNOWNED);
-		dev_dbg_ratelimited(ac->dev,
-				    "unowned response %#x dropped\n", opcode);
-	}
-
-	return owner;
-}
-
-/* Reserve a credit before sending so a fast response cannot arrive first. */
-static int q6asm_cmd_rsp_async_begin(struct audio_client *ac, u32 opcode)
-{
-	struct q6asm_cmd_rsp *rsp = &ac->rsp;
-	unsigned long flags;
-	int rc;
-
-	spin_lock_irqsave(&rsp->lock, flags);
-	q6asm_rsp_sync_epoch_locked(rsp);
-	if (rsp->overflow || q6asm_rsp_stale_locked(rsp, opcode) ||
-	    (rsp->pending && rsp->opcode == opcode))
-		rc = -EIO;
-	else
-		rc = q6asm_rsp_async_begin_locked(rsp, opcode);
-	spin_unlock_irqrestore(&rsp->lock, flags);
-
-	return rc;
-}
-
-static void q6asm_cmd_rsp_async_end(struct audio_client *ac, u32 opcode)
-{
-	struct q6asm_cmd_rsp *rsp = &ac->rsp;
-	unsigned long flags;
-
-	spin_lock_irqsave(&rsp->lock, flags);
-	/* A failed send after a restart has no credit to give back. */
-	q6asm_rsp_sync_epoch_locked(rsp);
-	q6asm_rsp_async_end_locked(rsp, opcode);
-	spin_unlock_irqrestore(&rsp->lock, flags);
-}
-
-static int q6asm_send_cmd_sync(struct audio_client *ac, struct apr_pkt *pkt,
-			       u32 expected, u32 *handle)
-{
-	struct q6asm *a = ac->q6asm;
-	struct q6asm_cmd_rsp *rsp = &ac->rsp;
-	unsigned long flags;
-	u32 status = 0;
-	bool done;
+	struct apr_hdr *hdr = &pkt->hdr;
 	int rc;
 
 	mutex_lock(&ac->cmd_lock);
-	rc = q6asm_cmd_rsp_arm(ac, expected);
-	if (rc < 0) {
-		dev_err_ratelimited(ac->dev,
-				    "CMD %#x refused: an earlier answer is still owed\n",
-				    expected);
-		goto out;
-	}
-
+	ac->result.opcode = 0;
+	ac->result.status = 0;
 	rc = apr_send_pkt(a->adev, pkt);
-	if (rc < 0) {
-		/* The packet never left the host; the remote state is unchanged. */
-		q6asm_cmd_rsp_disarm(ac);
-		goto out;
-	}
+	if (rc < 0)
+		goto err;
 
-	wait_event_timeout(rsp->wait, READ_ONCE(rsp->done), 5 * HZ);
+	if (rsp_opcode)
+		rc = wait_event_timeout(a->mem_wait,
+					(ac->result.opcode == hdr->opcode) ||
+					(ac->result.opcode == rsp_opcode),
+					5 * HZ);
+	else
+		rc = wait_event_timeout(a->mem_wait,
+					(ac->result.opcode == hdr->opcode),
+					5 * HZ);
 
-	/*
-	 * Read the result under the lock even after a timeout: a response can
-	 * complete the command in the same jiffy the timeout fires.
-	 */
-	spin_lock_irqsave(&rsp->lock, flags);
-	done = rsp->done;
-	status = rsp->status;
-	if (handle)
-		*handle = rsp->handle;
-	if (!done) {
-		rsp->pending = false;
-		if (rsp->wait_epoch == READ_ONCE(q6asm_global.ssr_epoch)) {
-			q6asm_rsp_mark_stale_locked(rsp, expected);
-		} else {
-			/*
-			 * The instance changed while the command was in
-			 * flight: it may have been received by either one.
-			 * Refuse further commands with unknown answers until
-			 * a CLOSE proves the stream's state.
-			 */
-			rsp->overflow = true;
-		}
-	}
-	spin_unlock_irqrestore(&rsp->lock, flags);
-
-	if (!done) {
-		dev_err(ac->dev,
-			"CMD %#x timeout; its response is retired\n",
-			pkt->hdr.opcode);
+	if (!rc) {
+		dev_err(a->dev, "CMD %x timeout\n", hdr->opcode);
 		rc = -ETIMEDOUT;
-	} else if (status) {
-		dev_err(ac->dev,
-			"DSP command %#x session %d returned error[%#x]\n",
-			pkt->hdr.opcode, ac->session, status);
-		rc = -EREMOTEIO;
-	} else {
-		rc = 0;
+	} else if (ac->result.status > 0) {
+		dev_err(a->dev, "DSP returned error[%x]\n",
+			ac->result.status);
+		rc = -EINVAL;
 	}
 
-out:
+err:
 	mutex_unlock(&ac->cmd_lock);
 	return rc;
 }
 
-static int __q6asm_memory_unmap(struct audio_client *ac, int dir)
+static int __q6asm_memory_unmap(struct audio_client *ac,
+				phys_addr_t buf_add, int dir)
 {
 	struct avs_cmd_shared_mem_unmap_regions *mem_unmap;
+	struct q6asm *a = dev_get_drvdata(ac->dev->parent);
 	struct apr_pkt *pkt;
-	unsigned long flags;
 	int rc, pkt_size;
 
 	if (ac->port[dir].mem_map_handle == 0) {
@@ -1340,27 +353,16 @@ static int __q6asm_memory_unmap(struct audio_client *ac, int dir)
 	pkt->hdr.src_port = 0;
 	pkt->hdr.dest_port = 0;
 	pkt->hdr.pkt_size = pkt_size;
-	/*
-	 * Keep the direction in the low nibble: q6asm_stream_callback()
-	 * recovers it with "hdr->token & 0x0F" to store the memory-map handle
-	 * in the right port.  Sending it in the flag byte (the vendor
-	 * kernel's layout) made every capture response land on the playback
-	 * port, so capture reads used a zero mem_map_handle and returned
-	 * silence.
-	 */
 	pkt->hdr.token = ((ac->session << 8) | dir);
 
 	pkt->hdr.opcode = ASM_CMD_SHARED_MEM_UNMAP_REGIONS;
 	mem_unmap->mem_map_handle = ac->port[dir].mem_map_handle;
 
-	rc = q6asm_send_cmd_sync(ac, pkt, ASM_CMD_SHARED_MEM_UNMAP_REGIONS,
-				 NULL);
+	rc = q6asm_apr_send_session_pkt(a, ac, pkt, 0);
 	if (rc < 0)
 		return rc;
 
-	spin_lock_irqsave(&ac->lock, flags);
 	ac->port[dir].mem_map_handle = 0;
-	spin_unlock_irqrestore(&ac->lock, flags);
 
 	return 0;
 }
@@ -1371,21 +373,11 @@ static void q6asm_audio_client_free_buf(struct audio_client *ac,
 {
 	unsigned long flags;
 
-	struct audio_buffer *buf;
-	struct q6asm_submit *submit;
-
 	spin_lock_irqsave(&ac->lock, flags);
-	buf = port->buf;
-	submit = port->submit;
-	port->buf = NULL;
-	port->submit = NULL;
 	port->num_periods = 0;
-	port->dsp_buf = 0;
-	port->next_done = 0;
-	atomic_set(&port->hw_ptr, 0);
 	spin_unlock_irqrestore(&ac->lock, flags);
-	kfree(buf);
-	kfree(submit);
+	kfree(port->buf);
+	port->buf = NULL;
 }
 
 /**
@@ -1402,10 +394,6 @@ int q6asm_unmap_memory_regions(unsigned int dir, struct audio_client *ac)
 	int cnt = 0;
 	int rc = 0;
 
-	rc = q6asm_fault_take(ac, Q6ASM_FAULT_UNMAP);
-	if (rc)
-		return rc;
-
 	port = &ac->port[dir];
 	if (!port->buf) {
 		rc = -EINVAL;
@@ -1414,7 +402,7 @@ int q6asm_unmap_memory_regions(unsigned int dir, struct audio_client *ac)
 
 	cnt = port->num_periods - 1;
 	if (cnt >= 0) {
-		rc = __q6asm_memory_unmap(ac, dir);
+		rc = __q6asm_memory_unmap(ac, port->buf[dir].phys, dir);
 		if (rc < 0) {
 			dev_err(ac->dev, "%s: Memory_unmap_regions failed %d\n",
 				__func__, rc);
@@ -1435,13 +423,13 @@ static int __q6asm_memory_map_regions(struct audio_client *ac, int dir,
 {
 	struct avs_cmd_shared_mem_map_regions *cmd = NULL;
 	struct avs_shared_map_region_payload *mregions = NULL;
+	struct q6asm *a = dev_get_drvdata(ac->dev->parent);
 	struct audio_port_data *port = NULL;
 	struct audio_buffer *ab = NULL;
 	struct apr_pkt *pkt;
 	unsigned long flags;
-	u32 handle = 0;
 	uint32_t num_regions, buf_sz;
-	int i, pkt_size, rc;
+	int i, pkt_size;
 
 	if (is_contiguous) {
 		num_regions = 1;
@@ -1469,7 +457,6 @@ static int __q6asm_memory_map_regions(struct audio_client *ac, int dir,
 	pkt->hdr.src_port = 0;
 	pkt->hdr.dest_port = 0;
 	pkt->hdr.pkt_size = pkt_size;
-	/* Direction in the low nibble, see __q6asm_memory_unmap(). */
 	pkt->hdr.token = ((ac->session << 8) | dir);
 	pkt->hdr.opcode = ASM_CMD_SHARED_MEM_MAP_REGIONS;
 
@@ -1489,27 +476,7 @@ static int __q6asm_memory_map_regions(struct audio_client *ac, int dir,
 	}
 	spin_unlock_irqrestore(&ac->lock, flags);
 
-	rc = q6asm_send_cmd_sync(ac, pkt, ASM_CMD_SHARED_MEM_MAP_REGIONS,
-				 &handle);
-	if (rc < 0)
-		return rc;
-
-	/*
-	 * A successful status without a handle is a protocol anomaly: the
-	 * mapping cannot be addressed or unmapped, so fail closed instead of
-	 * handing a zero handle to READ/WRITE.
-	 */
-	if (!handle) {
-		dev_err(ac->dev,
-			"Memory_map_regions returned no handle for dir %u\n", dir);
-		return -EPROTO;
-	}
-
-	spin_lock_irqsave(&ac->lock, flags);
-	ac->port[dir].mem_map_handle = handle;
-	spin_unlock_irqrestore(&ac->lock, flags);
-
-	return 0;
+	return q6asm_apr_send_session_pkt(a, ac, pkt, ASM_CMDRSP_SHARED_MEM_MAP_REGIONS);
 }
 
 /**
@@ -1527,37 +494,26 @@ int q6asm_map_memory_regions(unsigned int dir, struct audio_client *ac,
 			     phys_addr_t phys,
 			     size_t period_sz, unsigned int periods)
 {
-	struct q6asm_submit *submit;
 	struct audio_buffer *buf;
 	unsigned long flags;
 	int cnt;
 	int rc;
 
-	rc = q6asm_fault_take(ac, Q6ASM_FAULT_MAP);
-	if (rc)
-		return rc;
-
-	if (!periods || !period_sz)
-		return -EINVAL;
-
 	spin_lock_irqsave(&ac->lock, flags);
 	if (ac->port[dir].buf) {
 		dev_err(ac->dev, "Buffer already allocated\n");
 		spin_unlock_irqrestore(&ac->lock, flags);
-		return -EBUSY;
+		return 0;
 	}
 
 	buf = kzalloc_objs(*buf, periods, GFP_ATOMIC);
-	submit = kzalloc_objs(*submit, periods, GFP_ATOMIC);
-	if (!buf || !submit) {
+	if (!buf) {
 		spin_unlock_irqrestore(&ac->lock, flags);
-		kfree(buf);
-		kfree(submit);
 		return -ENOMEM;
 	}
 
+
 	ac->port[dir].buf = buf;
-	ac->port[dir].submit = submit;
 
 	buf[0].phys = phys;
 	buf[0].size = period_sz;
@@ -1569,8 +525,6 @@ int q6asm_map_memory_regions(unsigned int dir, struct audio_client *ac,
 		}
 	}
 	ac->port[dir].num_periods = periods;
-	ac->port[dir].dsp_buf = 0;
-	atomic_set(&ac->port[dir].hw_ptr, 0);
 
 	spin_unlock_irqrestore(&ac->lock, flags);
 
@@ -1578,25 +532,9 @@ int q6asm_map_memory_regions(unsigned int dir, struct audio_client *ac,
 	if (rc < 0) {
 		dev_err(ac->dev, "Memory_map_regions failed\n");
 		q6asm_audio_client_free_buf(ac, &ac->port[dir]);
-		return rc;
 	}
 
-	/*
-	 * A new mapping starts a new data-path instance.  The generation is
-	 * carried in the token so a completion that belonged to the previous
-	 * stream can never move this ring's hw_ptr or free its slots.
-	 */
-	spin_lock_irqsave(&ac->lock, flags);
-	ac->port[dir].generation = q6asm_next_generation();
-	memset(ac->port[dir].submit, 0,
-	       sizeof(*ac->port[dir].submit) * ac->port[dir].num_periods);
-	ac->port[dir].dsp_buf = 0;
-	ac->port[dir].next_done = 0;
-	ac->port[dir].failures = 0;
-	atomic_set(&ac->port[dir].hw_ptr, 0);
-	spin_unlock_irqrestore(&ac->lock, flags);
-
-	return 0;
+	return rc;
 }
 EXPORT_SYMBOL_GPL(q6asm_map_memory_regions);
 
@@ -1613,11 +551,6 @@ static void q6asm_audio_client_release(struct kref *ref)
 	a->session[ac->session] = NULL;
 	spin_unlock_irqrestore(&a->slock, flags);
 
-	/* Host-side ring descriptions; the DMA pages are not owned here. */
-	q6asm_audio_client_free_buf(ac, &ac->port[SNDRV_PCM_STREAM_PLAYBACK]);
-	q6asm_audio_client_free_buf(ac, &ac->port[SNDRV_PCM_STREAM_CAPTURE]);
-
-	kfree(ac->hold_slot);
 	kfree(ac);
 }
 
@@ -1626,79 +559,11 @@ static void q6asm_audio_client_release(struct kref *ref)
  *
  * @ac: audio client to free
  */
-void q6asm_audio_client_clear_callback(struct audio_client *ac)
-{
-	mutex_lock(&ac->cb_lock);
-	ac->cb = NULL;
-	ac->priv = NULL;
-	mutex_unlock(&ac->cb_lock);
-}
-EXPORT_SYMBOL_GPL(q6asm_audio_client_clear_callback);
-
 void q6asm_audio_client_free(struct audio_client *ac)
 {
-	q6asm_audio_client_clear_callback(ac);
 	kref_put(&ac->refcount, q6asm_audio_client_release);
 }
 EXPORT_SYMBOL_GPL(q6asm_audio_client_free);
-
-/**
- * q6asm_quarantine_session() - keep a session id unusable after a failed teardown
- *
- * @ac: audio client whose ADSP-side state could not be confirmed
- *
- * A failed CMD_CLOSE or UNMAP leaves the DSP owning a stream and/or DMA
- * mapping that the host can no longer address.  Retiring the id prevents a
- * later client from reusing the same session and colliding with that state.
- * The bitmap is module scoped: a q6asm driver rebind does not reset the
- * ADSP, so the id may only be reused after the remoteproc reports that the
- * ADSP actually stopped.
- */
-void q6asm_quarantine_session(struct audio_client *ac)
-{
-	/*
-	 * A stop or restart after the failed command was armed already
-	 * discarded the remote state (AFTER_SHUTDOWN clears the table); the
-	 * timeout is only the host noticing late.  Latching the session then
-	 * would make it unusable even though nothing of the old instance
-	 * survives.
-	 */
-	if (READ_ONCE(ac->rsp.wait_epoch) !=
-	    READ_ONCE(q6asm_global.ssr_epoch)) {
-		dev_dbg(ac->dev,
-			"session %d: ADSP epoch changed, quarantine skipped\n",
-			ac->session);
-		return;
-	}
-
-	mutex_lock(&q6asm_global.lock);
-	set_bit(ac->session, q6asm_global.session_quarantine);
-	mutex_unlock(&q6asm_global.lock);
-
-	dev_err(ac->dev, "session %d quarantined; ADSP ownership unknown\n",
-		ac->session);
-}
-EXPORT_SYMBOL_GPL(q6asm_quarantine_session);
-
-/**
- * q6asm_session_is_quarantined() - check a client's session quarantine bit
- *
- * @ac: audio client to test
- *
- * The DAI must refuse a new prepare() on an existing client whose session
- * was quarantined by an earlier failed teardown.
- */
-bool q6asm_session_is_quarantined(struct audio_client *ac)
-{
-	bool quarantined;
-
-	mutex_lock(&q6asm_global.lock);
-	quarantined = test_bit(ac->session, q6asm_global.session_quarantine);
-	mutex_unlock(&q6asm_global.lock);
-
-	return quarantined;
-}
-EXPORT_SYMBOL_GPL(q6asm_session_is_quarantined);
 
 static struct audio_client *q6asm_get_audio_client(struct q6asm *a,
 						   int session_id)
@@ -1718,8 +583,7 @@ static struct audio_client *q6asm_get_audio_client(struct q6asm *a,
 		goto err;
 
 	ac = a->session[session_id];
-	if (!kref_get_unless_zero(&ac->refcount))
-		ac = NULL;
+	kref_get(&ac->refcount);
 err:
 	return ac;
 }
@@ -1732,214 +596,6 @@ int q6asm_get_hw_pointer(struct audio_client *ac, unsigned int dir)
 }
 EXPORT_SYMBOL_GPL(q6asm_get_hw_pointer);
 
-/**
- * q6asm_get_buffer_generation() - identity of the current data path
- *
- * @ac: audio client
- * @dir: playback or capture port
- *
- * The front end records this value after a mapping and compares it with the
- * generation carried by a completion event.  An event that was validated
- * just before a re-prepare installed a new mapping is then dropped instead
- * of advancing the new stream.
- */
-u32 q6asm_get_buffer_generation(struct audio_client *ac, unsigned int dir)
-{
-	unsigned long flags;
-	u32 generation;
-
-	if (dir >= ARRAY_SIZE(ac->port))
-		return 0;
-
-	spin_lock_irqsave(&ac->lock, flags);
-	generation = ac->port[dir].generation;
-	spin_unlock_irqrestore(&ac->lock, flags);
-
-	return generation;
-}
-EXPORT_SYMBOL_GPL(q6asm_get_buffer_generation);
-
-static void q6asm_notify_client(struct audio_client *ac,
-				const struct q6asm_client_event *event)
-{
-	mutex_lock(&ac->cb_lock);
-	if (ac->cb)
-		ac->cb(event, ac->priv);
-	mutex_unlock(&ac->cb_lock);
-}
-
-static void q6asm_emit_simple(struct audio_client *ac,
-			      enum q6asm_client_event_id id, u32 stream_id,
-			      u32 status)
-{
-	struct q6asm_client_event event = {
-		.id = id,
-		.stream_id = stream_id,
-		.status = status,
-	};
-
-	q6asm_notify_client(ac, &event);
-}
-
-/*
- * Match a completion or a rejection to the period that was actually posted.
- * A completion may only be accepted while its slot is in flight, it belongs
- * to the current data-path generation and it names the submitted stream and
- * buffer.  Anything else (a duplicate, an answer from a closed stream, a
- * stale token) is dropped before it can move hw_ptr or free a slot.
- *
- * @generation is the byte decoded from the token; the full host value lives
- * in submit->generation and is compared separately.
- */
-static bool q6asm_complete_transfer(struct audio_client *ac, unsigned int dir,
-				    u32 index, u32 generation, u32 stream_id,
-				    phys_addr_t phys, bool check_phys,
-				    bool strict, u32 seq_id, u32 map_handle,
-				    u32 len, u32 status)
-{
-	struct q6asm_client_event event = {
-		.stream_id = stream_id,
-		.index = index,
-		.status = status,
-	};
-	struct audio_port_data *port = &ac->port[dir];
-	struct q6asm_submit *submit;
-	unsigned long flags;
-	bool notify = false;
-
-	if (!(ac->io_mode & ASM_SYNC_IO_MODE))
-		return false;
-
-	spin_lock_irqsave(&ac->lock, flags);
-	if (!port->buf || !port->submit || index >= port->num_periods)
-		goto out;
-
-	submit = &port->submit[index];
-	if (!submit->in_flight || submit->generation != port->generation)
-		goto out;
-	/*
-	 * Only firmware shown to echo the token's generation byte may use it
-	 * as a discriminator; other boards keep the historical matching.  The
-	 * decoded byte is compared with the encoded half of submit->generation,
-	 * never with the full host value.
-	 */
-	if ((ac->flags & Q6ASM_CLIENT_TOKEN_GENERATION) &&
-	    q6asm_token_gen(submit->generation) != generation)
-		goto out;
-	if (stream_id && submit->stream_id != stream_id)
-		goto out;
-	if (check_phys && submit->phys != phys)
-		goto out;
-	if (strict) {
-		if (seq_id != index) {
-			dev_dbg_ratelimited(ac->dev,
-					    "read completion seq %u token %u\n",
-					    seq_id, index);
-			goto out;
-		}
-		if (map_handle && map_handle != port->mem_map_handle) {
-			dev_dbg_ratelimited(ac->dev,
-					    "read completion map handle %#x (port %#x)\n",
-					    map_handle, port->mem_map_handle);
-			goto out;
-		}
-	}
-
-	submit->in_flight = false;
-	if (status) {
-		port->failures++;
-		event.id = (dir == SNDRV_PCM_STREAM_CAPTURE) ?
-			Q6ASM_EVENT_READ_FAILED : Q6ASM_EVENT_WRITE_FAILED;
-		event.len = 0;
-	} else {
-		/*
-		 * Count every period that is now complete in ring order.  An
-		 * out-of-order completion is remembered and counted when the
-		 * periods before it have completed, so hw_ptr never skips.
-		 */
-		submit->done = true;
-		while (port->submit[port->next_done].done) {
-			port->submit[port->next_done].done = false;
-			port->next_done = (port->next_done + 1) %
-					   port->num_periods;
-			atomic_inc(&port->hw_ptr);
-		}
-		event.id = (dir == SNDRV_PCM_STREAM_CAPTURE) ?
-			Q6ASM_EVENT_READ_DONE : Q6ASM_EVENT_WRITE_DONE;
-		event.len = len ? min(len, submit->len) : submit->len;
-	}
-	/* Let the front end drop an event that outlived a re-prepare. */
-	event.generation = port->generation;
-	notify = true;
-out:
-	spin_unlock_irqrestore(&ac->lock, flags);
-	if (notify) {
-		q6asm_stat_inc(ac, Q6ASM_STAT_ACCEPTED);
-		q6asm_notify_client(ac, &event);
-	} else {
-		q6asm_stat_inc(ac, Q6ASM_STAT_DROPPED);
-	}
-
-	return notify;
-}
-
-static void q6asm_data_failed(struct audio_client *ac, unsigned int dir,
-			      u32 token, u32 status, u32 stream_id)
-{
-	struct audio_port_data *port = &ac->port[dir];
-	u32 index = token & Q6ASM_TOKEN_INDEX_MASK;
-	u32 generation = (token & Q6ASM_TOKEN_GEN_MASK) >>
-			 Q6ASM_TOKEN_GEN_SHIFT;
-	unsigned long flags;
-	u32 cur_gen;
-	bool found = false;
-	int i;
-
-	if (q6asm_complete_transfer(ac, dir, index, generation, stream_id, 0,
-				    false, false, 0, 0, 0, status))
-		return;
-
-	/*
-	 * The token did not name a live period.  If it carries a generation
-	 * that is not the current one, the rejection belongs to an older
-	 * stream instance and must not touch this ring.  Otherwise the
-	 * firmware echoed the generation but not the index: fail the oldest
-	 * live period so the front end can report the failure.
-	 */
-	spin_lock_irqsave(&ac->lock, flags);
-	cur_gen = port->generation;
-	if ((ac->flags & Q6ASM_CLIENT_TOKEN_GENERATION) &&
-	    q6asm_token_gen(cur_gen) != generation) {
-		/* A stale or unusable token must not fail a live period. */
-		found = false;
-	} else if (port->submit && port->num_periods) {
-		for (i = 0; i < port->num_periods; i++) {
-			index = (port->next_done + i) % port->num_periods;
-			if (port->submit[index].in_flight &&
-			    port->submit[index].generation == cur_gen &&
-			    (!stream_id ||
-			     port->submit[index].stream_id == stream_id)) {
-				found = true;
-				break;
-			}
-		}
-	}
-	spin_unlock_irqrestore(&ac->lock, flags);
-
-	if (!found) {
-		dev_dbg_ratelimited(ac->dev,
-				    "data rejection token %#x matched no live period\n",
-				    token);
-		return;
-	}
-
-	dev_dbg_ratelimited(ac->dev,
-			    "data rejection token %#x: failing period %u\n",
-			    token, index);
-	q6asm_complete_transfer(ac, dir, index, q6asm_token_gen(cur_gen),
-				stream_id, 0, false, false, 0, 0, 0, status);
-}
-
 static int32_t q6asm_stream_callback(struct apr_device *adev,
 				     const struct apr_resp_pkt *data,
 				     int session_id)
@@ -1947,8 +603,9 @@ static int32_t q6asm_stream_callback(struct apr_device *adev,
 	struct q6asm *q6asm = dev_get_drvdata(&adev->dev);
 	const struct aprv2_ibasic_rsp_result_t *result;
 	const struct apr_hdr *hdr = &data->hdr;
+	struct audio_port_data *port;
 	struct audio_client *ac;
-	u32 stream_id = hdr->dest_port & 0xFF;
+	uint32_t client_event = 0;
 	int ret = 0;
 
 	ac = q6asm_get_audio_client(q6asm, session_id);
@@ -1959,98 +616,24 @@ static int32_t q6asm_stream_callback(struct apr_device *adev,
 
 	switch (hdr->opcode) {
 	case APR_BASIC_RSP_RESULT:
-		if (data->payload_size < sizeof(*result)) {
-			ret = -EPROTO;
-			goto done;
-		}
-
 		switch (result->opcode) {
-		case ASM_DATA_CMD_READ_V2:
-		case ASM_DATA_CMD_WRITE_V2:
-			/*
-			 * A basic result for a data command is only meaningful
-			 * when it carries a failure.  A status-0 ACK says the
-			 * command was accepted; the *_DONE event reports the
-			 * transfer.
-			 */
-			if (!result->status)
-				break;
-			q6asm_data_failed(ac,
-					  result->opcode ==
-					  ASM_DATA_CMD_READ_V2 ?
-					  SNDRV_PCM_STREAM_CAPTURE :
-					  SNDRV_PCM_STREAM_PLAYBACK,
-					  hdr->token, result->status,
-					  stream_id);
+		case ASM_SESSION_CMD_PAUSE:
+			client_event = ASM_CLIENT_EVENT_CMD_PAUSE_DONE;
 			break;
-		case ASM_SESSION_CMD_RUN_V2: {
-			u32 status = result->status;
-			u32 injected;
-			enum q6asm_rsp_owner owner;
-
-			/*
-			 * The ADSP answers ADSP_EALREADY when the session is
-			 * already running (a duplicated trigger); that is a
-			 * success for the state machine, not a failure.
-			 */
-			if (status == ADSP_EALREADY)
-				status = ADSP_EOK;
-			injected = q6asm_fault_status_take(ac,
-							   Q6ASM_FAULT_RUN_REJECT,
-							   ADSP_EFAILED);
-			if (injected)
-				status = injected;
-			owner = q6asm_cmd_rsp_claim(ac, result->opcode, status, 0);
-			/*
-			 * Diagnostic: hand the same answer to the correlator a
-			 * second time before any side effect.  It must be unowned;
-			 * an owned duplicate would mean an async credit can be
-			 * spent twice.
-			 */
-			if (q6asm_fault_drop(ac, Q6ASM_FAULT_DUPLICATE) &&
-			    q6asm_cmd_rsp_claim(ac, result->opcode, status, 0) !=
-			    Q6ASM_RSP_NONE)
-				dev_err_ratelimited(ac->dev,
-					"duplicate RUN answer was owned\n");
-			if (owner != Q6ASM_RSP_NONE)
-				q6asm_emit_simple(ac, Q6ASM_EVENT_RUN_DONE,
-						  stream_id, status);
-			break;
-		}
-		case ASM_SESSION_CMD_PAUSE: {
-			u32 status = result->status;
-			u32 injected;
-			enum q6asm_rsp_owner owner;
-
-			if (status == ADSP_EALREADY)
-				status = ADSP_EOK;
-			injected = q6asm_fault_status_take(ac,
-							   Q6ASM_FAULT_PAUSE_REJECT,
-							   ADSP_EFAILED);
-			if (injected)
-				status = injected;
-			owner = q6asm_cmd_rsp_claim(ac, result->opcode, status, 0);
-			if (owner != Q6ASM_RSP_NONE)
-				q6asm_emit_simple(ac, Q6ASM_EVENT_PAUSE_DONE,
-						  stream_id, status);
-			break;
-		}
-		case ASM_DATA_CMD_EOS: {
-			enum q6asm_rsp_owner owner;
-
-			owner = q6asm_cmd_rsp_claim(ac, result->opcode,
-						    result->status, 0);
-			if (owner != Q6ASM_RSP_NONE)
-				q6asm_emit_simple(ac, Q6ASM_EVENT_EOS_DONE,
-						  stream_id, result->status);
-			break;
-		}
-		case ASM_STREAM_CMD_CLOSE:
 		case ASM_SESSION_CMD_SUSPEND:
+			client_event = ASM_CLIENT_EVENT_CMD_SUSPEND_DONE;
+			break;
 		case ASM_STREAM_CMD_FLUSH:
+			client_event = ASM_CLIENT_EVENT_CMD_FLUSH_DONE;
+			break;
+		case ASM_SESSION_CMD_RUN_V2:
+			client_event = ASM_CLIENT_EVENT_CMD_RUN_DONE;
+			break;
+		case ASM_STREAM_CMD_CLOSE:
+			client_event = ASM_CLIENT_EVENT_CMD_CLOSE_DONE;
+			break;
 		case ASM_STREAM_CMD_FLUSH_READBUFS:
-			q6asm_cmd_rsp_claim(ac, result->opcode,
-					    result->status, 0);
+			client_event = ASM_CLIENT_EVENT_CMD_OUT_FLUSH_DONE;
 			break;
 		case ASM_STREAM_CMD_OPEN_WRITE_V3:
 		case ASM_STREAM_CMD_OPEN_READ_V3:
@@ -2059,104 +642,99 @@ static int32_t q6asm_stream_callback(struct apr_device *adev,
 		case ASM_DATA_CMD_MEDIA_FMT_UPDATE_V2:
 		case ASM_DATA_CMD_REMOVE_INITIAL_SILENCE:
 		case ASM_DATA_CMD_REMOVE_TRAILING_SILENCE:
-			q6asm_cmd_rsp_claim(ac, result->opcode,
-					    result->status, 0);
+			if (result->status != 0) {
+				dev_err(ac->dev,
+					"cmd = 0x%x returned error = 0x%x\n",
+					result->opcode, result->status);
+				ac->result = *result;
+				wake_up(&ac->cmd_wait);
+				ret = 0;
+				goto done;
+			}
 			break;
+		case ASM_DATA_CMD_EOS:
+		case ASM_DATA_CMD_READ_V2:
+		case ASM_DATA_CMD_WRITE_V2:
+			/* response as result of close stream */
+			goto done;
 		default:
-			dev_dbg_ratelimited(ac->dev,
-					    "basic result for unexpected opcode %#x (status %u)\n",
-					    result->opcode, result->status);
+			dev_err(ac->dev, "command[0x%x] not expecting rsp\n",
+				result->opcode);
 			break;
 		}
+
+		ac->result = *result;
+		wake_up(&ac->cmd_wait);
+
+		if (ac->cb)
+			ac->cb(client_event, hdr->token,
+			       data->payload, ac->priv);
+
+		ret = 0;
 		goto done;
 
-	case ASM_DATA_EVENT_WRITE_DONE_V2: {
-		phys_addr_t phys;
-		u32 index = hdr->token & Q6ASM_TOKEN_INDEX_MASK;
-		u32 generation = (hdr->token & Q6ASM_TOKEN_GEN_MASK) >>
-				 Q6ASM_TOKEN_GEN_SHIFT;
+	case ASM_DATA_EVENT_WRITE_DONE_V2:
+		client_event = ASM_CLIENT_EVENT_DATA_WRITE_DONE;
+		if (ac->io_mode & ASM_SYNC_IO_MODE) {
+			phys_addr_t phys;
+			int token = hdr->token & ASM_WRITE_TOKEN_MASK;
 
-		if (data->payload_size < 2 * sizeof(u32)) {
-			dev_dbg_ratelimited(ac->dev,
-					    "short write completion (%d bytes)\n",
-					    data->payload_size);
-			break;
+			guard(spinlock_irqsave)(&ac->lock);
+
+			port =  &ac->port[SNDRV_PCM_STREAM_PLAYBACK];
+
+			if (!port->buf) {
+				ret = 0;
+				goto done;
+			}
+
+			phys = port->buf[token].phys;
+
+			if (lower_32_bits(phys) != result->opcode ||
+			    upper_32_bits(phys) != result->status) {
+				dev_err(ac->dev, "Expected addr %pa\n",
+					&port->buf[token].phys);
+				ret = -EINVAL;
+				goto done;
+			}
+			atomic_set(&port->hw_ptr, token + 1);
 		}
-
-		if (q6asm_fault_status_take(ac, Q6ASM_FAULT_WRITE_REJECT,
-					    ADSP_EFAILED)) {
-			q6asm_complete_transfer(ac,
-						SNDRV_PCM_STREAM_PLAYBACK,
-						index, generation, stream_id,
-						0, false, false, 0, 0, 0,
-						ADSP_EFAILED);
-			break;
-		}
-
-		phys = ((phys_addr_t)result->status << 32) | result->opcode;
-		q6asm_complete_transfer(ac, SNDRV_PCM_STREAM_PLAYBACK, index,
-					generation, stream_id, phys, true, false,
-					0, 0, 0, 0);
 		break;
-	}
-	case ASM_DATA_EVENT_READ_DONE_V2: {
-		const struct asm_data_cmd_read_v2_done *done = data->payload;
-		phys_addr_t phys;
-		u32 index = hdr->token & Q6ASM_TOKEN_INDEX_MASK;
-		u32 generation = (hdr->token & Q6ASM_TOKEN_GEN_MASK) >>
-				 Q6ASM_TOKEN_GEN_SHIFT;
-		u32 len = 0;
-		bool full;
+	case ASM_DATA_EVENT_READ_DONE_V2:
+		client_event = ASM_CLIENT_EVENT_DATA_READ_DONE;
+		if (ac->io_mode & ASM_SYNC_IO_MODE) {
+			struct asm_data_cmd_read_v2_done *done = data->payload;
+			phys_addr_t phys;
 
-		if (data->payload_size < Q6ASM_READ_DONE_MIN) {
-			dev_dbg_ratelimited(ac->dev,
-					    "short read completion (%d bytes)\n",
-					    data->payload_size);
-			break;
+			guard(spinlock_irqsave)(&ac->lock);
+			port =  &ac->port[SNDRV_PCM_STREAM_CAPTURE];
+			if (!port->buf) {
+				ret = 0;
+				goto done;
+			}
+
+			phys = port->buf[hdr->token].phys;
+			atomic_set(&port->hw_ptr, hdr->token + 1);
+
+			if (upper_32_bits(phys) != done->buf_addr_msw ||
+			    lower_32_bits(phys) != done->buf_addr_lsw) {
+				dev_err(ac->dev, "Expected addr %pa %08x-%08x\n",
+					&port->buf[hdr->token].phys,
+					done->buf_addr_lsw,
+					done->buf_addr_msw);
+				ret = -EINVAL;
+				goto done;
+			}
 		}
 
-		if (done->status) {
-			if (data->payload_size >= Q6ASM_READ_DONE_FULL)
-				index = done->seq_id;
-			q6asm_complete_transfer(ac, SNDRV_PCM_STREAM_CAPTURE,
-						index, generation, stream_id,
-						0, false, false, 0, 0, 0,
-						done->status);
-			break;
-		}
-
-		if (q6asm_fault_status_take(ac, Q6ASM_FAULT_READ_REJECT,
-					    ADSP_ENOTREADY)) {
-			q6asm_complete_transfer(ac, SNDRV_PCM_STREAM_CAPTURE,
-						index, generation, stream_id,
-						0, false, false, 0, 0, 0,
-						ADSP_ENOTREADY);
-			break;
-		}
-
-		full = data->payload_size >= Q6ASM_READ_DONE_FULL;
-		if (full)
-			len = done->buf_size;
-
-		phys = ((phys_addr_t)done->buf_addr_msw << 32) |
-		       done->buf_addr_lsw;
-		q6asm_complete_transfer(ac, SNDRV_PCM_STREAM_CAPTURE, index,
-					generation, stream_id, phys, true,
-					full && (ac->flags &
-						 Q6ASM_CLIENT_STRICT_CAPTURE),
-					full ? done->seq_id : 0,
-					full ? done->mem_map_handle : 0,
-					len, 0);
 		break;
-	}
 	case ASM_DATA_EVENT_RENDERED_EOS:
-		q6asm_emit_simple(ac, Q6ASM_EVENT_EOS_RENDERED, stream_id, 0);
-		break;
-	default:
-		dev_dbg_ratelimited(ac->dev, "unexpected response %#x\n",
-				    hdr->opcode);
+		client_event = ASM_CLIENT_EVENT_CMD_EOS_DONE;
 		break;
 	}
+
+	if (ac->cb)
+		ac->cb(client_event, hdr->token, data->payload, ac->priv);
 
 done:
 	kref_put(&ac->refcount, q6asm_audio_client_release);
@@ -2167,96 +745,69 @@ static int q6asm_srvc_callback(struct apr_device *adev,
 			       const struct apr_resp_pkt *data)
 {
 	struct q6asm *q6asm = dev_get_drvdata(&adev->dev);
-	const struct aprv2_ibasic_rsp_result_t *result;
+	struct aprv2_ibasic_rsp_result_t *result;
+	struct audio_port_data *port;
+	struct audio_client *ac = NULL;
 	const struct apr_hdr *hdr = &data->hdr;
-	struct audio_client *ac;
-	u32 sid, dir;
+	struct q6asm *a;
+	uint32_t sid = 0;
+	uint32_t dir = 0;
 	int session_id;
 
-	/*
-	 * Stream-scoped responses carry the session in the destination port;
-	 * MAP/UNMAP commands use port 0 and put the session and direction in
-	 * the token instead.
-	 */
 	session_id = (hdr->dest_port >> 8) & 0xFF;
 	if (session_id)
 		return q6asm_stream_callback(adev, data, session_id);
 
 	sid = (hdr->token >> 8) & 0x0F;
-	if (!sid)
-		sid = (hdr->dest_port >> 8) & 0xFF;
-	if (!sid || sid > MAX_SESSIONS)
-		return 0;
-
 	ac = q6asm_get_audio_client(q6asm, sid);
 	if (!ac) {
-		dev_dbg_ratelimited(&adev->dev,
-				    "map response for inactive session %u\n", sid);
+		dev_err(&adev->dev, "Audio Client not active\n");
 		return 0;
 	}
 
-	dir = hdr->token & 0x0F;
-	if (dir >= ARRAY_SIZE(ac->port)) {
-		dev_dbg_ratelimited(ac->dev, "map response with bad dir %u\n",
-				    dir);
-		goto done;
-	}
-
+	a = dev_get_drvdata(ac->dev->parent);
+	dir = (hdr->token & 0x0F);
+	port = &ac->port[dir];
 	result = data->payload;
+
 	switch (hdr->opcode) {
 	case APR_BASIC_RSP_RESULT:
-		if (data->payload_size < sizeof(*result))
-			break;
 		switch (result->opcode) {
 		case ASM_CMD_SHARED_MEM_MAP_REGIONS:
-			/*
-			 * A status-0 basic result only acknowledges the command;
-			 * the mapping handle arrives in the CMDRSP.  A non-zero
-			 * status is the real answer and fails the wait.  If a
-			 * dropmap injection was armed, this real answer must not
-			 * leave it behind for a later session.
-			 */
-			if (result->status) {
-				q6asm_fault_clear(ac, Q6ASM_FAULT_DROP_MAP);
-				q6asm_cmd_rsp_claim(ac, result->opcode,
-						    result->status, 0);
-			} else {
-				dev_dbg(ac->dev,
-					"MAP accepted without a handle, waiting for the response\n");
-			}
-			break;
 		case ASM_CMD_SHARED_MEM_UNMAP_REGIONS:
-			q6asm_cmd_rsp_claim(ac, result->opcode,
-					    result->status, 0);
+			ac->result = *result;
+			wake_up(&a->mem_wait);
 			break;
 		default:
-			dev_dbg_ratelimited(ac->dev,
-					    "unexpected map-session result %#x\n",
-					    result->opcode);
+			dev_err(&adev->dev, "command[0x%x] not expecting rsp\n",
+				 result->opcode);
 			break;
 		}
-		break;
+		goto done;
 	case ASM_CMDRSP_SHARED_MEM_MAP_REGIONS:
-		if (q6asm_fault_drop(ac, Q6ASM_FAULT_DROP_MAP))
-			break;
-		if (data->payload_size < sizeof(u32))
-			break;
-		q6asm_cmd_rsp_claim(ac, ASM_CMD_SHARED_MEM_MAP_REGIONS, 0,
-				    result->opcode);
+		ac->result.status = 0;
+		ac->result.opcode = hdr->opcode;
+		port->mem_map_handle = result->opcode;
+		wake_up(&a->mem_wait);
 		break;
 	case ASM_CMD_SHARED_MEM_UNMAP_REGIONS:
-		/* Some firmware echoes the command opcode as its answer. */
-		q6asm_cmd_rsp_claim(ac, ASM_CMD_SHARED_MEM_UNMAP_REGIONS, 0,
-				    0);
+		ac->result.opcode = hdr->opcode;
+		ac->result.status = 0;
+		port->mem_map_handle = 0;
+		wake_up(&a->mem_wait);
 		break;
 	default:
-		dev_dbg_ratelimited(ac->dev, "unexpected map-session opcode %#x\n",
-				    hdr->opcode);
+		dev_dbg(&adev->dev, "command[0x%x]success [0x%x]\n",
+			result->opcode, result->status);
 		break;
 	}
+
+	if (ac->cb)
+		ac->cb(hdr->opcode, hdr->token, data->payload, ac->priv);
 
 done:
 	kref_put(&ac->refcount, q6asm_audio_client_release);
+
 	return 0;
 }
 
@@ -2293,24 +844,19 @@ struct audio_client *q6asm_audio_client_alloc(struct device *dev, q6asm_cb cb,
 	struct audio_client *ac;
 	unsigned long flags;
 
-	if (session_id < 0 || session_id >= MAX_SESSIONS)
-		return ERR_PTR(-EINVAL);
+	ac = q6asm_get_audio_client(a, session_id + 1);
+	if (ac) {
+		dev_err(dev, "Audio Client already active\n");
+		return ac;
+	}
 
 	ac = kzalloc_obj(*ac);
 	if (!ac)
 		return ERR_PTR(-ENOMEM);
 
-	/*
-	 * Allocate the held-buffer record up front so that a failed teardown
-	 * never has to allocate.  It is only used if CLOSE/UNMAP cannot
-	 * confirm that the DSP gave the buffer back.
-	 */
-	ac->hold_slot = kzalloc_obj(*ac->hold_slot);
-	if (!ac->hold_slot) {
-		kfree(ac);
-		return ERR_PTR(-ENOMEM);
-	}
-
+	spin_lock_irqsave(&a->slock, flags);
+	a->session[session_id + 1] = ac;
+	spin_unlock_irqrestore(&a->slock, flags);
 	ac->session = session_id + 1;
 	ac->cb = cb;
 	ac->dev = dev;
@@ -2321,55 +867,47 @@ struct audio_client *q6asm_audio_client_alloc(struct device *dev, q6asm_cb cb,
 	ac->adev = a->adev;
 	kref_init(&ac->refcount);
 
-	init_waitqueue_head(&ac->rsp.wait);
-	spin_lock_init(&ac->rsp.lock);
-	/*
-	 * A client that has not armed a command yet belongs to the current
-	 * instance; the quarantine guard compares this value.
-	 */
-	ac->rsp.epoch = READ_ONCE(q6asm_global.ssr_epoch);
-	ac->rsp.wait_epoch = ac->rsp.epoch;
+	init_waitqueue_head(&ac->cmd_wait);
 	mutex_init(&ac->cmd_lock);
-	mutex_init(&ac->cb_lock);
 	spin_lock_init(&ac->lock);
-
-	/* Lock order: global (mutex) -> session table (spinlock). */
-	mutex_lock(&q6asm_global.lock);
-	spin_lock_irqsave(&a->slock, flags);
-	if (test_bit(ac->session, q6asm_global.session_quarantine)) {
-		spin_unlock_irqrestore(&a->slock, flags);
-		mutex_unlock(&q6asm_global.lock);
-		kfree(ac->hold_slot);
-		kfree(ac);
-		dev_err(dev,
-			"session %d is quarantined; refusing a new client\n",
-			session_id + 1);
-		return ERR_PTR(-EIO);
-	}
-	if (a->session[ac->session]) {
-		spin_unlock_irqrestore(&a->slock, flags);
-		mutex_unlock(&q6asm_global.lock);
-		kfree(ac->hold_slot);
-		kfree(ac);
-		return ERR_PTR(-EBUSY);
-	}
-	a->session[ac->session] = ac;
-	spin_unlock_irqrestore(&a->slock, flags);
-	mutex_unlock(&q6asm_global.lock);
 
 	return ac;
 }
 EXPORT_SYMBOL_GPL(q6asm_audio_client_alloc);
 
-void q6asm_audio_client_set_flags(struct audio_client *ac, unsigned int flags)
-{
-	ac->flags = flags;
-}
-EXPORT_SYMBOL_GPL(q6asm_audio_client_set_flags);
-
 static int q6asm_ac_send_cmd_sync(struct audio_client *ac, struct apr_pkt *pkt)
 {
-	return q6asm_send_cmd_sync(ac, pkt, pkt->hdr.opcode, NULL);
+	struct apr_hdr *hdr = &pkt->hdr;
+	int rc;
+
+	mutex_lock(&ac->cmd_lock);
+	ac->result.opcode = 0;
+	ac->result.status = 0;
+
+	rc = apr_send_pkt(ac->adev, pkt);
+	if (rc < 0)
+		goto err;
+
+	rc = wait_event_timeout(ac->cmd_wait,
+				(ac->result.opcode == hdr->opcode), 5 * HZ);
+	if (!rc) {
+		dev_err(ac->dev, "CMD %x timeout\n", hdr->opcode);
+		rc =  -ETIMEDOUT;
+		goto err;
+	}
+
+	if (ac->result.status > 0) {
+		dev_err(ac->dev, "DSP returned error[%x]\n",
+			ac->result.status);
+		rc = -EINVAL;
+	} else {
+		rc = 0;
+	}
+
+
+err:
+	mutex_unlock(&ac->cmd_lock);
+	return rc;
 }
 
 /**
@@ -2469,10 +1007,6 @@ static int __q6asm_run(struct audio_client *ac, uint32_t stream_id,
 	struct apr_pkt *pkt;
 	int rc, pkt_size = APR_HDR_SIZE + sizeof(*run);
 
-	rc = q6asm_fault_take(ac, Q6ASM_FAULT_RUN);
-	if (rc)
-		return rc;
-
 	void *p __free(kfree) = kzalloc(pkt_size, GFP_ATOMIC);
 	if (!p)
 		return -ENOMEM;
@@ -2489,23 +1023,9 @@ static int __q6asm_run(struct audio_client *ac, uint32_t stream_id,
 	if (wait) {
 		rc = q6asm_ac_send_cmd_sync(ac, pkt);
 	} else {
-		/*
-		 * Reserve the response before the send: the basic result can
-		 * arrive on the APR worker as soon as the packet is queued.
-		 */
-		rc = q6asm_cmd_rsp_async_begin(ac, pkt->hdr.opcode);
-		if (rc < 0) {
-			dev_err_ratelimited(ac->dev,
-					    "nowait RUN refused: an earlier answer is still owed\n");
-			return rc;
-		}
 		rc = apr_send_pkt(ac->adev, pkt);
-		if (rc == pkt_size) {
+		if (rc == pkt_size)
 			rc = 0;
-		} else {
-			q6asm_cmd_rsp_async_end(ac, pkt->hdr.opcode);
-			rc = rc < 0 ? rc : -EIO;
-		}
 	}
 
 	return rc;
@@ -2874,27 +1394,17 @@ EXPORT_SYMBOL_GPL(q6asm_enc_cfg_blk_pcm_format_support);
  * @ac: audio client pointer
  * @stream_id: stream id
  *
- * Return: the period index that was posted, or a negative error.  -EAGAIN
- * means every ring slot is still owned by the ADSP.
+ * Return: Will be an negative value on error or zero on success
  */
-static int q6asm_post_transfer(struct audio_client *ac, unsigned int dir,
-			       u32 stream_id, u32 len, u32 msw_ts, u32 lsw_ts,
-			       u32 wflags)
+int q6asm_read(struct audio_client *ac, uint32_t stream_id)
 {
 	struct asm_data_cmd_read_v2 *read;
-	struct asm_data_cmd_write_v2 *write;
 	struct audio_port_data *port;
-	struct q6asm_submit *submit;
 	struct audio_buffer *ab;
 	struct apr_pkt *pkt;
 	unsigned long flags;
-	u32 index, token;
-	int pkt_size, rc;
-
-	if (dir == SNDRV_PCM_STREAM_CAPTURE)
-		pkt_size = APR_HDR_SIZE + sizeof(*read);
-	else
-		pkt_size = APR_HDR_SIZE + sizeof(*write);
+	int pkt_size = APR_HDR_SIZE + sizeof(*read);
+	int rc = 0;
 
 	void *p __free(kfree) = kzalloc(pkt_size, GFP_ATOMIC);
 	if (!p)
@@ -2902,93 +1412,33 @@ static int q6asm_post_transfer(struct audio_client *ac, unsigned int dir,
 
 	pkt = p;
 	read = p + APR_HDR_SIZE;
-	write = p + APR_HDR_SIZE;
 
-	q6asm_add_hdr(ac, &pkt->hdr, pkt_size, false, stream_id);
-	pkt->hdr.opcode = (dir == SNDRV_PCM_STREAM_CAPTURE) ?
-			  ASM_DATA_CMD_READ_V2 : ASM_DATA_CMD_WRITE_V2;
-
-	/*
-	 * Send under ac->lock and publish the submit record before the packet
-	 * can complete.  A failed send clears the record again, so the ring
-	 * cursor and the ADSP stay in sync.
-	 */
 	spin_lock_irqsave(&ac->lock, flags);
-	port = &ac->port[dir];
-	if (!port->buf || !port->submit || !port->num_periods ||
-	    !port->mem_map_handle) {
-		rc = -EINVAL;
-		goto unlock;
-	}
+	port = &ac->port[SNDRV_PCM_STREAM_CAPTURE];
+	q6asm_add_hdr(ac, &pkt->hdr, pkt_size, false, stream_id);
+	ab = &port->buf[port->dsp_buf];
+	pkt->hdr.opcode = ASM_DATA_CMD_READ_V2;
+	read->buf_addr_lsw = lower_32_bits(ab->phys);
+	read->buf_addr_msw = upper_32_bits(ab->phys);
+	read->mem_map_handle = port->mem_map_handle;
 
-	/*
-	 * Submit exactly the period at the ring cursor.  Skipping an
-	 * in-flight slot would let the ADSP fill a later period while ALSA
-	 * still expects this one; a busy cursor is simply -EAGAIN.
-	 */
-	index = port->dsp_buf;
-	if (index >= port->num_periods || port->submit[index].in_flight) {
-		rc = -EAGAIN;
-		goto unlock;
-	}
+	read->buf_size = ab->size;
+	read->seq_id = port->dsp_buf;
+	pkt->hdr.token = port->dsp_buf;
 
-	ab = &port->buf[index];
-	token = (q6asm_token_gen(port->generation) << Q6ASM_TOKEN_GEN_SHIFT) |
-		(index & Q6ASM_TOKEN_INDEX_MASK);
-	pkt->hdr.token = token;
+	port->dsp_buf++;
 
-	submit = &port->submit[index];
-	submit->generation = port->generation;
-	submit->stream_id = stream_id;
-	submit->phys = ab->phys;
-	submit->len = (dir == SNDRV_PCM_STREAM_CAPTURE) ? ab->size : len;
-	submit->in_flight = true;
+	if (port->dsp_buf >= port->num_periods)
+		port->dsp_buf = 0;
 
-	if (dir == SNDRV_PCM_STREAM_CAPTURE) {
-		read->buf_addr_lsw = lower_32_bits(ab->phys);
-		read->buf_addr_msw = upper_32_bits(ab->phys);
-		read->mem_map_handle = port->mem_map_handle;
-		read->buf_size = ab->size;
-		read->seq_id = index;
-	} else {
-		write->buf_addr_lsw = lower_32_bits(ab->phys);
-		write->buf_addr_msw = upper_32_bits(ab->phys);
-		write->mem_map_handle = port->mem_map_handle;
-		write->buf_size = len;
-		write->seq_id = index;
-		write->timestamp_lsw = lsw_ts;
-		write->timestamp_msw = msw_ts;
-		write->flags = wflags;
-	}
-
-	rc = apr_send_pkt(ac->adev, pkt);
-	if (rc == pkt_size) {
-		port->dsp_buf = (index + 1) % port->num_periods;
-		rc = index;
-	} else {
-		submit->in_flight = false;
-	}
-unlock:
 	spin_unlock_irqrestore(&ac->lock, flags);
-
-	if (rc < 0 && rc != -EAGAIN)
-		dev_err_ratelimited(ac->dev, "post %s failed: %d\n",
-				    dir == SNDRV_PCM_STREAM_CAPTURE ?
-				    "read" : "write", rc);
+	rc = apr_send_pkt(ac->adev, pkt);
+	if (rc == pkt_size)
+		rc = 0;
+	else
+		pr_err("read op[0x%x]rc[%d]\n", pkt->hdr.opcode, rc);
 
 	return rc;
-}
-
-int q6asm_read(struct audio_client *ac, uint32_t stream_id)
-{
-	int rc;
-
-	rc = q6asm_fault_take(ac, Q6ASM_FAULT_READ);
-	if (rc)
-		return rc;
-
-	return q6asm_post_transfer(ac, SNDRV_PCM_STREAM_CAPTURE, stream_id,
-				   0, 0, 0, 0);
 }
 EXPORT_SYMBOL_GPL(q6asm_read);
 
@@ -3057,47 +1507,67 @@ EXPORT_SYMBOL_GPL(q6asm_open_read);
  * @lsw_ts: timestamp lsw
  * @wflags: flags associated with write
  *
- * Return: the period index that was posted, or a negative error.  The
- * submitted length is kept by q6asm and reported with the completion; it is
- * not encoded in the token, so a 64 KiB period no longer truncates.
+ * Return: Will be an negative value on error or zero on success
  */
 int q6asm_write_async(struct audio_client *ac, uint32_t stream_id, uint32_t len,
 		      uint32_t msw_ts, uint32_t lsw_ts, uint32_t wflags)
 {
-	int rc;
+	struct asm_data_cmd_write_v2 *write;
+	struct audio_port_data *port;
+	struct audio_buffer *ab;
+	unsigned long flags;
+	struct apr_pkt *pkt;
+	int pkt_size = APR_HDR_SIZE + sizeof(*write);
+	int rc = 0;
 
-	rc = q6asm_fault_take(ac, Q6ASM_FAULT_WRITE);
-	if (rc)
-		return rc;
+	void *p __free(kfree) = kzalloc(pkt_size, GFP_ATOMIC);
+	if (!p)
+		return -ENOMEM;
 
-	return q6asm_post_transfer(ac, SNDRV_PCM_STREAM_PLAYBACK, stream_id,
-				   len, msw_ts, lsw_ts, wflags);
+	pkt = p;
+	write = p + APR_HDR_SIZE;
+
+	spin_lock_irqsave(&ac->lock, flags);
+	port = &ac->port[SNDRV_PCM_STREAM_PLAYBACK];
+	q6asm_add_hdr(ac, &pkt->hdr, pkt_size, false, stream_id);
+
+	ab = &port->buf[port->dsp_buf];
+	pkt->hdr.token = port->dsp_buf | (len << ASM_WRITE_TOKEN_LEN_SHIFT);
+	pkt->hdr.opcode = ASM_DATA_CMD_WRITE_V2;
+	write->buf_addr_lsw = lower_32_bits(ab->phys);
+	write->buf_addr_msw = upper_32_bits(ab->phys);
+	write->buf_size = len;
+	write->seq_id = port->dsp_buf;
+	write->timestamp_lsw = lsw_ts;
+	write->timestamp_msw = msw_ts;
+	write->mem_map_handle =
+	    ac->port[SNDRV_PCM_STREAM_PLAYBACK].mem_map_handle;
+
+	write->flags = wflags;
+
+	port->dsp_buf++;
+
+	if (port->dsp_buf >= port->num_periods)
+		port->dsp_buf = 0;
+
+	spin_unlock_irqrestore(&ac->lock, flags);
+	rc = apr_send_pkt(ac->adev, pkt);
+	if (rc == pkt_size)
+		rc = 0;
+
+	return rc;
 }
 EXPORT_SYMBOL_GPL(q6asm_write_async);
 
 static void q6asm_reset_buf_state(struct audio_client *ac)
 {
 	struct audio_port_data *port;
-	int dir;
 
-	/*
-	 * A flush starts a new data-path instance so completions for the
-	 * flushed buffers cannot be matched to the rebuilt ring.  The front
-	 * end caches the generation after a mapping; it must re-read
-	 * q6asm_get_buffer_generation() after issuing CMD_FLUSH.
-	 */
 	guard(spinlock_irqsave)(&ac->lock);
-	for (dir = 0; dir < ARRAY_SIZE(ac->port); dir++) {
-		port = &ac->port[dir];
-		if (!port->submit)
-			continue;
-		port->generation = q6asm_next_generation();
-		memset(port->submit, 0,
-		       sizeof(*port->submit) * port->num_periods);
-		port->dsp_buf = 0;
-		port->next_done = 0;
-		atomic_set(&port->hw_ptr, 0);
-	}
+	port = &ac->port[SNDRV_PCM_STREAM_PLAYBACK];
+	port->dsp_buf = 0;
+	port = &ac->port[SNDRV_PCM_STREAM_CAPTURE];
+	port->dsp_buf = 0;
 }
 
 static int __q6asm_cmd(struct audio_client *ac, uint32_t stream_id, int cmd,
@@ -3105,17 +1575,6 @@ static int __q6asm_cmd(struct audio_client *ac, uint32_t stream_id, int cmd,
 {
 	struct apr_pkt pkt;
 	int rc;
-
-	if (cmd == CMD_CLOSE) {
-		rc = q6asm_fault_take(ac, Q6ASM_FAULT_CLOSE);
-		if (rc)
-			return rc;
-	}
-	if (cmd == CMD_PAUSE) {
-		rc = q6asm_fault_take(ac, Q6ASM_FAULT_PAUSE);
-		if (rc)
-			return rc;
-	}
 
 	q6asm_add_hdr(ac, &pkt.hdr, APR_HDR_SIZE, true, stream_id);
 
@@ -3142,34 +1601,13 @@ static int __q6asm_cmd(struct audio_client *ac, uint32_t stream_id, int cmd,
 		return -EINVAL;
 	}
 
-	if (!wait) {
-		/*
-		 * apr_send_pkt() reports the packet size on success; the
-		 * callers use zero for "accepted" and negative for errors.
-		 * Reserve the response before sending, or an immediate basic
-		 * result would find no owner.
-		 */
-		rc = q6asm_cmd_rsp_async_begin(ac, pkt.hdr.opcode);
-		if (rc < 0)
-			return rc;
-		rc = apr_send_pkt(ac->adev, &pkt);
-		if (rc < 0) {
-			q6asm_cmd_rsp_async_end(ac, pkt.hdr.opcode);
-			return rc;
-		}
-		if (rc != pkt.hdr.pkt_size) {
-			q6asm_cmd_rsp_async_end(ac, pkt.hdr.opcode);
-			return -EIO;
-		}
-		return 0;
-	}
+	if (wait)
+		rc = q6asm_ac_send_cmd_sync(ac, &pkt);
+	else
+		return apr_send_pkt(ac->adev, &pkt);
 
-	rc = q6asm_ac_send_cmd_sync(ac, &pkt);
 	if (rc < 0)
 		return rc;
-
-	if (cmd == CMD_CLOSE)
-		q6asm_cmd_rsp_forget_stream(ac);
 
 	if (cmd == CMD_FLUSH)
 		q6asm_reset_buf_state(ac);
@@ -3207,244 +1645,6 @@ int q6asm_cmd_nowait(struct audio_client *ac, uint32_t stream_id, int cmd)
 }
 EXPORT_SYMBOL_GPL(q6asm_cmd_nowait);
 
-#ifdef CONFIG_SND_SOC_QDSP6_ASM_FAULT_INJECT
-/*
- * Replay a completion for the first period of an active client using a
- * token from another generation.  The transfer correlator must drop it.
- */
-static void q6asm_inject_completion(struct q6asm *a)
-{
-	struct audio_client *ac = NULL;
-	unsigned long flags;
-	int i, dir;
-
-	spin_lock_irqsave(&a->slock, flags);
-	for (i = 1; i <= MAX_SESSIONS; i++) {
-		if (a->session[i] &&
-		    kref_get_unless_zero(&a->session[i]->refcount)) {
-			ac = a->session[i];
-			break;
-		}
-	}
-	spin_unlock_irqrestore(&a->slock, flags);
-	if (!ac)
-		return;
-
-	for (dir = 0; dir < ARRAY_SIZE(ac->port); dir++) {
-		struct audio_port_data *port = &ac->port[dir];
-		unsigned long flags;
-		phys_addr_t phys;
-		u32 generation;
-
-		if (!READ_ONCE(port->buf) || !READ_ONCE(port->submit) ||
-		    !READ_ONCE(port->num_periods))
-			continue;
-		spin_lock_irqsave(&ac->lock, flags);
-		/* Re-check under the lock: release clears both pointers. */
-		if (!port->buf || !port->submit || !port->num_periods) {
-			spin_unlock_irqrestore(&ac->lock, flags);
-			continue;
-		}
-		/* Any encoded value except the current one is stale. */
-		generation = (q6asm_token_gen(port->generation) %
-			      Q6ASM_TOKEN_GEN_MAX) + 1;
-		phys = port->buf[0].phys;
-		spin_unlock_irqrestore(&ac->lock, flags);
-
-		q6asm_complete_transfer(ac, dir, 0, generation, 0, phys, true,
-					false, 0, 0, 0, 0);
-	}
-	kref_put(&ac->refcount, q6asm_audio_client_release);
-}
-
-static ssize_t held_dma_show(struct device *dev,
-			     struct device_attribute *attr, char *buf)
-{
-	struct q6asm_held_buffer *held;
-	unsigned int buffers = 0;
-	size_t bytes = 0;
-
-	mutex_lock(&q6asm_global.lock);
-	list_for_each_entry(held, &q6asm_global.held_buffers, node) {
-		buffers++;
-		bytes += held->dma.bytes;
-	}
-	mutex_unlock(&q6asm_global.lock);
-
-	return sysfs_emit(buf, "held %u bytes %zu leaked %u bytes %zu offline %u\n",
-			  buffers, bytes, q6asm_global.leaked_buffers,
-			  q6asm_global.leaked_bytes, q6asm_global.adsp_offline);
-}
-static DEVICE_ATTR_RO(held_dma);
-
-/*
- * One line per active session.  The device tests use the generation to prove
- * that a single open/remap loop crossed the 8-bit token boundary, and the
- * counters to prove which correlation branch handled an event.
- */
-static ssize_t session_gen_show(struct device *dev,
-				struct device_attribute *attr, char *buf)
-{
-	struct q6asm *q6asm = dev_get_drvdata(dev);
-	ssize_t len = 0;
-	int i;
-
-	for (i = 1; i <= MAX_SESSIONS; i++) {
-		struct audio_client *ac;
-		unsigned long flags;
-		u32 play, capture;
-
-		spin_lock_irqsave(&q6asm->slock, flags);
-		ac = q6asm->session[i];
-		if (ac && !kref_get_unless_zero(&ac->refcount))
-			ac = NULL;
-		spin_unlock_irqrestore(&q6asm->slock, flags);
-		if (!ac)
-			continue;
-
-		spin_lock_irqsave(&ac->lock, flags);
-		play = ac->port[SNDRV_PCM_STREAM_PLAYBACK].generation;
-		capture = ac->port[SNDRV_PCM_STREAM_CAPTURE].generation;
-		spin_unlock_irqrestore(&ac->lock, flags);
-
-		len += sysfs_emit_at(buf, len,
-				     "session %d play %u capture %u accepted %d dropped %d late %d unowned %d\n",
-				     i, play, capture,
-				     atomic_read(&ac->stats.accepted),
-				     atomic_read(&ac->stats.dropped),
-				     atomic_read(&ac->stats.late),
-				     atomic_read(&ac->stats.unowned));
-		kref_put(&ac->refcount, q6asm_audio_client_release);
-	}
-
-	if (!len)
-		len = sysfs_emit(buf, "none\n");
-
-	return len;
-}
-static DEVICE_ATTR_RO(session_gen);
-
-static ssize_t inject_fault_show(struct device *dev,
-				 struct device_attribute *attr, char *buf)
-{
-	struct q6asm *q6asm = dev_get_drvdata(dev);
-	unsigned long flags;
-	unsigned int fault;
-	bool timeout;
-
-	spin_lock_irqsave(&q6asm->slock, flags);
-	fault = q6asm->fault;
-	timeout = q6asm->fault_timeout;
-	spin_unlock_irqrestore(&q6asm->slock, flags);
-
-	if (fault == Q6ASM_FAULT_NONE)
-		return sysfs_emit(buf, "none\n");
-
-	return sysfs_emit(buf, "%s:%s\n", q6asm_fault_names[fault],
-			  timeout ? "timeout" : "reject");
-}
-
-/*
- * Arm a one-shot failure for one teardown command.  This exists so the
- * quarantine, held-buffer and state-rollback paths can be exercised on real
- * hardware:
- *
- *   echo map:timeout    > .../inject_fault  # MAP fails, session quarantined
- *   echo close:timeout  > .../inject_fault  # CMD_CLOSE fails
- *   echo unmap:reject   > .../inject_fault  # UNMAP fails after CLOSE
- *   echo pause:reject   > .../inject_fault  # CMD_PAUSE is not sent
- *   echo pausereject:reject > .../inject_fault # DSP rejects the next PAUSE
- *   echo runreject:reject   > .../inject_fault # DSP rejects the next RUN
- *   echo duplicate      > .../inject_fault  # replay the next RUN answer;
- *                                           # its second delivery must be
- *                                           # unowned and emit nothing
- *   echo spurious       > .../inject_fault  # replay a data completion from
- *                                           # an old generation
- *   echo dropmap        > .../inject_fault  # swallow the next MAP CMDRSP
- *                                           # (times out and retires MAP)
- *   echo clear          > .../inject_fault  # disarm
- *
- * "timeout" returns -ETIMEDOUT, "reject" returns -EINVAL (the value the
- * DSP uses for a refused command).  Every write needs root and affects only
- * the next matching operation.
- */
-static ssize_t inject_fault_store(struct device *dev,
-				  struct device_attribute *attr,
-				  const char *buf, size_t count)
-{
-	struct q6asm *q6asm = dev_get_drvdata(dev);
-	char op[16] = "";
-	char kind[16] = "";
-	unsigned long flags;
-	unsigned int fault = Q6ASM_FAULT_NONE;
-	unsigned int i;
-	const char *colon;
-	size_t len;
-	bool timeout = false;
-
-	if (sysfs_streq(buf, "clear") || sysfs_streq(buf, "none"))
-		goto store;
-
-	if (sysfs_streq(buf, "spurious")) {
-		q6asm_inject_completion(q6asm);
-		return count;
-	}
-	if (sysfs_streq(buf, "duplicate")) {
-		fault = Q6ASM_FAULT_DUPLICATE;
-		goto store;
-	}
-	if (sysfs_streq(buf, "dropmap")) {
-		fault = Q6ASM_FAULT_DROP_MAP;
-		goto store;
-	}
-
-	colon = strchr(buf, ':');
-	if (!colon)
-		return -EINVAL;
-	len = colon - buf;
-	if (!len || len >= sizeof(op))
-		return -EINVAL;
-	memcpy(op, buf, len);
-	op[len] = '\0';
-
-	colon++;
-	len = strlen(colon);
-	while (len && (colon[len - 1] == '\n' || colon[len - 1] == '\r'))
-		len--;
-	if (!len || len >= sizeof(kind))
-		return -EINVAL;
-	memcpy(kind, colon, len);
-	kind[len] = '\0';
-
-	for (i = Q6ASM_FAULT_MAP; i <= Q6ASM_FAULT_DROP_MAP; i++)
-		if (sysfs_streq(op, q6asm_fault_names[i]))
-			fault = i;
-	if (fault == Q6ASM_FAULT_NONE)
-		return -EINVAL;
-
-	if (sysfs_streq(kind, "timeout"))
-		timeout = true;
-	else if (!sysfs_streq(kind, "reject"))
-		return -EINVAL;
-
-store:
-	spin_lock_irqsave(&q6asm->slock, flags);
-	q6asm->fault = fault;
-	q6asm->fault_timeout = timeout;
-	spin_unlock_irqrestore(&q6asm->slock, flags);
-
-	return count;
-}
-static DEVICE_ATTR_RW(inject_fault);
-
-static void q6asm_remove_sysfs(void *data)
-{
-	device_remove_file(data, &dev_attr_session_gen);
-	device_remove_file(data, &dev_attr_inject_fault);
-	device_remove_file(data, &dev_attr_held_dma);
-}
-#endif /* CONFIG_SND_SOC_QDSP6_ASM_FAULT_INJECT */
-
 static int q6asm_probe(struct apr_device *adev)
 {
 	struct device *dev = &adev->dev;
@@ -3458,42 +1658,11 @@ static int q6asm_probe(struct apr_device *adev)
 
 	q6asm->dev = dev;
 	q6asm->adev = adev;
+	init_waitqueue_head(&q6asm->mem_wait);
 	spin_lock_init(&q6asm->slock);
 	dev_set_drvdata(dev, q6asm);
 
-	/*
-	 * The stop notifier must outlive this device: the ADSP stop event is
-	 * what releases held buffers and the session quarantine.  Register it
-	 * here, after qcom_common has been loaded by the remoteproc stack.
-	 */
-	q6asm_reclaim_register();
-
-#ifdef CONFIG_SND_SOC_QDSP6_ASM_FAULT_INJECT
-	int ret;
-
-	ret = device_create_file(dev, &dev_attr_inject_fault);
-	if (ret)
-		return ret;
-	ret = device_create_file(dev, &dev_attr_held_dma);
-	if (ret)
-		goto remove_inject;
-	ret = device_create_file(dev, &dev_attr_session_gen);
-	if (ret)
-		goto remove_held;
-	ret = devm_add_action_or_reset(dev, q6asm_remove_sysfs, dev);
-	if (ret)
-		return ret;
-#endif
-
 	return devm_of_platform_populate(dev);
-
-#ifdef CONFIG_SND_SOC_QDSP6_ASM_FAULT_INJECT
-remove_held:
-	device_remove_file(dev, &dev_attr_held_dma);
-remove_inject:
-	device_remove_file(dev, &dev_attr_inject_fault);
-	return ret;
-#endif
 }
 
 #ifdef CONFIG_OF
@@ -3513,18 +1682,6 @@ static struct apr_driver qcom_q6asm_driver = {
 	},
 };
 
-static int __init q6asm_driver_init(void)
-{
-	return apr_driver_register(&qcom_q6asm_driver);
-}
-
-static void __exit q6asm_driver_exit(void)
-{
-	apr_driver_unregister(&qcom_q6asm_driver);
-	q6asm_reclaim_unregister();
-}
-
-module_init(q6asm_driver_init);
-module_exit(q6asm_driver_exit);
+module_apr_driver(qcom_q6asm_driver);
 MODULE_DESCRIPTION("Q6 Audio Stream Manager driver");
 MODULE_LICENSE("GPL v2");

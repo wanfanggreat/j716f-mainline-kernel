@@ -6,7 +6,6 @@
 #include <linux/init.h>
 #include <linux/err.h>
 #include <linux/module.h>
-#include <linux/atomic.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/slab.h>
@@ -25,33 +24,13 @@
 
 #define DRV_NAME	"q6asm-fe-dai"
 
-/*
- * Lenovo J716F (SM8250-AC / kona ADSP): the ADSP answers
- * ASM_CMD_SHARED_MEM_MAP_REGIONS with ADSP_EFAILED for any buffer address
- * outside the LPASS audio SMMU window.  The vendor kernel maps its audio
- * buffers from 0x1000_0000-0x1FFF_FFFF (qcom,iommu-dma-addr-pool on its
- * msm-audio-ion node); with the upstream 32-bit DMA mask iommu-dma hands out
- * an IOVA near the top of the 32-bit space and the DSP rejects it.
- * q6asm_dai_pcm_new() therefore limits the audio DMA mask to 29 bits, which
- * puts the IOVA at 0x1FFF_xxxx inside that window; with that in place the
- * upstream address layout (dma_addr | sid << 32) is what the kona ADSP
- * accepts for both directions (confirmed on hardware 2026-11-07).
- */
-
 #define PLAYBACK_MIN_NUM_PERIODS    2
 #define PLAYBACK_MAX_NUM_PERIODS   8
 #define PLAYBACK_MAX_PERIOD_SIZE    65536
 #define PLAYBACK_MIN_PERIOD_SIZE    128
 #define CAPTURE_MIN_NUM_PERIODS     2
 #define CAPTURE_MAX_NUM_PERIODS     8
-/*
- * Lenovo J716F: the capture period size has to be able to hold what the DSP
- * delivers per ASM_DATA_CMD_READ. With the upstream 4096-byte limit ALSA
- * could not carve the 24000-byte DSP periods, ended up with a single-period
- * buffer and never advanced hw_ptr, so arecord failed with -EIO even though
- * the DSP was returning data. Match the playback limit.
- */
-#define CAPTURE_MAX_PERIOD_SIZE     PLAYBACK_MAX_PERIOD_SIZE
+#define CAPTURE_MAX_PERIOD_SIZE     4096
 #define CAPTURE_MIN_PERIOD_SIZE     320
 #define SID_MASK_DEFAULT	0xF
 
@@ -66,25 +45,8 @@
 
 enum stream_state {
 	Q6ASM_STREAM_IDLE = 0,
-	Q6ASM_STREAM_PREPARED,
-	Q6ASM_STREAM_STARTING,
-	Q6ASM_STREAM_RUNNING,
-	Q6ASM_STREAM_PAUSING,
-	Q6ASM_STREAM_PAUSED,
-	Q6ASM_STREAM_STOPPING,
 	Q6ASM_STREAM_STOPPED,
-	Q6ASM_STREAM_ERROR,
-};
-
-/*
- * Mapping state of a stream's DMA buffer.  A MAP command that timed out may
- * still have executed at the DSP, so "unknown" is a real state: the teardown
- * must try to unmap and, if it cannot, keep the pages alive.
- */
-enum q6asm_map_state {
-	Q6ASM_MAP_NONE = 0,	/* no mapping was requested or it was released */
-	Q6ASM_MAP_CONFIRMED,	/* the DSP returned a map handle */
-	Q6ASM_MAP_UNKNOWN,	/* MAP may have executed; no reply seen */
+	Q6ASM_STREAM_RUNNING,
 };
 
 struct q6asm_dai_rtd {
@@ -92,12 +54,6 @@ struct q6asm_dai_rtd {
 	struct snd_compr_stream *cstream;
 	struct snd_codec codec;
 	struct snd_dma_buffer dma_buffer;
-	/*
-	 * Protects the state machine and the failure/elapsed counters.  The
-	 * lock is never held across a call into ALSA or a sleeping Q6ASM
-	 * command: the PRTD lock order is stream lock -> rtd->lock ->
-	 * ac->lock, and snd_pcm_period_elapsed() takes the stream lock.
-	 */
 	spinlock_t lock;
 	phys_addr_t phys;
 	unsigned int pcm_size;
@@ -110,40 +66,20 @@ struct q6asm_dai_rtd {
 	snd_pcm_uframes_t queue_ptr;
 	uint16_t source; /* Encoding source bit mask */
 	struct audio_client *audio_client;
-	struct device *dev;
+	uint32_t next_track_stream_id;
+	bool next_track;
 	uint32_t stream_id;
-	/* Identity of the mapping the current stream owns; see prepare(). */
-	u32 generation;
 	uint16_t session_id;
 	enum stream_state state;
-	/* ALSA has seen the START trigger; period_elapsed is legal. */
-	bool started;
-	/* A period completed while ALSA was not running yet. */
-	bool elapsed_pending;
-	bool dma_held;
-	/* Whether OPEN_WRITE/OPEN_READ succeeded and CMD_CLOSE is needed */
-	bool stream_opened;
-	/* Whether the remote teardown already failed once; do not retry. */
-	bool teardown_failed;
-	/* Whether the audio buffer is mapped into the ADSP address space */
-	enum q6asm_map_state map_state;
-	/* True when set_params() or free() could not confirm the teardown. */
-	bool teardown_unknown;
-	/* Copy the fixed PCM ring before it can be freed under a live map. */
-	bool needs_hold;
 	uint32_t initial_samples_drop;
 	uint32_t trailing_samples_drop;
 	bool notify_on_drain;
-	/* The kona ADSP needs capture started before the first userspace read. */
-	bool early_capture_start;
-	bool j716f;
 };
 
 struct q6asm_dai_data {
 	struct snd_soc_dai_driver *dais;
 	int num_dais;
 	long long int sid;
-	bool j716f;
 };
 
 static const struct snd_pcm_hardware q6asm_dai_hardware_capture = {
@@ -160,37 +96,8 @@ static const struct snd_pcm_hardware q6asm_dai_hardware_capture = {
 	.rate_max =             48000,
 	.channels_min =         1,
 	.channels_max =         4,
-	.buffer_bytes_max =     CAPTURE_MAX_NUM_PERIODS * 4096,
-	.period_bytes_min =	CAPTURE_MIN_PERIOD_SIZE,
-	.period_bytes_max =     4096,
-	.periods_min =          CAPTURE_MIN_NUM_PERIODS,
-	.periods_max =          CAPTURE_MAX_NUM_PERIODS,
-	.fifo_size =            0,
-};
-
-/*
- * Lenovo J716F: the capture period has to be able to hold what the DSP
- * delivers per ASM_DATA_CMD_READ.  With the upstream 4096-byte limit ALSA
- * could not carve the 24000-byte DSP periods, ended up with a single-period
- * buffer and never advanced hw_ptr, so arecord failed with -EIO even though
- * the DSP was returning data.  The limit is board specific: raise it only
- * where that firmware behaviour has been observed.
- */
-static const struct snd_pcm_hardware q6asm_dai_hardware_capture_j716f = {
-	.info =                 (SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_BATCH |
-				SNDRV_PCM_INFO_BLOCK_TRANSFER |
-				SNDRV_PCM_INFO_NO_REWINDS | SNDRV_PCM_INFO_SYNC_APPLPTR |
-				SNDRV_PCM_INFO_MMAP_VALID |
-				SNDRV_PCM_INFO_INTERLEAVED |
-				SNDRV_PCM_INFO_PAUSE | SNDRV_PCM_INFO_RESUME),
-	.formats =              (SNDRV_PCM_FMTBIT_S16_LE |
-				SNDRV_PCM_FMTBIT_S24_LE),
-	.rates =                SNDRV_PCM_RATE_8000_48000,
-	.rate_min =             8000,
-	.rate_max =             48000,
-	.channels_min =         1,
-	.channels_max =         4,
-	.buffer_bytes_max =     CAPTURE_MAX_NUM_PERIODS * CAPTURE_MAX_PERIOD_SIZE,
+	.buffer_bytes_max =     CAPTURE_MAX_NUM_PERIODS *
+				CAPTURE_MAX_PERIOD_SIZE,
 	.period_bytes_min =	CAPTURE_MIN_PERIOD_SIZE,
 	.period_bytes_max =     CAPTURE_MAX_PERIOD_SIZE,
 	.periods_min =          CAPTURE_MIN_NUM_PERIODS,
@@ -269,499 +176,28 @@ static const struct snd_compr_codec_caps q6asm_compr_caps = {
 	.descriptor[0].formats = 0,
 };
 
-static int q6asm_dai_queue_playback(struct q6asm_dai_rtd *prtd,
-				    struct snd_pcm_runtime *runtime);
-
-static int q6asm_dai_fill_capture(struct q6asm_dai_rtd *prtd)
-{
-	int i, rc = 0;
-
-	for (i = 0; i < prtd->periods; i++) {
-		rc = q6asm_read(prtd->audio_client, prtd->stream_id);
-		if (rc < 0)
-			break;
-	}
-
-	return rc;
-}
-
-/*
- * Post the capture ring while holding prtd->lock.  A STOP that is already
- * in progress has moved the state away from RUNNING, so no READ can be
- * queued after the PAUSE/EOS command.  q6asm_read() only takes the audio
- * client lock and queues an APR packet, neither of which sleeps.
- * Caller holds prtd->lock.
- */
-static int q6asm_dai_fill_capture_locked(struct q6asm_dai_rtd *prtd)
-{
-	int i, rc = 0;
-
-	if (prtd->state != Q6ASM_STREAM_RUNNING)
-		return -EAGAIN;
-
-	for (i = 0; i < prtd->periods; i++) {
-		rc = q6asm_read(prtd->audio_client, prtd->stream_id);
-		if (rc < 0)
-			break;
-	}
-
-	return rc;
-}
-
-static bool q6asm_dai_capture_active(struct q6asm_dai_rtd *prtd)
-{
-	bool active;
-
-	spin_lock(&prtd->lock);
-	active = prtd->state == Q6ASM_STREAM_RUNNING;
-	spin_unlock(&prtd->lock);
-
-	return active;
-}
-
-/*
- * A data event may only act on the mapping that is current and on a stream
- * the front end still owns.  Q6ASM validates the generation before it emits
- * the event, but a re-prepare can install a new mapping between that check
- * and this callback; the front end compares again under its own lock.  The
- * state guard also keeps completions that arrive during teardown out.
- * Caller holds prtd->lock.
- */
-static bool q6asm_dai_stale_event(struct q6asm_dai_rtd *prtd,
-				  const struct q6asm_client_event *event)
-{
-	if (event->id < Q6ASM_EVENT_READ_DONE)
-		return false;
-	if (event->generation != prtd->generation)
-		return true;
-
-	switch (prtd->state) {
-	case Q6ASM_STREAM_PREPARED:
-	case Q6ASM_STREAM_RUNNING:
-	case Q6ASM_STREAM_STARTING:
-	case Q6ASM_STREAM_PAUSING:
-	case Q6ASM_STREAM_PAUSED:
-		return false;
-	default:
-		return true;
-	}
-}
-
-/*
- * Force the stream into XRUN.  snd_pcm_stop_xrun() only acts on a running
- * stream, but a pause the DSP rejected leaves ALSA in PAUSED and a failure
- * can arrive while the START trigger is still between its state change and
- * its wakeup.  snd_pcm_stop() requires the stream lock (the core's
- * __snd_pcm_xrun() runs with it held; snd_pcm_stop_xrun() is the wrapper
- * that takes it), so take the lock here and set XRUN from every state where
- * the stream is still live.  SUSPENDED, SETUP and DISCONNECTED are left
- * alone: forcing XRUN there would turn a system suspend or a removed device
- * into a recoverable stream.
- */
-static void q6asm_dai_abort_stream(struct snd_pcm_substream *substream)
-{
-	unsigned long flags;
-	snd_pcm_state_t state;
-
-	snd_pcm_stream_lock_irqsave(substream, flags);
-	state = substream->runtime->state;
-	if (state == SNDRV_PCM_STATE_RUNNING ||
-	    state == SNDRV_PCM_STATE_DRAINING ||
-	    state == SNDRV_PCM_STATE_PREPARED ||
-	    state == SNDRV_PCM_STATE_PAUSED)
-		snd_pcm_stop(substream, SNDRV_PCM_STATE_XRUN);
-	snd_pcm_stream_unlock_irqrestore(substream, flags);
-}
-
-static void event_handler(const struct q6asm_client_event *event, void *priv)
+static void event_handler(uint32_t opcode, uint32_t token,
+			  void *payload, void *priv)
 {
 	struct q6asm_dai_rtd *prtd = priv;
 	struct snd_pcm_substream *substream = prtd->substream;
-	bool elapsed = false, xrun = false;
-	int rc;
 
-	if (!substream)
-		return;
-
-	switch (event->id) {
-	case Q6ASM_EVENT_RUN_DONE: {
-		bool play = false;
-
-		spin_lock(&prtd->lock);
-		if (event->status) {
-			/*
-			 * The DSP refused the RUN, so the remote is not in
-			 * the state the front end assumed.  Fail closed
-			 * instead of leaving ALSA running an unfed stream.
-			 */
-			if (prtd->state == Q6ASM_STREAM_STARTING ||
-			    prtd->state == Q6ASM_STREAM_RUNNING ||
-			    prtd->state == Q6ASM_STREAM_PAUSING) {
-				dev_err_ratelimited(prtd->dev,
-						    "RUN rejected: %u\n",
-						    event->status);
-				prtd->state = Q6ASM_STREAM_ERROR;
-				xrun = prtd->started;
-			}
-			spin_unlock(&prtd->lock);
-			if (xrun)
-				q6asm_dai_abort_stream(substream);
-			break;
-		}
-		/*
-		 * Only the transition the front end asked for may consume the
-		 * completion; a duplicate RUN_DONE must not re-arm a stream.
-		 */
-		if (prtd->state != Q6ASM_STREAM_STARTING) {
-			spin_unlock(&prtd->lock);
-			break;
-		}
-		prtd->state = Q6ASM_STREAM_RUNNING;
-		if (prtd->started && prtd->elapsed_pending) {
-			prtd->elapsed_pending = false;
-			elapsed = true;
-		}
-		if (substream->stream == SNDRV_PCM_STREAM_CAPTURE) {
-			/*
-			 * The first reads are queued here.  Doing it under
-			 * prtd->lock keeps a concurrent STOP from leaving a
-			 * READ behind the stop command.
-			 */
-			rc = q6asm_dai_fill_capture_locked(prtd);
-			if (rc < 0 && rc != -EAGAIN) {
-				dev_err_ratelimited(prtd->dev,
-						    "capture read post failed: %d\n",
-						    rc);
-				prtd->state = Q6ASM_STREAM_ERROR;
-				xrun = prtd->started;
-			}
-		} else {
-			play = prtd->started;
-		}
-		spin_unlock(&prtd->lock);
-
-		if (play) {
-			rc = q6asm_dai_queue_playback(prtd, substream->runtime);
-			if (rc < 0 && rc != -EAGAIN) {
-				spin_lock(&prtd->lock);
-				prtd->state = Q6ASM_STREAM_ERROR;
-				xrun = prtd->started;
-				spin_unlock(&prtd->lock);
-			}
-		}
-		if (elapsed)
-			snd_pcm_period_elapsed(substream);
-		if (xrun)
-			q6asm_dai_abort_stream(substream);
+	switch (opcode) {
+	case ASM_CLIENT_EVENT_CMD_RUN_DONE:
 		break;
-	}
-
-	case Q6ASM_EVENT_PAUSE_DONE:
-		spin_lock(&prtd->lock);
-		if (prtd->state == Q6ASM_STREAM_PAUSING) {
-			if (!event->status) {
-				prtd->state = Q6ASM_STREAM_PAUSED;
-			} else {
-				/*
-				 * ALSA is already paused, but the DSP kept
-				 * running.  Report an explicit failure so the
-				 * next prepare rebuilds the stream instead of
-				 * leaving a paused front end on a live remote.
-				 */
-				dev_err_ratelimited(prtd->dev,
-						    "PAUSE rejected: %u\n",
-						    event->status);
-				prtd->state = Q6ASM_STREAM_ERROR;
-				xrun = true;
-			}
-		}
-		spin_unlock(&prtd->lock);
-		if (xrun)
-			q6asm_dai_abort_stream(substream);
+	case ASM_CLIENT_EVENT_CMD_EOS_DONE:
 		break;
-
-	case Q6ASM_EVENT_EOS_DONE:
-		if (event->status)
-			dev_err_ratelimited(prtd->dev, "EOS rejected: %u\n",
-					    event->status);
-		spin_lock(&prtd->lock);
-		if (prtd->state == Q6ASM_STREAM_STOPPING)
-			prtd->state = Q6ASM_STREAM_STOPPED;
-		spin_unlock(&prtd->lock);
+	case ASM_CLIENT_EVENT_DATA_WRITE_DONE:
+		snd_pcm_period_elapsed(substream);
 		break;
+	case ASM_CLIENT_EVENT_DATA_READ_DONE:
+		snd_pcm_period_elapsed(substream);
+		if (prtd->state == Q6ASM_STREAM_RUNNING)
+			q6asm_read(prtd->audio_client, prtd->stream_id);
 
-	case Q6ASM_EVENT_READ_DONE:
-		spin_lock(&prtd->lock);
-		if (q6asm_dai_stale_event(prtd, event) ||
-		    prtd->state != Q6ASM_STREAM_RUNNING) {
-			spin_unlock(&prtd->lock);
-			break;
-		}
-		if (prtd->started)
-			elapsed = true;
-		else
-			prtd->elapsed_pending = true;
-		/*
-		 * Refill under the same lock STOP uses to leave RUNNING, so
-		 * no READ can be queued after the stop command was sent.
-		 */
-		rc = q6asm_dai_fill_capture_locked(prtd);
-		if (rc < 0 && rc != -EAGAIN) {
-			dev_err_ratelimited(prtd->dev,
-					    "capture read post failed: %d\n", rc);
-			prtd->state = Q6ASM_STREAM_ERROR;
-			elapsed = false;
-			xrun = prtd->started;
-		}
-		spin_unlock(&prtd->lock);
-		if (elapsed)
-			snd_pcm_period_elapsed(substream);
-		if (xrun)
-			q6asm_dai_abort_stream(substream);
 		break;
-
-	case Q6ASM_EVENT_READ_FAILED:
-		/*
-		 * A rejected READ left a hole in the ring.  Re-posting it
-		 * would put later periods ahead of it in the DSP queue, so
-		 * the only correct answer is an XRUN; the next prepare
-		 * rebuilds the queue in order.
-		 */
-		spin_lock(&prtd->lock);
-		if (q6asm_dai_stale_event(prtd, event)) {
-			spin_unlock(&prtd->lock);
-			break;
-		}
-		{
-			enum stream_state old = prtd->state;
-
-			prtd->state = Q6ASM_STREAM_ERROR;
-			xrun = prtd->started || old == Q6ASM_STREAM_PAUSED ||
-			       old == Q6ASM_STREAM_PAUSING;
-		}
-		spin_unlock(&prtd->lock);
-		if (xrun)
-			q6asm_dai_abort_stream(substream);
-		break;
-
-	case Q6ASM_EVENT_WRITE_DONE:
-		spin_lock(&prtd->lock);
-		if (q6asm_dai_stale_event(prtd, event)) {
-			spin_unlock(&prtd->lock);
-			break;
-		}
-		if (prtd->started)
-			elapsed = true;
-		else
-			prtd->elapsed_pending = true;
-		spin_unlock(&prtd->lock);
-		if (elapsed)
-			snd_pcm_period_elapsed(substream);
-		break;
-
-	case Q6ASM_EVENT_WRITE_FAILED:
-		spin_lock(&prtd->lock);
-		if (q6asm_dai_stale_event(prtd, event)) {
-			spin_unlock(&prtd->lock);
-			break;
-		}
-		{
-			enum stream_state old = prtd->state;
-
-			prtd->state = Q6ASM_STREAM_ERROR;
-			xrun = prtd->started || old == Q6ASM_STREAM_PAUSED ||
-			       old == Q6ASM_STREAM_PAUSING;
-		}
-		spin_unlock(&prtd->lock);
-		if (xrun)
-			q6asm_dai_abort_stream(substream);
-		break;
-
 	default:
 		break;
-	}
-}
-
-/*
- * Lenovo J716F: map the period ring into the ADSP.
- *
- * The address keeps the upstream layout (IOVA | sid << 32); the 29-bit DMA
- * mask set in q6asm_dai_pcm_new() keeps the IOVA inside the LPASS audio
- * window 0x1000_0000-0x1FFF_FFFF, which is what the kona ADSP requires.
- * Only this board's firmware has shown the early-boot rejection that makes
- * the second, plain-IOVA encoding necessary.
- */
-static int q6asm_dai_map_regions(struct device *dev,
-				 struct snd_pcm_substream *substream,
-				 struct q6asm_dai_rtd *prtd, u64 sid_bits)
-{
-	struct snd_dma_buffer *dma = substream->runtime->dma_buffer_p;
-	dma_addr_t dma_addr;
-	phys_addr_t phys;
-	size_t period_sz;
-	int ret, attempt, last_ret = -ENOMEM;
-
-	if (!prtd->periods || !dma) {
-		dev_err(dev, "J716F: no DMA buffer or periods for the DMA map\n");
-		return -EINVAL;
-	}
-	dma_addr = dma->addr;
-	period_sz = prtd->pcm_size / prtd->periods;
-
-	if (prtd->j716f && lower_32_bits(dma_addr) < 0x10000000) {
-		dev_err(dev,
-			"J716F: DMA address %#llx is below the LPASS window 0x10000000; refusing to map\n",
-			(unsigned long long)dma_addr);
-		return -ERANGE;
-	}
-
-	for (attempt = 0; attempt < (prtd->j716f ? 2 : 1); attempt++) {
-		/* 0: upstream layout, 1: plain IOVA (no SID in the msw) */
-		if (attempt == 0)
-			phys = dma_addr | sid_bits;
-		else
-			phys = (phys_addr_t)lower_32_bits(dma_addr);
-
-		ret = q6asm_map_memory_regions(substream->stream,
-					       prtd->audio_client, phys,
-					       period_sz, prtd->periods);
-		if (ret >= 0) {
-			prtd->phys = phys;
-			prtd->map_state = Q6ASM_MAP_CONFIRMED;
-			dev_dbg(dev,
-				"J716F: map dir=%d mode=%d phys=%#llx dma=%#llx period=%zu periods=%u accepted\n",
-				substream->stream, attempt,
-				(unsigned long long)phys,
-				(unsigned long long)dma_addr, period_sz,
-				prtd->periods);
-			return 0;
-		}
-
-		last_ret = ret;
-		dev_err(dev,
-			"J716F: map dir=%d mode=%d phys=%#llx dma=%#llx period=%zu periods=%u failed (%d)\n",
-			substream->stream, attempt, (unsigned long long)phys,
-			(unsigned long long)dma_addr, period_sz,
-			prtd->periods, ret);
-
-		/*
-		 * A timeout, a missing handle or a malformed answer means the
-		 * DSP may have executed the MAP without the host seeing the
-		 * result.  Retiring the session is the only safe answer.
-		 */
-		if (ret == -ETIMEDOUT || ret == -EPROTO) {
-			dev_err(dev,
-				"J716F: MAP unresolved; session %d quarantined\n",
-				prtd->stream_id);
-			q6asm_quarantine_session(prtd->audio_client);
-			prtd->map_state = Q6ASM_MAP_UNKNOWN;
-			return ret;
-		}
-		if (ret != -EREMOTEIO)
-			return ret;
-	}
-
-	return last_ret;
-}
-
-/*
- * Release the remote stream, then its mapping.  A step is only skipped when
- * it is known to have completed.  On any unresolved step the session is
- * quarantined and the PCM pages are moved out of ALSA so they cannot be
- * freed while the ADSP may still hold the mapping.
- */
-static int q6asm_dai_release_remote(struct snd_soc_component *component,
-				    struct snd_pcm_substream *substream,
-				    struct q6asm_dai_rtd *prtd)
-{
-	struct snd_soc_pcm_runtime *soc_prtd =
-		snd_soc_substream_to_rtd(substream);
-	bool failed = false;
-	int ret = 0;
-
-	if (prtd->teardown_failed)
-		return -EIO;
-
-	if (prtd->stream_opened) {
-		ret = q6asm_cmd(prtd->audio_client, prtd->stream_id, CMD_CLOSE);
-		if (ret < 0) {
-			dev_err(component->dev,
-				"J716F: CMD_CLOSE failed %d; session %d quarantined\n",
-				ret, prtd->stream_id);
-			q6asm_quarantine_session(prtd->audio_client);
-			failed = true;
-		} else {
-			prtd->stream_opened = false;
-		}
-	}
-
-	if (!failed && prtd->map_state == Q6ASM_MAP_CONFIRMED) {
-		ret = q6asm_unmap_memory_regions(substream->stream,
-						 prtd->audio_client);
-		if (ret < 0) {
-			dev_err(component->dev,
-				"J716F: UNMAP failed %d after CLOSE; session %d quarantined\n",
-				ret, prtd->stream_id);
-			q6asm_quarantine_session(prtd->audio_client);
-			failed = true;
-		} else {
-			prtd->map_state = Q6ASM_MAP_NONE;
-		}
-	} else if (!failed && prtd->map_state == Q6ASM_MAP_UNKNOWN) {
-		/* The mapping was never resolved; there is no handle to unmap. */
-		failed = true;
-		ret = -EIO;
-	}
-
-	/*
-	 * The routing table is host-only state and must not outlive the
-	 * stream even when the remote teardown is unresolved.
-	 */
-	q6routing_stream_close(soc_prtd->dai_link->id, substream->stream);
-	spin_lock(&prtd->lock);
-	prtd->state = Q6ASM_STREAM_IDLE;
-	spin_unlock(&prtd->lock);
-
-	if (!failed)
-		return 0;
-
-	prtd->teardown_failed = true;
-	prtd->needs_hold = true;
-	return ret;
-}
-
-/*
- * Move a PCM DMA buffer that the DSP may still own out of ALSA's reach.
- * For the fixed pre-allocation this means detaching substream->dma_buffer;
- * for a dynamically allocated runtime buffer the snd_dma_buffer itself is
- * detached and freed after its contents are copied into the hold record.
- */
-static void q6asm_dai_hold_pcm_buffer(struct snd_pcm_substream *substream,
-				      struct q6asm_dai_rtd *prtd)
-{
-	struct snd_pcm_runtime *runtime = substream->runtime;
-	struct snd_dma_buffer *dma = runtime->dma_buffer_p;
-	bool dynamic, held;
-
-	if (prtd->dma_held || !dma)
-		return;
-
-	dynamic = dma != &substream->dma_buffer;
-	held = q6asm_hold_buffer(prtd->audio_client, dma, prtd->session_id);
-	prtd->dma_held = true;
-
-	if (dynamic) {
-		/* ALSA would free this at hw_free; detach it in every case. */
-		runtime->dma_buffer_p = NULL;
-		runtime->dma_area = NULL;
-		runtime->dma_addr = 0;
-		runtime->dma_bytes = 0;
-		if (held)
-			kfree(dma);
-	} else if (!held) {
-		/* Keep the pages mapped but out of ALSA's free path. */
-		dma->area = NULL;
-		dma->bytes = 0;
 	}
 }
 
@@ -773,112 +209,72 @@ static int q6asm_dai_prepare(struct snd_soc_component *component,
 	struct q6asm_dai_rtd *prtd = runtime->private_data;
 	struct q6asm_dai_data *pdata;
 	struct device *dev = component->dev;
-	bool was_active;
-	u32 generation;
-	int ret;
+	int ret, i;
 
 	pdata = snd_soc_component_get_drvdata(component);
 	if (!pdata)
 		return -EINVAL;
 
-	if (!prtd || !prtd->audio_client)
+	if (!prtd || !prtd->audio_client) {
+		dev_err(dev, "%s: private data null or audio client freed\n",
+			__func__);
 		return -EINVAL;
-
-	if (q6asm_session_is_quarantined(prtd->audio_client)) {
-		dev_err(dev, "session %d is quarantined; refusing prepare\n",
-			prtd->stream_id);
-		return -EIO;
 	}
 
-	/*
-	 * Lenovo J716F: keep pcm_count consistent with the period size that is
-	 * handed to the DSP in q6asm_map_memory_regions() below
-	 * (pcm_size / periods).  snd_pcm_lib_period_bytes() can differ from
-	 * that, which made the driver ask the DSP for a different amount of
-	 * data per period than the mapping described.
-	 */
-	prtd->pcm_count = prtd->periods ?
-		(prtd->pcm_size / prtd->periods) :
-		snd_pcm_lib_period_bytes(substream);
-	prtd->queue_ptr = 0;
-
-	spin_lock(&prtd->lock);
-	prtd->started = false;
-	prtd->elapsed_pending = false;
-	spin_unlock(&prtd->lock);
-
-	/*
-	 * Retire the old remote stream before opening the new one.  The state
-	 * is moved to IDLE first so a completion that is still in the APR
-	 * worker cannot re-post reads or call period_elapsed during teardown.
-	 */
-	spin_lock(&prtd->lock);
-	was_active = prtd->state != Q6ASM_STREAM_IDLE;
-	prtd->state = Q6ASM_STREAM_IDLE;
-	spin_unlock(&prtd->lock);
-
-	if (was_active) {
-		ret = q6asm_dai_release_remote(component, substream, prtd);
-		if (ret)
+	prtd->pcm_count = snd_pcm_lib_period_bytes(substream);
+	/* rate and channels are sent to audio driver */
+	if (prtd->state == Q6ASM_STREAM_RUNNING) {
+		/* clear the previous setup if any  */
+		ret = q6asm_cmd(prtd->audio_client, prtd->stream_id, CMD_CLOSE);
+		if (ret < 0) {
+			dev_err(dev, "Failed to close q6asm stream %d\n", prtd->stream_id);
 			return ret;
+		}
+
+		ret = q6asm_unmap_memory_regions(substream->stream, prtd->audio_client);
+		if (ret < 0) {
+			dev_err(dev, "Failed to unmap memory regions for q6asm stream %d\n",
+				prtd->stream_id);
+			return ret;
+		}
+
+		q6routing_stream_close(soc_prtd->dai_link->id,
+					 substream->stream);
+		prtd->state = Q6ASM_STREAM_STOPPED;
 	}
 
-	if (prtd->dma_held) {
-		/* The previous close could not prove the DSP released the ring. */
-		return -EIO;
-	}
+	ret = q6asm_map_memory_regions(substream->stream, prtd->audio_client,
+				       prtd->phys,
+				       (prtd->pcm_size / prtd->periods),
+				       prtd->periods);
 
-	ret = q6asm_dai_map_regions(dev, substream, prtd,
-				    pdata->sid < 0 ? 0 : ((u64)pdata->sid << 32));
 	if (ret < 0) {
-		dev_err(dev, "Audio Start: DMA mapping failed rc = %d\n", ret);
-		return ret;
+		dev_err(dev, "Audio Start: Buffer Allocation failed rc = %d\n",
+							ret);
+		return -ENOMEM;
 	}
 
-	/*
-	 * Remember which data path this stream owns.  A completion that was
-	 * already validated against the previous mapping carries another
-	 * generation and is dropped by the event handler.
-	 */
-	generation = q6asm_get_buffer_generation(prtd->audio_client,
-						 substream->stream);
-	spin_lock(&prtd->lock);
-	prtd->generation = generation;
-	spin_unlock(&prtd->lock);
-
-	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
+	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
 		ret = q6asm_open_write(prtd->audio_client, prtd->stream_id,
-				       FORMAT_LINEAR_PCM, 0,
-				       prtd->bits_per_sample, false);
-	else
+				       FORMAT_LINEAR_PCM,
+				       0, prtd->bits_per_sample, false);
+	} else if (substream->stream == SNDRV_PCM_STREAM_CAPTURE) {
 		ret = q6asm_open_read(prtd->audio_client, prtd->stream_id,
 				      FORMAT_LINEAR_PCM,
 				      prtd->bits_per_sample);
-	if (ret < 0) {
-		dev_err(dev, "q6asm_open failed %d\n", ret);
-		/*
-		 * A lost or malformed answer means the DSP may have opened
-		 * the stream anyway.  There is no confirmed stream to close,
-		 * so retire the session rather than let a later client reuse
-		 * it.  The remote stream (if any) is reclaimed by the ADSP
-		 * restart; this is a protocol limitation, not a host leak.
-		 */
-		if (ret == -ETIMEDOUT || ret == -EPROTO) {
-			dev_err(dev,
-				"open result unknown; session %d quarantined\n",
-				prtd->stream_id);
-			q6asm_quarantine_session(prtd->audio_client);
-		}
-		goto err_unmap;
 	}
-	prtd->stream_opened = true;
+
+	if (ret < 0) {
+		dev_err(dev, "%s: q6asm_open_write failed\n", __func__);
+		goto open_err;
+	}
 
 	prtd->session_id = q6asm_get_session_id(prtd->audio_client);
 	ret = q6routing_stream_open(soc_prtd->dai_link->id, LEGACY_PCM_MODE,
-				    prtd->session_id, substream->stream);
+			      prtd->session_id, substream->stream);
 	if (ret) {
-		dev_err(dev, "stream reg failed ret:%d\n", ret);
-		goto err_release;
+		dev_err(dev, "%s: stream reg failed ret:%d\n", __func__, ret);
+		goto routing_err;
 	}
 
 	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
@@ -886,321 +282,79 @@ static int q6asm_dai_prepare(struct snd_soc_component *component,
 				prtd->audio_client, prtd->stream_id,
 				runtime->rate, runtime->channels, NULL,
 				prtd->bits_per_sample);
-		if (ret < 0) {
-			dev_err(dev, "CMD Format block failed %d\n", ret);
-			goto err_release;
-		}
-		spin_lock(&prtd->lock);
-		prtd->state = Q6ASM_STREAM_PREPARED;
-		spin_unlock(&prtd->lock);
-	} else {
+	} else if (substream->stream == SNDRV_PCM_STREAM_CAPTURE) {
 		ret = q6asm_enc_cfg_blk_pcm_format_support(prtd->audio_client,
 							   prtd->stream_id,
 							   runtime->rate,
 							   runtime->channels,
 							   prtd->bits_per_sample);
-		if (ret < 0) {
-			dev_err(dev, "capture format block failed %d\n", ret);
-			goto err_release;
-		}
 
-		if (prtd->early_capture_start) {
-			/*
-			 * The kona ADSP answers READ_V2 with ADSP_ENOTREADY
-			 * until the session is running, and its first
-			 * completion takes longer than ALSA's default read
-			 * wait.  Start the session here (prepare is sleepable)
-			 * and let the RUN_DONE event queue the reads.
-			 */
-			spin_lock(&prtd->lock);
-			prtd->state = Q6ASM_STREAM_STARTING;
-			spin_unlock(&prtd->lock);
+		/* Queue the buffers */
+		for (i = 0; i < runtime->periods; i++)
+			q6asm_read(prtd->audio_client, prtd->stream_id);
 
-			ret = q6asm_run(prtd->audio_client, prtd->stream_id,
-					0, 0, 0);
-			if (ret < 0) {
-				dev_err(dev, "capture run failed %d\n", ret);
-				goto err_release;
-			}
-		} else {
-			/*
-			 * Other firmware accepts reads before RUN; keep the
-			 * upstream ordering there.
-			 */
-			spin_lock(&prtd->lock);
-			prtd->state = Q6ASM_STREAM_PREPARED;
-			spin_unlock(&prtd->lock);
-			q6asm_dai_fill_capture(prtd);
-		}
 	}
+	if (ret < 0)
+		dev_info(dev, "%s: CMD Format block failed\n", __func__);
+	else
+		prtd->state = Q6ASM_STREAM_RUNNING;
 
-	return 0;
-
-err_release:
-	q6asm_dai_release_remote(component, substream, prtd);
 	return ret;
 
-err_unmap:
-	if (prtd->map_state == Q6ASM_MAP_CONFIRMED) {
-		int urc = q6asm_unmap_memory_regions(substream->stream,
-						     prtd->audio_client);
-
-		if (urc < 0) {
-			dev_err(dev, "cleanup UNMAP failed %d\n", urc);
-			q6asm_quarantine_session(prtd->audio_client);
-			prtd->map_state = Q6ASM_MAP_UNKNOWN;
-			prtd->needs_hold = true;
-		} else {
-			prtd->map_state = Q6ASM_MAP_NONE;
-		}
-	}
-	return ret;
-}
-
-/*
- * Queue the periods the application has already written but the DSP has not
- * seen.  Caller holds prtd->lock; a completion can arrive as soon as the
- * packet is queued, so queue_ptr advances only after a successful send.
- */
-static int q6asm_dai_queue_playback_locked(struct q6asm_dai_rtd *prtd,
-					   struct snd_pcm_runtime *runtime)
-{
-	snd_pcm_uframes_t appl, qp, delta, boundary;
-	unsigned int avail;
-	int i, rc, ret = 0;
-
-	if (!runtime->period_size || !runtime->periods)
-		return 0;
-
-	boundary = runtime->boundary;
-	if (!boundary)
-		return -EINVAL;
-
-	appl = READ_ONCE(runtime->control->appl_ptr);
-	qp = prtd->queue_ptr;
-	if (qp >= boundary)
-		qp %= boundary;
-
-	delta = (appl >= qp) ? appl - qp : boundary - qp + appl;
-	if (delta > runtime->buffer_size) {
-		dev_warn_ratelimited(prtd->dev,
-				     "J716F: queue delta %lu > buffer %lu, clamping\n",
-				     (unsigned long)delta,
-				     (unsigned long)runtime->buffer_size);
-		delta = runtime->buffer_size;
-	}
-
-	avail = delta / runtime->period_size;
-	if (avail > runtime->periods)
-		avail = runtime->periods;
-	if (!avail)
-		return 0;
-
-	for (i = 0; i < (int)avail; i++) {
-		rc = q6asm_write_async(prtd->audio_client, prtd->stream_id,
-				       prtd->pcm_count, 0, 0, 0);
-		if (rc < 0) {
-			ret = rc;
-			break;
-		}
-		prtd->queue_ptr = (qp + runtime->period_size) % boundary;
-		qp = prtd->queue_ptr;
-	}
-
-	/* A full ring is not an error; the next completion frees a slot. */
-	if (ret == -EAGAIN)
-		return 0;
+routing_err:
+	q6asm_cmd(prtd->audio_client, prtd->stream_id,  CMD_CLOSE);
+open_err:
+	q6asm_unmap_memory_regions(substream->stream, prtd->audio_client);
 
 	return ret;
 }
 
-static int q6asm_dai_queue_playback(struct q6asm_dai_rtd *prtd,
-				    struct snd_pcm_runtime *runtime)
-{
-	unsigned long flags;
-	int ret;
-
-	spin_lock_irqsave(&prtd->lock, flags);
-	if (prtd->state != Q6ASM_STREAM_RUNNING) {
-		spin_unlock_irqrestore(&prtd->lock, flags);
-		return 0;
-	}
-	ret = q6asm_dai_queue_playback_locked(prtd, runtime);
-	spin_unlock_irqrestore(&prtd->lock, flags);
-
-	return ret;
-}
-
-static int q6asm_dai_ack(struct snd_soc_component *component,
-			 struct snd_pcm_substream *substream)
+static int q6asm_dai_ack(struct snd_soc_component *component, struct snd_pcm_substream *substream)
 {
 	struct snd_pcm_runtime *runtime = substream->runtime;
 	struct q6asm_dai_rtd *prtd = runtime->private_data;
+	int i, ret = 0, avail_periods;
 
-	if (substream->stream != SNDRV_PCM_STREAM_PLAYBACK)
-		return 0;
+	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK && prtd->state == Q6ASM_STREAM_RUNNING) {
+		avail_periods = (runtime->control->appl_ptr - prtd->queue_ptr)/runtime->period_size;
+		for (i = 0; i < avail_periods; i++) {
+			ret = q6asm_write_async(prtd->audio_client, prtd->stream_id,
+					   prtd->pcm_count, 0, 0, 0);
 
-	return q6asm_dai_queue_playback(prtd, runtime);
+			if (ret < 0) {
+				dev_err(component->dev, "Error queuing playback buffer %d\n", ret);
+				return ret;
+			}
+			prtd->queue_ptr += runtime->period_size;
+		}
+	}
+
+	return ret;
 }
 
 static int q6asm_dai_trigger(struct snd_soc_component *component,
 			     struct snd_pcm_substream *substream, int cmd)
 {
+	int ret = 0;
 	struct snd_pcm_runtime *runtime = substream->runtime;
 	struct q6asm_dai_rtd *prtd = runtime->private_data;
-	bool flush = false;
-	int ret = 0;
 
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
 	case SNDRV_PCM_TRIGGER_RESUME:
 	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
-		bool send_run;
-
-		spin_lock(&prtd->lock);
-		switch (prtd->state) {
-		case Q6ASM_STREAM_RUNNING:
-			/* The remote is already running (capture prepare). */
-			prtd->started = true;
-			flush = prtd->elapsed_pending;
-			prtd->elapsed_pending = false;
-			send_run = false;
-			break;
-		case Q6ASM_STREAM_STARTING:
-			/* RUN is in flight; RUN_DONE will arm the queue. */
-			prtd->started = true;
-			send_run = false;
-			break;
-		case Q6ASM_STREAM_PAUSED:
-		case Q6ASM_STREAM_PAUSING:
-			/* PAUSE_RELEASE/RESUME must restart the paused stream. */
-			prtd->state = Q6ASM_STREAM_STARTING;
-			prtd->started = true;
-			send_run = true;
-			break;
-		case Q6ASM_STREAM_PREPARED:
-			prtd->state = Q6ASM_STREAM_STARTING;
-			prtd->started = true;
-			send_run = true;
-			break;
-		default:
-			spin_unlock(&prtd->lock);
-			return -EINVAL;
-		}
-		spin_unlock(&prtd->lock);
-
-		if (send_run) {
-			ret = q6asm_run_nowait(prtd->audio_client,
-					       prtd->stream_id, 0, 0, 0);
-			if (ret < 0) {
-				spin_lock(&prtd->lock);
-				prtd->started = false;
-				prtd->state = Q6ASM_STREAM_ERROR;
-				spin_unlock(&prtd->lock);
-			}
-		}
-		if (flush)
-			snd_pcm_period_elapsed_under_stream_lock(substream);
-		if (substream->stream == SNDRV_PCM_STREAM_CAPTURE &&
-		    q6asm_dai_capture_active(prtd)) {
-			int frc = q6asm_dai_fill_capture(prtd);
-
-			if (frc < 0 && frc != -EAGAIN) {
-				spin_lock(&prtd->lock);
-				prtd->state = Q6ASM_STREAM_ERROR;
-				spin_unlock(&prtd->lock);
-				return frc;
-			}
-		}
+		ret = q6asm_run_nowait(prtd->audio_client, prtd->stream_id,
+				       0, 0, 0);
 		break;
-
-	case SNDRV_PCM_TRIGGER_STOP: {
-		enum stream_state old;
-
-		spin_lock(&prtd->lock);
-		old = prtd->state;
-		prtd->started = false;
-		prtd->elapsed_pending = false;
-		if (old == Q6ASM_STREAM_RUNNING ||
-		    old == Q6ASM_STREAM_STARTING ||
-		    old == Q6ASM_STREAM_PAUSED ||
-		    old == Q6ASM_STREAM_PAUSING)
-			prtd->state = Q6ASM_STREAM_STOPPING;
-		else
-			prtd->state = Q6ASM_STREAM_STOPPED;
-		spin_unlock(&prtd->lock);
-
-		if (old != Q6ASM_STREAM_RUNNING &&
-		    old != Q6ASM_STREAM_STARTING &&
-		    old != Q6ASM_STREAM_PAUSED &&
-		    old != Q6ASM_STREAM_PAUSING)
-			break;
-
-		/*
-		 * Playback is ended with EOS; a capture stream has no EOS, so
-		 * the vendor firmware uses PAUSE.
-		 */
-		if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
-			ret = q6asm_cmd_nowait(prtd->audio_client,
-					       prtd->stream_id, CMD_EOS);
-		else
-			ret = q6asm_cmd_nowait(prtd->audio_client,
-					       prtd->stream_id, CMD_PAUSE);
-		if (ret < 0)
-			dev_err_ratelimited(component->dev,
-					    "stop command failed %d\n", ret);
+	case SNDRV_PCM_TRIGGER_STOP:
+		ret = q6asm_cmd_nowait(prtd->audio_client, prtd->stream_id,
+				       CMD_EOS);
 		break;
-	}
-
 	case SNDRV_PCM_TRIGGER_SUSPEND:
-	case SNDRV_PCM_TRIGGER_PAUSE_PUSH: {
-		enum stream_state old;
-		bool was_started;
-		int prc = 0;
-
-		/*
-		 * Keep prtd->lock across the state change, the send and the
-		 * rollback.  Otherwise RUN_DONE can observe PAUSING between
-		 * the change and a failed send, be discarded, and leave the
-		 * stream in STARTING with no completion left.  The send does
-		 * not sleep on this board's APR transport (GLINK trysend only
-		 * takes spinlocks and returns -EAGAIN when the TX pipe is full
-		 * or -EBUSY when no RX intent is free); it is not claimed to
-		 * be sleepable-safe on a virtio-rpmsg transport.
-		 */
-		spin_lock(&prtd->lock);
-		old = prtd->state;
-		was_started = prtd->started;
-		if (old == Q6ASM_STREAM_RUNNING ||
-		    old == Q6ASM_STREAM_STARTING) {
-			prtd->state = Q6ASM_STREAM_PAUSING;
-			prtd->started = false;
-			prc = q6asm_cmd_nowait(prtd->audio_client,
-					       prtd->stream_id, CMD_PAUSE);
-			if (prc < 0) {
-				/*
-				 * The command never left the host, so the
-				 * stream is still running remotely.  Restore
-				 * both halves of the state; started=false
-				 * while RUNNING would suppress every later
-				 * period notification.
-				 */
-				prtd->state = old;
-				prtd->started = was_started;
-			}
-		}
-		spin_unlock(&prtd->lock);
-
-		if (old != Q6ASM_STREAM_RUNNING &&
-		    old != Q6ASM_STREAM_STARTING)
-			break;
-		if (prc < 0) {
-			dev_err_ratelimited(component->dev,
-					    "pause command failed %d\n", prc);
-			ret = prc;
-		}
+	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
+		ret = q6asm_cmd_nowait(prtd->audio_client, prtd->stream_id,
+				       CMD_PAUSE);
 		break;
-	}
 	default:
 		ret = -EINVAL;
 		break;
@@ -1215,11 +369,13 @@ static int q6asm_dai_open(struct snd_soc_component *component,
 	struct snd_pcm_runtime *runtime = substream->runtime;
 	struct snd_soc_pcm_runtime *soc_prtd = snd_soc_substream_to_rtd(substream);
 	struct snd_soc_dai *cpu_dai = snd_soc_rtd_to_cpu(soc_prtd, 0);
-	const struct snd_pcm_hardware *hw;
 	struct q6asm_dai_rtd *prtd;
 	struct q6asm_dai_data *pdata;
 	struct device *dev = component->dev;
-	int ret;
+	int ret = 0;
+	int stream_id;
+
+	stream_id = cpu_dai->driver->id;
 
 	pdata = snd_soc_component_get_drvdata(component);
 	if (!pdata) {
@@ -1231,114 +387,69 @@ static int q6asm_dai_open(struct snd_soc_component *component,
 	if (prtd == NULL)
 		return -ENOMEM;
 
-	spin_lock_init(&prtd->lock);
 	prtd->substream = substream;
-	prtd->dev = dev;
-	prtd->j716f = pdata->j716f;
-	prtd->early_capture_start = pdata->j716f &&
-				    substream->stream == SNDRV_PCM_STREAM_CAPTURE;
-	prtd->audio_client = q6asm_audio_client_alloc(dev, event_handler, prtd,
-						      cpu_dai->driver->id,
-						      LEGACY_PCM_MODE);
+	prtd->audio_client = q6asm_audio_client_alloc(dev,
+				(q6asm_cb)event_handler, prtd, stream_id,
+				LEGACY_PCM_MODE);
 	if (IS_ERR(prtd->audio_client)) {
+		dev_info(dev, "%s: Could not allocate memory\n", __func__);
 		ret = PTR_ERR(prtd->audio_client);
-		dev_err(dev, "cannot allocate an audio client: %d\n", ret);
 		kfree(prtd);
 		return ret;
-	}
-	if (pdata->j716f) {
-		unsigned int flags = Q6ASM_CLIENT_TOKEN_GENERATION;
-
-		if (substream->stream == SNDRV_PCM_STREAM_CAPTURE)
-			flags |= Q6ASM_CLIENT_STRICT_CAPTURE;
-		q6asm_audio_client_set_flags(prtd->audio_client, flags);
 	}
 
 	/* DSP expects stream id from 1 */
 	prtd->stream_id = 1;
 
-	/*
-	 * Lenovo J716F: the ADSP needs ~230 ms before it raises the first
-	 * ASM_CLIENT_EVENT_DATA_READ_DONE, while ALSA's default capture read
-	 * wait is only buffer_size * 1100 / rate (~220 ms for the same
-	 * buffer).  prepare() starts the stream and queues the reads so the
-	 * data is normally ready by the first userspace read; keep a floor
-	 * for the case where it is not.  Playback keeps the default.
-	 */
-	if (prtd->early_capture_start)
-		substream->wait_time = 10000;
-
 	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
-		hw = &q6asm_dai_hardware_playback;
-	else if (pdata->j716f)
-		hw = &q6asm_dai_hardware_capture_j716f;
-	else
-		hw = &q6asm_dai_hardware_capture;
+		runtime->hw = q6asm_dai_hardware_playback;
+	else if (substream->stream == SNDRV_PCM_STREAM_CAPTURE)
+		runtime->hw = q6asm_dai_hardware_capture;
 
-	runtime->hw = *hw;
+	/* Ensure that buffer size is a multiple of period size */
 	ret = snd_pcm_hw_constraint_integer(runtime,
 					    SNDRV_PCM_HW_PARAM_PERIODS);
 	if (ret < 0)
-		goto err_client;
+		dev_info(dev, "snd_pcm_hw_constraint_integer failed\n");
 
 	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
 		ret = snd_pcm_hw_constraint_minmax(runtime,
 			SNDRV_PCM_HW_PARAM_BUFFER_BYTES,
 			PLAYBACK_MIN_NUM_PERIODS * PLAYBACK_MIN_PERIOD_SIZE,
 			PLAYBACK_MAX_NUM_PERIODS * PLAYBACK_MAX_PERIOD_SIZE);
-		if (ret < 0)
-			goto err_client;
+		if (ret < 0) {
+			dev_err(dev, "constraint for buffer bytes min max ret = %d\n",
+				ret);
+		}
 	}
 
 	ret = snd_pcm_hw_constraint_step(runtime, 0,
 		SNDRV_PCM_HW_PARAM_PERIOD_SIZE, 480);
-	if (ret < 0)
-		goto err_client;
+	if (ret < 0) {
+		dev_err(dev, "constraint for period bytes step ret = %d\n",
+								ret);
+	}
 	ret = snd_pcm_hw_constraint_step(runtime, 0,
 		SNDRV_PCM_HW_PARAM_BUFFER_SIZE, 480);
-	if (ret < 0)
-		goto err_client;
+	if (ret < 0) {
+		dev_err(dev, "constraint for buffer bytes step ret = %d\n",
+								ret);
+	}
 
 	runtime->private_data = prtd;
-	snd_soc_set_runtime_hwparams(substream, hw);
-	runtime->dma_bytes = hw->buffer_bytes_max;
 
-	/*
-	 * Lenovo J716F: the CS35L41 ASP path is wired for 16-bit slots.
-	 * The ADSP accepts S24_LE but the amplifier output is heavily
-	 * attenuated (measured in R4/M43: only audible with the ear on the
-	 * speaker at full volume); S16_LE is the verified format.  Do not
-	 * advertise a format this board cannot reproduce correctly.
-	 */
-	if (pdata->j716f)
-		runtime->hw.formats = SNDRV_PCM_FMTBIT_S16_LE;
-
-	return 0;
-
-err_client:
-	q6asm_audio_client_free(prtd->audio_client);
-	kfree(prtd);
-	return ret;
-}
-
-static int q6asm_dai_hw_free(struct snd_soc_component *component,
-			     struct snd_pcm_substream *substream)
-{
-	struct snd_pcm_runtime *runtime = substream->runtime;
-	struct q6asm_dai_rtd *prtd = runtime->private_data;
-	if (!prtd || !prtd->audio_client)
-		return 0;
-
-	spin_lock(&prtd->lock);
-	prtd->started = false;
-	prtd->elapsed_pending = false;
-	spin_unlock(&prtd->lock);
-
-	q6asm_dai_release_remote(component, substream, prtd);
-	if (prtd->needs_hold) {
-		q6asm_dai_hold_pcm_buffer(substream, prtd);
-		prtd->needs_hold = false;
+	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
+		snd_soc_set_runtime_hwparams(substream, &q6asm_dai_hardware_playback);
+		runtime->dma_bytes = q6asm_dai_hardware_playback.buffer_bytes_max;
+	} else {
+		snd_soc_set_runtime_hwparams(substream, &q6asm_dai_hardware_capture);
+		runtime->dma_bytes = q6asm_dai_hardware_capture.buffer_bytes_max;
 	}
+
+	if (pdata->sid < 0)
+		prtd->phys = substream->dma_buffer.addr;
+	else
+		prtd->phys = substream->dma_buffer.addr | (pdata->sid << 32);
 
 	return 0;
 }
@@ -1347,28 +458,21 @@ static int q6asm_dai_close(struct snd_soc_component *component,
 			   struct snd_pcm_substream *substream)
 {
 	struct snd_pcm_runtime *runtime = substream->runtime;
+	struct snd_soc_pcm_runtime *soc_prtd = snd_soc_substream_to_rtd(substream);
 	struct q6asm_dai_rtd *prtd = runtime->private_data;
-	int ret;
-
-	if (!prtd)
-		return 0;
 
 	if (prtd->audio_client) {
-		spin_lock(&prtd->lock);
-		prtd->started = false;
-		prtd->elapsed_pending = false;
-		prtd->state = Q6ASM_STREAM_STOPPED;
-		spin_unlock(&prtd->lock);
-
-		q6asm_audio_client_clear_callback(prtd->audio_client);
-		ret = q6asm_dai_release_remote(component, substream, prtd);
-		if (ret && prtd->needs_hold) {
-			q6asm_dai_hold_pcm_buffer(substream, prtd);
-			prtd->needs_hold = false;
+		if (prtd->state == Q6ASM_STREAM_RUNNING) {
+			q6asm_cmd(prtd->audio_client, prtd->stream_id,
+				  CMD_CLOSE);
+			q6asm_unmap_memory_regions(substream->stream,
+					   prtd->audio_client);
 		}
 		q6asm_audio_client_free(prtd->audio_client);
 		prtd->audio_client = NULL;
 	}
+	q6routing_stream_close(soc_prtd->dai_link->id,
+						substream->stream);
 	kfree(prtd);
 	return 0;
 }
@@ -1376,16 +480,16 @@ static int q6asm_dai_close(struct snd_soc_component *component,
 static snd_pcm_uframes_t q6asm_dai_pointer(struct snd_soc_component *component,
 					   struct snd_pcm_substream *substream)
 {
+
 	struct snd_pcm_runtime *runtime = substream->runtime;
 	struct q6asm_dai_rtd *prtd = runtime->private_data;
 	snd_pcm_uframes_t ptr;
 
-	if (!runtime->periods || !prtd || !prtd->audio_client)
-		return 0;
+	ptr = q6asm_get_hw_pointer(prtd->audio_client, substream->stream) * runtime->period_size;
+	if (ptr)
+		return ptr - 1;
 
-	ptr = q6asm_get_hw_pointer(prtd->audio_client, substream->stream) %
-	      runtime->periods;
-	return ptr * runtime->period_size;
+	return 0;
 }
 
 static int q6asm_dai_hw_params(struct snd_soc_component *component,
@@ -1410,117 +514,91 @@ static int q6asm_dai_hw_params(struct snd_soc_component *component,
 	return 0;
 }
 
-static void compress_event_handler(const struct q6asm_client_event *event,
-				   void *priv)
+static void compress_event_handler(uint32_t opcode, uint32_t token,
+				   void *payload, void *priv)
 {
 	struct q6asm_dai_rtd *prtd = priv;
 	struct snd_compr_stream *substream = prtd->cstream;
 	u32 wflags = 0;
-	uint32_t bytes_to_write;
+	uint64_t avail;
+	uint32_t bytes_written, bytes_to_write;
 	bool is_last_buffer = false;
 
 	guard(spinlock_irqsave)(&prtd->lock);
 
-	/* A completion for a previous mapping must not touch this stream. */
-	if (event->id >= Q6ASM_EVENT_READ_DONE &&
-	    (event->generation != prtd->generation ||
-	     prtd->state == Q6ASM_STREAM_IDLE)) {
-		dev_dbg_ratelimited(prtd->dev,
-				    "compressed event %u for an old mapping\n",
-				    event->id);
-		return;
-	}
-
-	switch (event->id) {
-	case Q6ASM_EVENT_RUN_DONE:
-		if (event->status) {
-			prtd->state = Q6ASM_STREAM_ERROR;
-			break;
-		}
-		prtd->state = Q6ASM_STREAM_RUNNING;
+	switch (opcode) {
+	case ASM_CLIENT_EVENT_CMD_RUN_DONE:
 		if (!prtd->bytes_sent) {
 			q6asm_stream_remove_initial_silence(prtd->audio_client,
 						    prtd->stream_id,
 						    prtd->initial_samples_drop);
 
-			if (q6asm_write_async(prtd->audio_client,
-					      prtd->stream_id, prtd->pcm_count,
-					      0, 0, 0) < 0) {
-				prtd->state = Q6ASM_STREAM_ERROR;
-				break;
-			}
+			q6asm_write_async(prtd->audio_client, prtd->stream_id,
+					  prtd->pcm_count, 0, 0, 0);
 			prtd->bytes_sent += prtd->pcm_count;
 		}
+
 		break;
 
-	case Q6ASM_EVENT_EOS_DONE:
-		if (event->status)
-			dev_warn_ratelimited(prtd->dev,
-					     "compressed EOS rejected: %u\n",
-					     event->status);
-		break;
-
-	case Q6ASM_EVENT_EOS_RENDERED:
-		/*
-		 * Drain completes when the DSP has rendered the last buffer,
-		 * not when it accepted the EOS command.
-		 */
+	case ASM_CLIENT_EVENT_CMD_EOS_DONE:
 		if (prtd->notify_on_drain) {
+			if (substream->partial_drain) {
+				/*
+				 * Close old stream and make it stale, switch
+				 * the active stream now!
+				 */
+				q6asm_cmd_nowait(prtd->audio_client,
+						 prtd->stream_id,
+						 CMD_CLOSE);
+				/*
+				 * vaild stream ids start from 1, So we are
+				 * toggling this between 1 and 2.
+				 */
+				prtd->stream_id = (prtd->stream_id == 1 ? 2 : 1);
+			}
+
 			snd_compr_drain_notify(prtd->cstream);
 			prtd->notify_on_drain = false;
+
 		}
 		break;
 
-	case Q6ASM_EVENT_WRITE_DONE:
-		/*
-		 * The submitted length is authoritative; the token no longer
-		 * carries it, so a 64 KiB period is accounted correctly.
-		 */
-		prtd->copied_total += event->len;
+	case ASM_CLIENT_EVENT_DATA_WRITE_DONE:
+
+		bytes_written = token >> ASM_WRITE_TOKEN_LEN_SHIFT;
+		prtd->copied_total += bytes_written;
 		snd_compr_fragment_elapsed(substream);
 
 		if (prtd->state != Q6ASM_STREAM_RUNNING)
 			break;
 
-		if (prtd->bytes_sent > prtd->bytes_received) {
-			prtd->state = Q6ASM_STREAM_ERROR;
-			break;
-		}
-		if (prtd->bytes_received - prtd->bytes_sent > prtd->pcm_count) {
+		avail = prtd->bytes_received - prtd->bytes_sent;
+		if (avail > prtd->pcm_count) {
 			bytes_to_write = prtd->pcm_count;
 		} else {
-			if (prtd->notify_on_drain)
+			if (substream->partial_drain || prtd->notify_on_drain)
 				is_last_buffer = true;
-			bytes_to_write = prtd->bytes_received - prtd->bytes_sent;
+			bytes_to_write = avail;
 		}
 
 		if (bytes_to_write) {
-			if (is_last_buffer) {
+			if (substream->partial_drain && is_last_buffer) {
 				wflags |= ASM_LAST_BUFFER_FLAG;
 				q6asm_stream_remove_trailing_silence(prtd->audio_client,
 						     prtd->stream_id,
 						     prtd->trailing_samples_drop);
 			}
 
-			if (q6asm_write_async(prtd->audio_client,
-					      prtd->stream_id, bytes_to_write,
-					      0, 0, wflags) < 0) {
-				prtd->state = Q6ASM_STREAM_ERROR;
-				break;
-			}
+			q6asm_write_async(prtd->audio_client, prtd->stream_id,
+					  bytes_to_write, 0, 0, wflags);
+
 			prtd->bytes_sent += bytes_to_write;
 		}
 
 		if (prtd->notify_on_drain && is_last_buffer)
 			q6asm_cmd_nowait(prtd->audio_client,
 					 prtd->stream_id, CMD_EOS);
-		break;
 
-	case Q6ASM_EVENT_WRITE_FAILED:
-		dev_err_ratelimited(prtd->dev,
-				    "compressed write rejected: %u\n",
-				    event->status);
-		prtd->state = Q6ASM_STREAM_ERROR;
 		break;
 
 	default:
@@ -1552,8 +630,6 @@ static int q6asm_dai_compr_open(struct snd_soc_component *component,
 
 	/* DSP expects stream id from 1 */
 	prtd->stream_id = 1;
-	prtd->dev = dev;
-	spin_lock_init(&prtd->lock);
 
 	prtd->cstream = stream;
 	prtd->audio_client = q6asm_audio_client_alloc(dev,
@@ -1580,6 +656,7 @@ static int q6asm_dai_compr_open(struct snd_soc_component *component,
 		prtd->phys = prtd->dma_buffer.addr | (pdata->sid << 32);
 
 	snd_compr_set_runtime_buffer(stream, &prtd->dma_buffer);
+	spin_lock_init(&prtd->lock);
 	runtime->private_data = prtd;
 
 	return 0;
@@ -1592,58 +669,6 @@ free_prtd:
 	return ret;
 }
 
-/*
- * Give a compressed stream back in the order the ADSP expects: CLOSE the
- * stream, then UNMAP the buffer, then drop the routing.  A step is only
- * skipped when it is known to have completed, so one failure leaves the
- * remaining ownership question to the caller.  Returns true when the remote
- * state could not be confirmed.
- */
-static bool q6asm_dai_compr_teardown(struct snd_soc_component *component,
-				     struct snd_soc_pcm_runtime *rtd,
-				     struct q6asm_dai_rtd *prtd, int dir)
-{
-	struct audio_client *ac = prtd->audio_client;
-	bool failed = false;
-	int ret;
-
-	if (prtd->stream_opened) {
-		ret = q6asm_cmd(ac, prtd->stream_id, CMD_CLOSE);
-		if (ret < 0) {
-			dev_err(component->dev,
-				"J716F: compr CMD_CLOSE failed %d; session %d quarantined\n",
-				ret, prtd->stream_id);
-			q6asm_quarantine_session(ac);
-			failed = true;
-		} else {
-			prtd->stream_opened = false;
-		}
-	}
-
-	if (!failed && prtd->map_state == Q6ASM_MAP_CONFIRMED) {
-		ret = q6asm_unmap_memory_regions(dir, ac);
-		if (ret < 0) {
-			dev_err(component->dev,
-				"J716F: compr UNMAP failed %d after CLOSE; session %d quarantined\n",
-				ret, prtd->stream_id);
-			q6asm_quarantine_session(ac);
-			failed = true;
-		} else {
-			prtd->map_state = Q6ASM_MAP_NONE;
-		}
-	} else if (!failed && prtd->map_state == Q6ASM_MAP_UNKNOWN) {
-		/* No handle was ever received; only an ADSP stop clears it. */
-		failed = true;
-	}
-
-	if (!failed)
-		q6routing_stream_close(rtd->dai_link->id, dir);
-	else if (prtd->map_state != Q6ASM_MAP_NONE)
-		prtd->teardown_unknown = true;
-
-	return failed;
-}
-
 static int q6asm_dai_compr_free(struct snd_soc_component *component,
 				struct snd_compr_stream *stream)
 {
@@ -1652,32 +677,23 @@ static int q6asm_dai_compr_free(struct snd_soc_component *component,
 	struct snd_soc_pcm_runtime *rtd = stream->private_data;
 
 	if (prtd->audio_client) {
-		q6asm_audio_client_clear_callback(prtd->audio_client);
+		if (prtd->state == Q6ASM_STREAM_RUNNING) {
+			q6asm_cmd(prtd->audio_client, prtd->stream_id,
+				  CMD_CLOSE);
+			if (prtd->next_track_stream_id) {
+				q6asm_cmd(prtd->audio_client,
+					  prtd->next_track_stream_id,
+					  CMD_CLOSE);
+			}
 
-		/*
-		 * set_params() already ran this teardown when it failed.  Do
-		 * not repeat a command whose remote result is unknown; the
-		 * session is quarantined and the pages stay held.
-		 */
-		if (!prtd->teardown_unknown &&
-		    q6asm_dai_compr_teardown(component, rtd, prtd,
-					     stream->direction))
-			prtd->teardown_unknown = true;
-
-		if (prtd->teardown_unknown && !prtd->dma_held) {
-			if (q6asm_hold_buffer(prtd->audio_client,
-					      &prtd->dma_buffer,
-					      prtd->session_id))
-				prtd->dma_held = true;
-			else
-				dev_err(component->dev,
-					"J716F: cannot hold the compressed DMA buffer; leaving the pages\n");
-		} else if (!prtd->teardown_unknown) {
-			snd_dma_free_pages(&prtd->dma_buffer);
+			q6asm_unmap_memory_regions(stream->direction,
+					   prtd->audio_client);
 		}
+		snd_dma_free_pages(&prtd->dma_buffer);
 		q6asm_audio_client_free(prtd->audio_client);
 		prtd->audio_client = NULL;
 	}
+	q6routing_stream_close(rtd->dai_link->id, stream->direction);
 	kfree(prtd);
 
 	return 0;
@@ -1882,62 +898,28 @@ static int q6asm_dai_compr_set_params(struct snd_soc_component *component,
 		return -EINVAL;
 	}
 
-	if (q6asm_session_is_quarantined(prtd->audio_client)) {
-		dev_err(dev, "J716F: session %d is quarantined; refusing compr params\n",
-			prtd->stream_id);
-		return -EIO;
-	}
-
-	if (!runtime->fragments || !runtime->fragment_size)
-		return -EINVAL;
-
-	/*
-	 * Quiesce the front end before the old stream is torn down.  A
-	 * completion validated against the previous mapping may still be in
-	 * the callback; with the state idle it cannot account a fragment or
-	 * post a write into the ring being released.
-	 */
-	spin_lock(&prtd->lock);
-	prtd->state = Q6ASM_STREAM_IDLE;
-	spin_unlock(&prtd->lock);
-
-	/*
-	 * A second set_params() on the same stream must not open a second
-	 * stream or map a second time; release the previous configuration
-	 * first.
-	 */
-	if (prtd->stream_opened || prtd->map_state != Q6ASM_MAP_NONE) {
-		if (q6asm_dai_compr_teardown(component, rtd, prtd, dir)) {
-			prtd->teardown_unknown = true;
-			return -EIO;
-		}
-	}
-
 	prtd->periods = runtime->fragments;
 	prtd->pcm_count = runtime->fragment_size;
 	prtd->pcm_size = runtime->fragments * runtime->fragment_size;
 	prtd->bits_per_sample = 16;
-	spin_lock(&prtd->lock);
-	prtd->state = Q6ASM_STREAM_PREPARED;
-	spin_unlock(&prtd->lock);
 
 	if (dir == SND_COMPRESS_PLAYBACK) {
-		ret = q6asm_open_write(prtd->audio_client, prtd->stream_id,
-				       params->codec.id, params->codec.profile,
-				       prtd->bits_per_sample, true);
+		ret = q6asm_open_write(prtd->audio_client, prtd->stream_id, params->codec.id,
+				params->codec.profile, prtd->bits_per_sample,
+				true);
+
 		if (ret < 0) {
-			dev_err(dev, "q6asm_open_write failed %d\n", ret);
+			dev_err(dev, "q6asm_open_write failed\n");
 			goto open_err;
 		}
-		prtd->stream_opened = true;
 	}
 
 	prtd->session_id = q6asm_get_session_id(prtd->audio_client);
 	ret = q6routing_stream_open(rtd->dai_link->id, LEGACY_PCM_MODE,
-				    prtd->session_id, dir);
+			      prtd->session_id, dir);
 	if (ret) {
 		dev_err(dev, "Stream reg failed ret:%d\n", ret);
-		goto q6_err;
+		goto routing_err;
 	}
 
 	ret = __q6asm_dai_compr_set_codec_params(component, stream,
@@ -1951,37 +933,21 @@ static int q6asm_dai_compr_set_params(struct snd_soc_component *component,
 	ret = q6asm_map_memory_regions(dir, prtd->audio_client, prtd->phys,
 				       (prtd->pcm_size / prtd->periods),
 				       prtd->periods);
+
 	if (ret < 0) {
 		dev_err(dev, "Buffer Mapping failed ret:%d\n", ret);
-		/*
-		 * A timeout, a missing handle (-EPROTO) or a malformed answer
-		 * means the DSP may have mapped the region anyway.  Keep the
-		 * real error and retire the session: only an ADSP stop can
-		 * clear a mapping the host cannot address.
-		 */
-		if (ret == -ETIMEDOUT || ret == -EPROTO || ret == -EIO) {
-			prtd->map_state = Q6ASM_MAP_UNKNOWN;
-			q6asm_quarantine_session(prtd->audio_client);
-		}
+		ret = -ENOMEM;
 		goto q6_err;
 	}
 
-	prtd->map_state = Q6ASM_MAP_CONFIRMED;
-	spin_lock(&prtd->lock);
-	prtd->generation = q6asm_get_buffer_generation(prtd->audio_client,
-						       dir);
-	spin_unlock(&prtd->lock);
+	prtd->state = Q6ASM_STREAM_RUNNING;
+
 	return 0;
 
 q6_err:
-	/*
-	 * Roll back through the same ordered teardown free() uses.  If it
-	 * cannot confirm that the ADSP released the stream, remember that so
-	 * free() keeps the DMA buffer instead of handing it back to the page
-	 * allocator while the DSP may still be using it.
-	 */
-	if (q6asm_dai_compr_teardown(component, rtd, prtd, dir))
-		prtd->teardown_unknown = true;
+	q6routing_stream_close(rtd->dai_link->id, dir);
+routing_err:
+	q6asm_cmd(prtd->audio_client, prtd->stream_id, CMD_CLOSE);
 
 open_err:
 	return ret;
@@ -1997,14 +963,36 @@ static int q6asm_dai_compr_set_metadata(struct snd_soc_component *component,
 
 	switch (metadata->key) {
 	case SNDRV_COMPRESS_ENCODER_PADDING:
-		spin_lock(&prtd->lock);
 		prtd->trailing_samples_drop = metadata->value[0];
-		spin_unlock(&prtd->lock);
 		break;
 	case SNDRV_COMPRESS_ENCODER_DELAY:
-		spin_lock(&prtd->lock);
 		prtd->initial_samples_drop = metadata->value[0];
-		spin_unlock(&prtd->lock);
+		if (prtd->next_track_stream_id) {
+			ret = q6asm_open_write(prtd->audio_client,
+					       prtd->next_track_stream_id,
+					       prtd->codec.id,
+					       prtd->codec.profile,
+					       prtd->bits_per_sample,
+				       true);
+			if (ret < 0) {
+				dev_err(component->dev, "q6asm_open_write failed\n");
+				return ret;
+			}
+			ret = __q6asm_dai_compr_set_codec_params(component, stream,
+								 &prtd->codec,
+								 prtd->next_track_stream_id);
+			if (ret < 0) {
+				dev_err(component->dev, "q6asm_open_write failed\n");
+				return ret;
+			}
+
+			ret = q6asm_stream_remove_initial_silence(prtd->audio_client,
+						    prtd->next_track_stream_id,
+						    prtd->initial_samples_drop);
+			prtd->next_track_stream_id = 0;
+
+		}
+
 		break;
 	default:
 		ret = -EINVAL;
@@ -2024,57 +1012,26 @@ static int q6asm_dai_compr_trigger(struct snd_soc_component *component,
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
 	case SNDRV_PCM_TRIGGER_RESUME:
-	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE: {
-		bool run = false;
-
-		spin_lock(&prtd->lock);
-		if (prtd->state != Q6ASM_STREAM_RUNNING &&
-		    prtd->state != Q6ASM_STREAM_STARTING) {
-			prtd->state = Q6ASM_STREAM_STARTING;
-			run = true;
-		}
-		spin_unlock(&prtd->lock);
-
-		if (run) {
-			ret = q6asm_run_nowait(prtd->audio_client,
-					       prtd->stream_id, 0, 0, 0);
-			if (ret < 0) {
-				spin_lock(&prtd->lock);
-				prtd->state = Q6ASM_STREAM_ERROR;
-				spin_unlock(&prtd->lock);
-			}
-		}
+	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
+		ret = q6asm_run_nowait(prtd->audio_client, prtd->stream_id,
+				       0, 0, 0);
 		break;
-	}
 	case SNDRV_PCM_TRIGGER_STOP:
-		spin_lock(&prtd->lock);
-		prtd->state = Q6ASM_STREAM_STOPPING;
-		spin_unlock(&prtd->lock);
 		ret = q6asm_cmd_nowait(prtd->audio_client, prtd->stream_id,
 				       CMD_EOS);
 		break;
 	case SNDRV_PCM_TRIGGER_SUSPEND:
 	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
-		spin_lock(&prtd->lock);
-		if (prtd->state == Q6ASM_STREAM_RUNNING)
-			prtd->state = Q6ASM_STREAM_PAUSING;
-		spin_unlock(&prtd->lock);
 		ret = q6asm_cmd_nowait(prtd->audio_client, prtd->stream_id,
 				       CMD_PAUSE);
 		break;
-	case SND_COMPR_TRIGGER_DRAIN:
-		spin_lock(&prtd->lock);
-		prtd->notify_on_drain = true;
-		spin_unlock(&prtd->lock);
-		break;
 	case SND_COMPR_TRIGGER_NEXT_TRACK:
+		prtd->next_track = true;
+		prtd->next_track_stream_id = (prtd->stream_id == 1 ? 2 : 1);
+		break;
+	case SND_COMPR_TRIGGER_DRAIN:
 	case SND_COMPR_TRIGGER_PARTIAL_DRAIN:
-		/*
-		 * The stream-id rotation needs a second OPEN and a MAP that
-		 * this driver has never validated on the kona firmware.
-		 * Refuse it instead of writing to an id that was never opened.
-		 */
-		ret = -EOPNOTSUPP;
+		prtd->notify_on_drain = true;
 		break;
 	default:
 		ret = -EINVAL;
@@ -2093,12 +1050,6 @@ static int q6asm_dai_compr_pointer(struct snd_soc_component *component,
 	uint64_t temp_copied_total;
 
 	guard(spinlock_irqsave)(&prtd->lock);
-
-	if (!prtd->pcm_size) {
-		tstamp->copied_total = 0;
-		tstamp->byte_offset = 0;
-		return 0;
-	}
 
 	tstamp->copied_total = prtd->copied_total;
 	temp_copied_total = tstamp->copied_total;
@@ -2121,14 +1072,17 @@ static int q6asm_compr_copy(struct snd_soc_component *component,
 	uint64_t bytes_received;
 	uint64_t temp_bytes_received;
 
-	if (!prtd->pcm_size || !prtd->pcm_count ||
-	    count > prtd->pcm_size)
-		return -EINVAL;
-	if (!count)
-		return 0;
-
 	bytes_received = prtd->bytes_received;
 	temp_bytes_received = bytes_received;
+
+	/**
+	 * Make sure that next track data pointer is aligned at 32 bit boundary
+	 * This is a Mandatory requirement from DSP data buffers alignment
+	 */
+	if (prtd->next_track) {
+		bytes_received = ALIGN(prtd->bytes_received, prtd->pcm_count);
+		temp_bytes_received = bytes_received;
+	}
 
 	app_pointer = do_div(temp_bytes_received, prtd->pcm_size);
 	dstn = prtd->dma_buffer.area + app_pointer;
@@ -2147,34 +1101,28 @@ static int q6asm_compr_copy(struct snd_soc_component *component,
 
 	guard(spinlock_irqsave)(&prtd->lock);
 
-	if (prtd->copied_total > prtd->bytes_received) {
-		dev_warn_ratelimited(prtd->dev,
-				     "compressed counters went backwards (%llu > %llu)\n",
-				     prtd->copied_total, prtd->bytes_received);
-		bytes_in_flight = 0;
-	} else {
-		bytes_in_flight = prtd->bytes_received - prtd->copied_total;
+	bytes_in_flight = prtd->bytes_received - prtd->copied_total;
+
+	if (prtd->next_track) {
+		prtd->next_track = false;
+		prtd->copied_total = ALIGN(prtd->copied_total, prtd->pcm_count);
+		prtd->bytes_sent = ALIGN(prtd->bytes_sent, prtd->pcm_count);
 	}
 
 	prtd->bytes_received = bytes_received + count;
 
-	/* Kick off the data to the DSP if it is starving. */
-	if (prtd->state == Q6ASM_STREAM_RUNNING && bytes_in_flight == 0) {
+	/* Kick off the data to dsp if its starving!! */
+	if (prtd->state == Q6ASM_STREAM_RUNNING && (bytes_in_flight == 0)) {
 		uint32_t bytes_to_write = prtd->pcm_count;
 
 		avail = prtd->bytes_received - prtd->bytes_sent;
+
 		if (avail < prtd->pcm_count)
 			bytes_to_write = avail;
 
-		if (bytes_to_write) {
-			if (q6asm_write_async(prtd->audio_client,
-					      prtd->stream_id, bytes_to_write,
-					      0, 0, wflags) < 0) {
-				prtd->state = Q6ASM_STREAM_ERROR;
-				return count;
-			}
-			prtd->bytes_sent += bytes_to_write;
-		}
+		q6asm_write_async(prtd->audio_client, prtd->stream_id,
+				  bytes_to_write, 0, 0, wflags);
+		prtd->bytes_sent += bytes_to_write;
 	}
 
 	return count;
@@ -2246,26 +1194,6 @@ static int q6asm_dai_pcm_new(struct snd_soc_component *component,
 	struct snd_pcm *pcm = rtd->pcm;
 	size_t size = q6asm_dai_hardware_playback.buffer_bytes_max;
 
-	/*
-	 * Lenovo J716F: the vendor kernel maps audio buffers from the LPASS
-	 * audio SMMU window 0x1000_0000-0x1FFF_FFFF (qcom,iommu-dma-addr-pool
-	 * on its msm-audio-ion node). Keep the IOVA in the same window so the
-	 * address handed to the ADSP is inside the range its firmware was
-	 * built for. A 29-bit mask makes iommu-dma allocate top-down at
-	 * 0x1FFF_xxxx, i.e. inside that window.
-	 */
-	if (of_machine_is_compatible("lenovo,j716f")) {
-		int ret = dma_set_mask_and_coherent(component->dev,
-						    DMA_BIT_MASK(29));
-
-		if (ret) {
-			dev_err(component->dev,
-				"J716F: cannot limit the audio DMA mask to the LPASS window (%d); refusing PCM registration\n",
-				ret);
-			return ret;
-		}
-	}
-
 	return snd_pcm_set_fixed_buffer_all(pcm, SNDRV_DMA_TYPE_DEV,
 					    component->dev, size);
 }
@@ -2293,7 +1221,6 @@ static const struct snd_soc_component_driver q6asm_fe_dai_component = {
 	.name			= DRV_NAME,
 	.open			= q6asm_dai_open,
 	.hw_params		= q6asm_dai_hw_params,
-	.hw_free		= q6asm_dai_hw_free,
 	.close			= q6asm_dai_close,
 	.prepare		= q6asm_dai_prepare,
 	.trigger		= q6asm_dai_trigger,
@@ -2387,18 +1314,9 @@ static int q6asm_dai_probe(struct platform_device *pdev)
 	else
 		pdata->sid = args.args[0] & SID_MASK_DEFAULT;
 
-	pdata->j716f = of_machine_is_compatible("lenovo,j716f");
 	dev_set_drvdata(dev, pdata);
 
 	rc = of_q6asm_parse_dai_data(dev, pdata);
-	if (rc)
-		return rc;
-
-	/*
-	 * Resolve DMA buffers held after a failed teardown before this
-	 * device's IOMMU domain disappears.
-	 */
-	rc = q6asm_dma_device_register(dev);
 	if (rc)
 		return rc;
 
