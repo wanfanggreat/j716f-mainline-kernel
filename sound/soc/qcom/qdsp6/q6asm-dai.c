@@ -623,6 +623,8 @@ static int q6asm_dai_close(struct snd_soc_component *component,
 	}
 
 	if (prtd->audio_client) {
+		/* No event may reach prtd once it is freed below. */
+		q6asm_audio_client_clear_callback(prtd->audio_client);
 		if (prtd->state == Q6ASM_STREAM_RUNNING) {
 			q6asm_cmd(prtd->audio_client, prtd->stream_id,
 				  CMD_CLOSE);

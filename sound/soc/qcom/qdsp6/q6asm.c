@@ -268,6 +268,7 @@ struct audio_client {
 	uint32_t io_mode;
 	struct apr_device *adev;
 	struct mutex cmd_lock;
+	struct mutex cb_lock;
 	spinlock_t lock;
 	struct kref refcount;
 	/* idx:1 out port, 0: in port */
@@ -557,6 +558,25 @@ static void q6asm_audio_client_release(struct kref *ref)
 }
 
 /**
+ * q6asm_audio_client_clear_callback() - Stop delivering events to the owner
+ *
+ * @ac: audio client whose callback is to be cleared
+ *
+ * A response that was already queued can reach the dispatch sites after the
+ * owner has dropped its private data.  Clearing the callback under the same
+ * lock the dispatch sites take stops the delivery, so the owner may free its
+ * context before the client itself is released.
+ */
+void q6asm_audio_client_clear_callback(struct audio_client *ac)
+{
+	mutex_lock(&ac->cb_lock);
+	ac->cb = NULL;
+	ac->priv = NULL;
+	mutex_unlock(&ac->cb_lock);
+}
+EXPORT_SYMBOL_GPL(q6asm_audio_client_clear_callback);
+
+/**
  * q6asm_audio_client_free() - Freee allocated audio client
  *
  * @ac: audio client to free
@@ -668,9 +688,11 @@ static int32_t q6asm_stream_callback(struct apr_device *adev,
 		ac->result = *result;
 		wake_up(&ac->cmd_wait);
 
+		mutex_lock(&ac->cb_lock);
 		if (ac->cb)
 			ac->cb(client_event, hdr->token,
 			       data->payload, ac->priv);
+		mutex_unlock(&ac->cb_lock);
 
 		ret = 0;
 		goto done;
@@ -735,8 +757,10 @@ static int32_t q6asm_stream_callback(struct apr_device *adev,
 		break;
 	}
 
+	mutex_lock(&ac->cb_lock);
 	if (ac->cb)
 		ac->cb(client_event, hdr->token, data->payload, ac->priv);
+	mutex_unlock(&ac->cb_lock);
 
 done:
 	kref_put(&ac->refcount, q6asm_audio_client_release);
@@ -804,8 +828,10 @@ static int q6asm_srvc_callback(struct apr_device *adev,
 		break;
 	}
 
+	mutex_lock(&ac->cb_lock);
 	if (ac->cb)
 		ac->cb(hdr->opcode, hdr->token, data->payload, ac->priv);
+	mutex_unlock(&ac->cb_lock);
 
 done:
 	kref_put(&ac->refcount, q6asm_audio_client_release);
@@ -871,6 +897,7 @@ struct audio_client *q6asm_audio_client_alloc(struct device *dev, q6asm_cb cb,
 
 	init_waitqueue_head(&ac->cmd_wait);
 	mutex_init(&ac->cmd_lock);
+	mutex_init(&ac->cb_lock);
 	spin_lock_init(&ac->lock);
 
 	return ac;
