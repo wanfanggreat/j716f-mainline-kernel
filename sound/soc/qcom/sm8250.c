@@ -407,73 +407,46 @@ static int sm8250_snd_hw_params(struct snd_pcm_substream *substream,
 {
 	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
 	struct snd_soc_dai *codec_dai;
-	const unsigned int left_slots[] = { 0, 1 };
-	const unsigned int right_slots[] = { 1, 0 };
 	int i, ret;
 
 	/*
-	 * Lenovo J716F: the CS35L41 amplifiers take their PLL reference from
-	 * the I2S bit clock.  Program the component side (PLL source and
-	 * divider) and the ASP channel map for every amplifier on the link.
-	 * 0x40/0x43 are on the left, 0x41/0x42 on the right.
+	 * Lenovo J716F: the CS35L41 amplifiers take their PLL reference and
+	 * their channel position from the I2S link.  The board describes the
+	 * ASP RX slot pair in cirrus,asp-rx-slots; program the DAI clock and
+	 * channel map from it, then the component side (PLL source and
+	 * divider).
+	 *
+	 * An amplifier without the property is skipped: its slot pair is not
+	 * known, and guessing it from the I2C address only ever worked for the
+	 * board that never needed the guess.
 	 */
 	for_each_rtd_codec_dais(rtd, i, codec_dai) {
-		unsigned int rx_slots_buf[2];
-		const unsigned int *rx_slots = left_slots;
-		struct device_node *np;
-		u32 address;
+		unsigned int rx_slots[2];
 
 		if (!strstr(codec_dai->name, "cs35l41"))
 			continue;
 
-		np = codec_dai->component->dev->of_node;
-		/*
-		 * The board describes the amplifier's ASP RX slot pair.  The
-		 * J716F address fallback below is only for DTBs that predate
-		 * the property; new boards should not need a machine-driver
-		 * table keyed by I2C address.
-		 */
-		if (of_property_count_u32_elems(np, "cirrus,asp-rx-slots") ==
-		    ARRAY_SIZE(rx_slots_buf)) {
-			ret = of_property_read_u32_array(np,
-							 "cirrus,asp-rx-slots",
-							 rx_slots_buf,
-							 ARRAY_SIZE(rx_slots_buf));
-			if (ret)
-				return ret;
-			rx_slots = rx_slots_buf;
-		} else if (of_machine_is_compatible("lenovo,j716f")) {
-			ret = of_property_read_u32(np, "reg", &address);
-			if (ret)
-				return ret;
-			switch (address) {
-			case 0x40:
-			case 0x43:
-				break;
-			case 0x41:
-			case 0x42:
-				rx_slots = right_slots;
-				break;
-			default:
-				return -EINVAL;
-			}
-		}
+		ret = of_property_read_u32_array(
+			codec_dai->component->dev->of_node,
+			"cirrus,asp-rx-slots", rx_slots,
+			ARRAY_SIZE(rx_slots));
+		if (ret)
+			continue;
 
 		ret = snd_soc_dai_set_channel_map(codec_dai, 0, NULL,
-						  ARRAY_SIZE(left_slots),
-						  rx_slots);
+			ARRAY_SIZE(rx_slots), rx_slots);
 		if (ret)
 			return ret;
 
 		ret = snd_soc_dai_set_sysclk(codec_dai, CS35L41_CLKID_SCLK,
-					     MI2S_BCLK_RATE, SND_SOC_CLOCK_IN);
+			MI2S_BCLK_RATE, SND_SOC_CLOCK_IN);
 		if (ret)
 			return ret;
 
 		ret = snd_soc_component_set_sysclk(codec_dai->component,
-						   CS35L41_CLKID_SCLK, 0,
-						   MI2S_BCLK_RATE,
-						   SND_SOC_CLOCK_IN);
+			CS35L41_CLKID_SCLK, 0,
+			MI2S_BCLK_RATE,
+			SND_SOC_CLOCK_IN);
 		if (ret)
 			return ret;
 	}
@@ -502,6 +475,19 @@ static int sm8250_snd_hw_free(struct snd_pcm_substream *substream)
 static const struct snd_soc_ops sm8250_be_ops = {
 	.startup = sm8250_snd_startup,
 	.shutdown = sm8250_snd_shutdown,
+	.hw_free = sm8250_snd_hw_free,
+	.prepare = sm8250_snd_prepare,
+};
+
+/*
+ * Lenovo J716F: only this board needs a hw_params callback on the
+ * backends, to clock the CS35L41 amplifiers from the I2S bit clock and
+ * hand them their slot map.  Every other board keeps the upstream ops
+ * without one.
+ */
+static const struct snd_soc_ops sm8250_j716f_be_ops = {
+	.startup = sm8250_snd_startup,
+	.shutdown = sm8250_snd_shutdown,
 	.hw_params = sm8250_snd_hw_params,
 	.hw_free = sm8250_snd_hw_free,
 	.prepare = sm8250_snd_prepare,
@@ -509,15 +495,19 @@ static const struct snd_soc_ops sm8250_be_ops = {
 
 static void sm8250_add_be_ops(struct snd_soc_card *card)
 {
+	const struct snd_soc_ops *ops = &sm8250_be_ops;
 	struct snd_soc_dai_link *link;
 	int i;
+
+	if (of_machine_is_compatible("lenovo,j716f"))
+		ops = &sm8250_j716f_be_ops;
 
 	for_each_card_prelinks(card, i, link) {
 		if (link->no_pcm == 1) {
 			link->init = sm8250_snd_init;
 			link->exit = sm8250_snd_exit;
 			link->be_hw_params_fixup = sm8250_be_hw_params_fixup;
-			link->ops = &sm8250_be_ops;
+			link->ops = ops;
 		}
 	}
 }
