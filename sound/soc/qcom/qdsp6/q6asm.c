@@ -874,6 +874,14 @@ struct audio_client *q6asm_audio_client_alloc(struct device *dev, q6asm_cb cb,
 
 	ac = q6asm_get_audio_client(a, session_id + 1);
 	if (ac) {
+		bool kept;
+
+		mutex_lock(&ac->cb_lock);
+		kept = !ac->cb;
+		mutex_unlock(&ac->cb_lock);
+		if (kept)
+			return ERR_PTR(-EBUSY);
+
 		dev_err(dev, "Audio Client already active\n");
 		return ac;
 	}
