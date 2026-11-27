@@ -12,7 +12,6 @@
 #include <linux/bitops.h>
 #include <linux/mutex.h>
 #include <linux/slab.h>
-#include <linux/string.h>
 #include <sound/core.h>
 #include <sound/soc.h>
 #include <sound/soc-dapm.h>
@@ -373,37 +372,9 @@ struct msm_routing_data {
 	struct session_data port_data[AFE_MAX_PORTS];
 	struct device *dev;
 	struct mutex lock;
-	/*
-	 * Set once the q6adm-routing platform device is bound and cleared in
-	 * remove().  Every user takes lock, so a stream open racing remove
-	 * either finishes before the table is torn down or sees !ready.
-	 */
-	bool ready;
 };
 
-/*
- * One q6adm-routing instance exists per ADSP and the table is referenced by
- * the Q6ASM front end through exported helpers, not through a device
- * pointer.  Keeping the table static makes a stale pointer impossible; the
- * ready flag and the mutex provide the lifetime the old kfree() lacked.
- */
-static struct msm_routing_data routing_data = {
-	.lock = __MUTEX_INITIALIZER(routing_data.lock),
-};
-
-static void q6routing_close_session_copps(struct msm_routing_data *data,
-					  struct session_data *session)
-{
-	unsigned long j;
-
-	for_each_set_bit(j, &session->copp_map, MAX_COPPS_PER_PORT) {
-		if (session->copps[j]) {
-			q6adm_close(data->dev, session->copps[j]);
-			session->copps[j] = NULL;
-		}
-	}
-	session->copp_map = 0;
-}
+static struct msm_routing_data *routing_data;
 
 /**
  * q6routing_stream_open() - Register a new stream for route setup
@@ -416,34 +387,31 @@ static void q6routing_close_session_copps(struct msm_routing_data *data,
  * Return: Will be an negative on error or a zero on success.
  */
 int q6routing_stream_open(int fedai_id, int perf_mode,
-			  int stream_id, int stream_type)
+			   int stream_id, int stream_type)
 {
-	struct msm_routing_data *data = &routing_data;
-	struct session_data *session, *pdata;
+	int j, topology, num_copps = 0;
 	struct route_payload payload;
 	struct q6copp *copp;
-	int j, topology, num_copps = 0;
-	int copp_idx, ret = 0;
+	int copp_idx;
+	struct session_data *session, *pdata;
 
-	if (stream_id <= 0 || stream_id > MAX_SESSIONS)
+	if (!routing_data) {
+		pr_err("Routing driver not yet ready\n");
 		return -EINVAL;
-
-	mutex_lock(&data->lock);
-	if (!data->ready) {
-		ret = -ENODEV;
-		goto unlock;
 	}
 
-	session = &data->sessions[stream_id - 1];
+	session = &routing_data->sessions[stream_id - 1];
 	if (session->port_id < 0) {
-		dev_err(data->dev, "Routing not setup for MultiMedia%d Session\n",
+		dev_err(routing_data->dev, "Routing not setup for MultiMedia%d Session\n",
 			session->fedai_id);
-		ret = -EINVAL;
-		goto unlock;
+		return -EINVAL;
 	}
 
-	pdata = &data->port_data[session->port_id];
+	pdata = &routing_data->port_data[session->port_id];
+
+	mutex_lock(&routing_data->lock);
 	session->fedai_id = fedai_id;
+
 	session->path_type = pdata->path_type;
 	session->sample_rate = pdata->sample_rate;
 	session->channels = pdata->channels;
@@ -451,26 +419,17 @@ int q6routing_stream_open(int fedai_id, int perf_mode,
 
 	payload.num_copps = 0; /* only RX needs to use payload */
 	topology = NULL_COPP_TOPOLOGY;
-	copp = q6adm_open(data->dev, session->port_id, session->path_type,
-			  session->sample_rate, session->channels, topology,
-			  perf_mode, session->bits_per_sample, 0, 0);
+	copp = q6adm_open(routing_data->dev, session->port_id,
+			      session->path_type, session->sample_rate,
+			      session->channels, topology, perf_mode,
+			      session->bits_per_sample, 0, 0);
+
 	if (IS_ERR_OR_NULL(copp)) {
-		ret = copp ? PTR_ERR(copp) : -EINVAL;
-		q6routing_close_session_copps(data, session);
-		session->fedai_id = -1;
-		goto unlock;
+		mutex_unlock(&routing_data->lock);
+		return -EINVAL;
 	}
 
 	copp_idx = q6adm_get_copp_id(copp);
-	if (session->copps[copp_idx]) {
-		/*
-		 * This session already owns the COPP; drop the extra reference
-		 * q6adm_open() just took and keep the existing route.
-		 */
-		q6adm_close(data->dev, copp);
-		goto unlock;
-	}
-
 	set_bit(copp_idx, &session->copp_map);
 	session->copps[copp_idx] = copp;
 
@@ -483,30 +442,15 @@ int q6routing_stream_open(int fedai_id, int perf_mode,
 	if (num_copps) {
 		payload.num_copps = num_copps;
 		payload.session_id = stream_id;
-		ret = q6adm_matrix_map(data->dev, session->path_type, payload,
-				       perf_mode);
-		if (ret) {
-			dev_err(data->dev,
-				"ADM matrix map failed for stream %d: %d\n",
-				stream_id, ret);
-			/*
-			 * The whole session's route is unusable now.  Close
-			 * every COPP it holds, not just the one added by this
-			 * call, or the rest would become unreachable once
-			 * fedai_id is cleared.
-			 */
-			q6routing_close_session_copps(data, session);
-			session->fedai_id = -1;
-		}
+		q6adm_matrix_map(routing_data->dev, session->path_type,
+				 payload, perf_mode);
 	}
+	mutex_unlock(&routing_data->lock);
 
-unlock:
-	mutex_unlock(&data->lock);
-	return ret;
+	return 0;
 }
 EXPORT_SYMBOL_GPL(q6routing_stream_open);
 
-/* Caller holds data->lock. */
 static struct session_data *get_session_from_id(struct msm_routing_data *data,
 						int fedai_id)
 {
@@ -530,49 +474,41 @@ static struct session_data *get_session_from_id(struct msm_routing_data *data,
  */
 void q6routing_stream_close(int fedai_id, int stream_type)
 {
-	struct msm_routing_data *data = &routing_data;
 	struct session_data *session;
 	int idx;
 
-	mutex_lock(&data->lock);
-	if (!data->ready)
-		goto unlock;
-
-	session = get_session_from_id(data, fedai_id);
+	session = get_session_from_id(routing_data, fedai_id);
 	if (!session)
-		goto unlock;
+		return;
 
 	for_each_set_bit(idx, &session->copp_map, MAX_COPPS_PER_PORT) {
 		if (session->copps[idx]) {
-			q6adm_close(data->dev, session->copps[idx]);
+			q6adm_close(routing_data->dev, session->copps[idx]);
 			session->copps[idx] = NULL;
 		}
 	}
 
 	session->fedai_id = -1;
 	session->copp_map = 0;
-unlock:
-	mutex_unlock(&data->lock);
 }
 EXPORT_SYMBOL_GPL(q6routing_stream_close);
 
 static int msm_routing_get_audio_mixer(struct snd_kcontrol *kcontrol,
 				       struct snd_ctl_elem_value *ucontrol)
 {
+	struct snd_soc_dapm_context *dapm = snd_soc_dapm_kcontrol_to_dapm(kcontrol);
 	struct soc_mixer_control *mc =
 	    (struct soc_mixer_control *)kcontrol->private_value;
 	int session_id = mc->shift;
-	struct msm_routing_data *data = &routing_data;
-	bool enabled;
+	struct snd_soc_component *c = snd_soc_dapm_to_component(dapm);
+	struct msm_routing_data *priv = dev_get_drvdata(c->dev);
+	struct session_data *session = &priv->sessions[session_id];
 
-	if (!data->ready || session_id < 0 || session_id >= MAX_SESSIONS)
-		return -ENODEV;
+	if (session->port_id == mc->reg)
+		ucontrol->value.integer.value[0] = 1;
+	else
+		ucontrol->value.integer.value[0] = 0;
 
-	mutex_lock(&data->lock);
-	enabled = data->sessions[session_id].port_id == mc->reg;
-	mutex_unlock(&data->lock);
-
-	ucontrol->value.integer.value[0] = enabled;
 	return 0;
 }
 
@@ -580,51 +516,29 @@ static int msm_routing_put_audio_mixer(struct snd_kcontrol *kcontrol,
 				       struct snd_ctl_elem_value *ucontrol)
 {
 	struct snd_soc_dapm_context *dapm = snd_soc_dapm_kcontrol_to_dapm(kcontrol);
-	struct msm_routing_data *data = &routing_data;
+	struct snd_soc_component *c = snd_soc_dapm_to_component(dapm);
+	struct msm_routing_data *data = dev_get_drvdata(c->dev);
 	struct soc_mixer_control *mc =
 		    (struct soc_mixer_control *)kcontrol->private_value;
 	struct snd_soc_dapm_update *update = NULL;
 	int be_id = mc->reg;
 	int session_id = mc->shift;
-	bool changed = false;
+	struct session_data *session = &data->sessions[session_id];
 
-	if (!data->ready || session_id < 0 || session_id >= MAX_SESSIONS)
-		return -ENODEV;
-
-	mutex_lock(&data->lock);
 	if (ucontrol->value.integer.value[0]) {
-		if (data->sessions[session_id].port_id != be_id) {
-			if (data->sessions[session_id].copp_map) {
-				dev_err(data->dev,
-					"cannot change the port of a routed session %d\n",
-					session_id);
-				mutex_unlock(&data->lock);
-				return -EBUSY;
-			}
-			data->sessions[session_id].port_id = be_id;
-			changed = true;
-		}
+		if (session->port_id == be_id)
+			return 0;
+
+		session->port_id = be_id;
+		snd_soc_dapm_mixer_update_power(dapm, kcontrol, 1, update);
 	} else {
-		if (data->sessions[session_id].port_id == be_id) {
-			if (data->sessions[session_id].copp_map) {
-				dev_err(data->dev,
-					"cannot unroute a session with COPPs %d\n",
-					session_id);
-				mutex_unlock(&data->lock);
-				return -EBUSY;
-			}
-			data->sessions[session_id].port_id = -1;
-			changed = true;
-		}
+		if (session->port_id == -1 || session->port_id != be_id)
+			return 0;
+
+		session->port_id = -1;
+		snd_soc_dapm_mixer_update_power(dapm, kcontrol, 0, update);
 	}
-	mutex_unlock(&data->lock);
 
-	if (!changed)
-		return 0;
-
-	/* DAPM updates can recurse into other components; do it unlocked. */
-	snd_soc_dapm_mixer_update_power(dapm, kcontrol,
-					ucontrol->value.integer.value[0], update);
 	return 1;
 }
 
@@ -1217,7 +1131,7 @@ static int routing_hw_params(struct snd_soc_component *component,
 			     struct snd_pcm_hw_params *params)
 {
 	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
-	struct msm_routing_data *data = &routing_data;
+	struct msm_routing_data *data = dev_get_drvdata(component->dev);
 	unsigned int be_id = snd_soc_rtd_to_cpu(rtd, 0)->id;
 	struct session_data *session;
 	int path_type;
@@ -1230,13 +1144,10 @@ static int routing_hw_params(struct snd_soc_component *component,
 	if (be_id >= AFE_MAX_PORTS)
 		return -EINVAL;
 
-	mutex_lock(&data->lock);
-	if (!data->ready) {
-		mutex_unlock(&data->lock);
-		return -ENODEV;
-	}
-
 	session = &data->port_data[be_id];
+
+	mutex_lock(&data->lock);
+
 	session->path_type = path_type;
 	session->sample_rate = params_rate(params);
 	session->channels = params_channels(params);
@@ -1258,18 +1169,12 @@ static int routing_hw_params(struct snd_soc_component *component,
 
 static int msm_routing_probe(struct snd_soc_component *c)
 {
-	struct msm_routing_data *data = &routing_data;
 	int i;
 
-	mutex_lock(&data->lock);
 	for (i = 0; i < MAX_SESSIONS; i++) {
-		memset(&data->sessions[i], 0, sizeof(data->sessions[i]));
-		data->sessions[i].port_id = -1;
-		data->sessions[i].fedai_id = -1;
+		routing_data->sessions[i].port_id = -1;
+		routing_data->sessions[i].fedai_id = -1;
 	}
-	for (i = 0; i < AFE_MAX_PORTS; i++)
-		memset(&data->port_data[i], 0, sizeof(data->port_data[i]));
-	mutex_unlock(&data->lock);
 
 	return 0;
 }
@@ -1302,52 +1207,25 @@ static const struct snd_soc_component_driver msm_soc_routing_component = {
 
 static int q6pcm_routing_probe(struct platform_device *pdev)
 {
-	struct msm_routing_data *data = &routing_data;
-	int ret;
+	struct device *dev = &pdev->dev;
 
-	mutex_lock(&data->lock);
-	data->dev = &pdev->dev;
-	data->ready = true;
-	mutex_unlock(&data->lock);
+	routing_data = kzalloc_obj(*routing_data);
+	if (!routing_data)
+		return -ENOMEM;
 
-	ret = devm_snd_soc_register_component(&pdev->dev,
-					      &msm_soc_routing_component,
-					      NULL, 0);
-	if (ret) {
-		mutex_lock(&data->lock);
-		data->ready = false;
-		mutex_unlock(&data->lock);
-		return ret;
-	}
+	routing_data->dev = dev;
 
-	return 0;
+	mutex_init(&routing_data->lock);
+	dev_set_drvdata(dev, routing_data);
+
+	return devm_snd_soc_register_component(dev, &msm_soc_routing_component,
+					  NULL, 0);
 }
 
 static void q6pcm_routing_remove(struct platform_device *pdev)
 {
-	struct msm_routing_data *data = &routing_data;
-	struct session_data *session;
-	int i, idx;
-
-	/*
-	 * Stop new users first, then give back every COPP the table still
-	 * owns.  The table itself is static, so a user that already passed
-	 * the ready check can finish without touching freed memory.
-	 */
-	mutex_lock(&data->lock);
-	data->ready = false;
-	for (i = 0; i < MAX_SESSIONS; i++) {
-		session = &data->sessions[i];
-		for_each_set_bit(idx, &session->copp_map, MAX_COPPS_PER_PORT) {
-			if (session->copps[idx]) {
-				q6adm_close(data->dev, session->copps[idx]);
-				session->copps[idx] = NULL;
-			}
-		}
-		session->copp_map = 0;
-		session->fedai_id = -1;
-	}
-	mutex_unlock(&data->lock);
+	kfree(routing_data);
+	routing_data = NULL;
 }
 
 #ifdef CONFIG_OF
