@@ -74,6 +74,10 @@ struct q6asm_dai_rtd {
 	uint32_t initial_samples_drop;
 	uint32_t trailing_samples_drop;
 	bool notify_on_drain;
+	bool j716f_capture;
+	bool capture_enabled;
+	bool capture_waiting_run;
+	unsigned int capture_inflight;
 };
 
 struct q6asm_dai_data {
@@ -176,14 +180,54 @@ static const struct snd_compr_codec_caps q6asm_compr_caps = {
 	.descriptor[0].formats = 0,
 };
 
+/*
+ * Lenovo J716F: the ADSP answers READ with ADSP_ENOTREADY until the RUN
+ * command has completed, so the capture ring is filled from the RUN_DONE
+ * event instead of from prepare().  Keep at most one period in flight per
+ * ring slot, and send the APR packets outside the lock.
+ */
+static void j716f_capture_queue_reads(struct q6asm_dai_rtd *prtd)
+{
+	unsigned long flags;
+	int ret;
+
+	for (;;) {
+		spin_lock_irqsave(&prtd->lock, flags);
+		if (!prtd->capture_enabled || prtd->capture_waiting_run ||
+		    prtd->capture_inflight >= prtd->periods) {
+			spin_unlock_irqrestore(&prtd->lock, flags);
+			return;
+		}
+		prtd->capture_inflight++;
+		spin_unlock_irqrestore(&prtd->lock, flags);
+
+		ret = q6asm_read(prtd->audio_client, prtd->stream_id);
+		if (ret < 0) {
+			spin_lock_irqsave(&prtd->lock, flags);
+			prtd->capture_inflight--;
+			spin_unlock_irqrestore(&prtd->lock, flags);
+			pr_warn_ratelimited("J716F: capture read failed: %d\n",
+					    ret);
+			return;
+		}
+	}
+}
+
 static void event_handler(uint32_t opcode, uint32_t token,
 			  void *payload, void *priv)
 {
 	struct q6asm_dai_rtd *prtd = priv;
 	struct snd_pcm_substream *substream = prtd->substream;
+	unsigned long flags;
 
 	switch (opcode) {
 	case ASM_CLIENT_EVENT_CMD_RUN_DONE:
+		if (!prtd->j716f_capture)
+			break;
+		spin_lock_irqsave(&prtd->lock, flags);
+		prtd->capture_waiting_run = false;
+		spin_unlock_irqrestore(&prtd->lock, flags);
+		j716f_capture_queue_reads(prtd);
 		break;
 	case ASM_CLIENT_EVENT_CMD_EOS_DONE:
 		break;
@@ -191,14 +235,69 @@ static void event_handler(uint32_t opcode, uint32_t token,
 		snd_pcm_period_elapsed(substream);
 		break;
 	case ASM_CLIENT_EVENT_DATA_READ_DONE:
+		if (!prtd->j716f_capture) {
+			snd_pcm_period_elapsed(substream);
+			if (prtd->state == Q6ASM_STREAM_RUNNING)
+				q6asm_read(prtd->audio_client, prtd->stream_id);
+			break;
+		}
+		spin_lock_irqsave(&prtd->lock, flags);
+		if (prtd->capture_inflight)
+			prtd->capture_inflight--;
+		spin_unlock_irqrestore(&prtd->lock, flags);
 		snd_pcm_period_elapsed(substream);
-		if (prtd->state == Q6ASM_STREAM_RUNNING)
-			q6asm_read(prtd->audio_client, prtd->stream_id);
-
+		j716f_capture_queue_reads(prtd);
 		break;
 	default:
 		break;
 	}
+}
+
+/*
+ * Lenovo J716F: the ADSP only accepts MAP addresses inside the LPASS audio
+ * window 0x10000000-0x1fffffff, and the 29-bit DMA mask set in
+ * q6asm_dai_pcm_new() keeps the IOVA there.  A buffer below the window is
+ * refused here rather than handed to the DSP.
+ *
+ * The address keeps the upstream encoding (IOVA | sid << 32).  This firmware
+ * has been seen refusing that encoding with a DSP error and accepting the
+ * plain IOVA on the second attempt, so the retry is board scoped, only made
+ * when the first address actually carries the sid bits, and only for a DSP
+ * refusal.  q6asm_apr_send_session_pkt() reports every non-zero DSP status as
+ * -EINVAL and has no other -EINVAL path in a MAP, so that is the refusal case
+ * here.  A timeout is not retried: the DSP may have executed the MAP without
+ * the host seeing the answer.
+ */
+static int q6asm_dai_map_regions(struct device *dev,
+				 struct snd_pcm_substream *substream,
+				 struct q6asm_dai_rtd *prtd)
+{
+	dma_addr_t dma_addr = substream->dma_buffer.addr;
+	size_t period_sz = prtd->pcm_size / prtd->periods;
+	int ret;
+
+	if (!of_machine_is_compatible("lenovo,j716f"))
+		return q6asm_map_memory_regions(substream->stream,
+						prtd->audio_client, prtd->phys,
+						period_sz, prtd->periods);
+
+	if (lower_32_bits(dma_addr) < 0x10000000) {
+		dev_err(dev,
+			"J716F: DMA address %#x is below the LPASS audio window 0x10000000, refusing to map\n",
+			lower_32_bits(dma_addr));
+		return -ERANGE;
+	}
+
+	ret = q6asm_map_memory_regions(substream->stream, prtd->audio_client,
+				       prtd->phys, period_sz, prtd->periods);
+	if (ret != -EINVAL || !upper_32_bits(prtd->phys))
+		return ret;
+
+	dev_err(dev, "J716F: MAP with the sid in the address was refused, retrying with the plain IOVA\n");
+	prtd->phys = lower_32_bits(dma_addr);
+
+	return q6asm_map_memory_regions(substream->stream, prtd->audio_client,
+					prtd->phys, period_sz, prtd->periods);
 }
 
 static int q6asm_dai_prepare(struct snd_soc_component *component,
@@ -209,6 +308,7 @@ static int q6asm_dai_prepare(struct snd_soc_component *component,
 	struct q6asm_dai_rtd *prtd = runtime->private_data;
 	struct q6asm_dai_data *pdata;
 	struct device *dev = component->dev;
+	unsigned long flags;
 	int ret, i;
 
 	pdata = snd_soc_component_get_drvdata(component);
@@ -219,6 +319,13 @@ static int q6asm_dai_prepare(struct snd_soc_component *component,
 		dev_err(dev, "%s: private data null or audio client freed\n",
 			__func__);
 		return -EINVAL;
+	}
+
+	if (prtd->j716f_capture) {
+		spin_lock_irqsave(&prtd->lock, flags);
+		prtd->capture_enabled = false;
+		prtd->capture_waiting_run = true;
+		spin_unlock_irqrestore(&prtd->lock, flags);
 	}
 
 	prtd->pcm_count = snd_pcm_lib_period_bytes(substream);
@@ -246,10 +353,7 @@ static int q6asm_dai_prepare(struct snd_soc_component *component,
 	/* ALSA resets appl_ptr for every prepare, including xrun recovery. */
 	prtd->queue_ptr = 0;
 
-	ret = q6asm_map_memory_regions(substream->stream, prtd->audio_client,
-				       prtd->phys,
-				       (prtd->pcm_size / prtd->periods),
-				       prtd->periods);
+	ret = q6asm_dai_map_regions(dev, substream, prtd);
 
 	if (ret < 0) {
 		dev_err(dev, "Audio Start: Buffer Allocation failed rc = %d\n",
@@ -292,9 +396,16 @@ static int q6asm_dai_prepare(struct snd_soc_component *component,
 							   runtime->channels,
 							   prtd->bits_per_sample);
 
-		/* Queue the buffers */
-		for (i = 0; i < runtime->periods; i++)
-			q6asm_read(prtd->audio_client, prtd->stream_id);
+		if (prtd->j716f_capture) {
+			/* Filled from RUN_DONE, the ADSP refuses READ before RUN. */
+			spin_lock_irqsave(&prtd->lock, flags);
+			prtd->capture_inflight = 0;
+			spin_unlock_irqrestore(&prtd->lock, flags);
+		} else {
+			/* Queue the buffers */
+			for (i = 0; i < runtime->periods; i++)
+				q6asm_read(prtd->audio_client, prtd->stream_id);
+		}
 
 	}
 	if (ret < 0)
@@ -341,26 +452,50 @@ static int q6asm_dai_trigger(struct snd_soc_component *component,
 	int ret = 0;
 	struct snd_pcm_runtime *runtime = substream->runtime;
 	struct q6asm_dai_rtd *prtd = runtime->private_data;
+	unsigned long flags;
 
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
 	case SNDRV_PCM_TRIGGER_RESUME:
 	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
+		if (prtd->j716f_capture) {
+			/* Reads are released by RUN_DONE, never before it. */
+			spin_lock_irqsave(&prtd->lock, flags);
+			prtd->capture_enabled = true;
+			prtd->capture_waiting_run = true;
+			spin_unlock_irqrestore(&prtd->lock, flags);
+		}
 		ret = q6asm_run_nowait(prtd->audio_client, prtd->stream_id,
 				       0, 0, 0);
 		break;
 	case SNDRV_PCM_TRIGGER_STOP:
+		if (prtd->j716f_capture) {
+			spin_lock_irqsave(&prtd->lock, flags);
+			prtd->capture_enabled = false;
+			spin_unlock_irqrestore(&prtd->lock, flags);
+		}
 		ret = q6asm_cmd_nowait(prtd->audio_client, prtd->stream_id,
 				       CMD_EOS);
 		break;
 	case SNDRV_PCM_TRIGGER_SUSPEND:
 	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
+		if (prtd->j716f_capture) {
+			spin_lock_irqsave(&prtd->lock, flags);
+			prtd->capture_enabled = false;
+			spin_unlock_irqrestore(&prtd->lock, flags);
+		}
 		ret = q6asm_cmd_nowait(prtd->audio_client, prtd->stream_id,
 				       CMD_PAUSE);
 		break;
 	default:
 		ret = -EINVAL;
 		break;
+	}
+
+	if (prtd->j716f_capture && ret < 0) {
+		spin_lock_irqsave(&prtd->lock, flags);
+		prtd->capture_enabled = false;
+		spin_unlock_irqrestore(&prtd->lock, flags);
 	}
 
 	return ret;
@@ -375,6 +510,7 @@ static int q6asm_dai_open(struct snd_soc_component *component,
 	struct q6asm_dai_rtd *prtd;
 	struct q6asm_dai_data *pdata;
 	struct device *dev = component->dev;
+	bool j716f = of_machine_is_compatible("lenovo,j716f");
 	int ret = 0;
 	int stream_id;
 
@@ -390,6 +526,10 @@ static int q6asm_dai_open(struct snd_soc_component *component,
 	if (prtd == NULL)
 		return -ENOMEM;
 
+	/* The PCM path guards the capture queue with this lock. */
+	spin_lock_init(&prtd->lock);
+	prtd->j716f_capture = j716f &&
+			      substream->stream == SNDRV_PCM_STREAM_CAPTURE;
 	prtd->substream = substream;
 	prtd->audio_client = q6asm_audio_client_alloc(dev,
 				(q6asm_cb)event_handler, prtd, stream_id,
@@ -449,6 +589,17 @@ static int q6asm_dai_open(struct snd_soc_component *component,
 		runtime->dma_bytes = q6asm_dai_hardware_capture.buffer_bytes_max;
 	}
 
+	/*
+	 * Lenovo J716F: the CS35L41 ASP path is wired for 16-bit slots, and
+	 * q6asm encodes linear PCM as MULTI_CHANNEL_PCM_V2, which carries no
+	 * sample word size, so the DSP reads 32-bit words and S24_LE comes out
+	 * about 48 dB low (M43 measurement).  Do not advertise a format the
+	 * board cannot reproduce; the upstream V4/V5 media format with an
+	 * explicit word size would remove this.
+	 */
+	if (j716f)
+		runtime->hw.formats = SNDRV_PCM_FMTBIT_S16_LE;
+
 	if (pdata->sid < 0)
 		prtd->phys = substream->dma_buffer.addr;
 	else
@@ -463,6 +614,13 @@ static int q6asm_dai_close(struct snd_soc_component *component,
 	struct snd_pcm_runtime *runtime = substream->runtime;
 	struct snd_soc_pcm_runtime *soc_prtd = snd_soc_substream_to_rtd(substream);
 	struct q6asm_dai_rtd *prtd = runtime->private_data;
+	unsigned long flags;
+
+	if (prtd->j716f_capture) {
+		spin_lock_irqsave(&prtd->lock, flags);
+		prtd->capture_enabled = false;
+		spin_unlock_irqrestore(&prtd->lock, flags);
+	}
 
 	if (prtd->audio_client) {
 		if (prtd->state == Q6ASM_STREAM_RUNNING) {
@@ -1198,6 +1356,25 @@ static int q6asm_dai_pcm_new(struct snd_soc_component *component,
 {
 	struct snd_pcm *pcm = rtd->pcm;
 	size_t size = q6asm_dai_hardware_playback.buffer_bytes_max;
+	int ret;
+
+	/*
+	 * Lenovo J716F: the ADSP maps audio buffers from the LPASS window
+	 * 0x10000000-0x1fffffff, the same window the vendor kernel gives its
+	 * msm-audio-ion node.  A 29-bit mask keeps the IOVA of the fixed PCM
+	 * buffer inside it; refusing registration is better than handing the
+	 * DSP an address its firmware cannot map.
+	 */
+	if (of_machine_is_compatible("lenovo,j716f")) {
+		ret = dma_set_mask_and_coherent(component->dev,
+						DMA_BIT_MASK(29));
+		if (ret < 0) {
+			dev_err(component->dev,
+				"J716F: cannot limit the audio DMA mask to the LPASS window: %d\n",
+				ret);
+			return ret;
+		}
+	}
 
 	return snd_pcm_set_fixed_buffer_all(pcm, SNDRV_DMA_TYPE_DEV,
 					    component->dev, size);
