@@ -614,7 +614,9 @@ static int q6asm_dai_close(struct snd_soc_component *component,
 	struct snd_pcm_runtime *runtime = substream->runtime;
 	struct snd_soc_pcm_runtime *soc_prtd = snd_soc_substream_to_rtd(substream);
 	struct q6asm_dai_rtd *prtd = runtime->private_data;
+	bool teardown_failed = false;
 	unsigned long flags;
+	int ret;
 
 	if (prtd->j716f_capture) {
 		spin_lock_irqsave(&prtd->lock, flags);
@@ -626,13 +628,30 @@ static int q6asm_dai_close(struct snd_soc_component *component,
 		/* No event may reach prtd once it is freed below. */
 		q6asm_audio_client_clear_callback(prtd->audio_client);
 		if (prtd->state == Q6ASM_STREAM_RUNNING) {
-			q6asm_cmd(prtd->audio_client, prtd->stream_id,
-				  CMD_CLOSE);
-			q6asm_unmap_memory_regions(substream->stream,
-					   prtd->audio_client);
+			ret = q6asm_cmd(prtd->audio_client, prtd->stream_id,
+					CMD_CLOSE);
+			if (ret < 0)
+				teardown_failed = true;
+			ret = q6asm_unmap_memory_regions(substream->stream,
+							 prtd->audio_client);
+			if (ret < 0)
+				teardown_failed = true;
 		}
-		q6asm_audio_client_free(prtd->audio_client);
-		prtd->audio_client = NULL;
+		if (teardown_failed) {
+			/*
+			 * The ADSP may still own the stream or the mapping.
+			 * Releasing the client would free the port table and
+			 * return the session id while the DSP keeps using them,
+			 * so leak it instead of pulling the ground out.
+			 */
+			dev_err(component->dev,
+				"J716F: stream %d teardown unconfirmed, keeping the audio client\n",
+				prtd->stream_id);
+			prtd->audio_client = NULL;
+		} else {
+			q6asm_audio_client_free(prtd->audio_client);
+			prtd->audio_client = NULL;
+		}
 	}
 	q6routing_stream_close(soc_prtd->dai_link->id,
 						substream->stream);
