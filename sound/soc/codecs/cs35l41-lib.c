@@ -1276,18 +1276,6 @@ int cs35l41_global_enable(struct device *dev, struct regmap *regmap, enum cs35l4
 		regmap_write(regmap, CS35L41_IRQ1_STATUS1, pup_pdn_mask);
 		break;
 	case CS35L41_INT_BOOST:
-		/*
-		 * Lenovo J716F: run the vendor driver's pre-enable sequence before
-		 * GLOBAL_EN: clear AMP_OUT_MUTE and unmask the IRQ1 power-up status
-		 * bit. Kept as a board delta until r02 evaluates it on its own.
-		 */
-		if (enable) {
-			regmap_update_bits(regmap, CS35L41_AMP_OUT_MUTE,
-					   CS35L41_AMP_OUT_MUTE_MASK, 0);
-			regmap_update_bits(regmap, CS35L41_IRQ1_MASK1,
-					   CS35L41_IRQ1_MASK1_PUP_UNMASK, 0);
-		}
-
 		ret = regmap_update_bits(regmap, CS35L41_PWR_CTRL1, CS35L41_GLOBAL_EN_MASK,
 					 enable << CS35L41_GLOBAL_EN_SHIFT);
 		if (ret) {
