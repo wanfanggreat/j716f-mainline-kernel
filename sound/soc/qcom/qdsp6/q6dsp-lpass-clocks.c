@@ -22,6 +22,7 @@ struct q6dsp_clk {
 	int attributes;
 	int rate;
 	uint32_t handle;
+	bool voted;
 	struct clk_hw hw;
 };
 
@@ -91,38 +92,44 @@ static int clk_vote_q6dsp_block(struct clk_hw *hw)
 
 	ret = cc->desc->lpass_vote_clk(clk->dev, clk->q6dsp_clk_id,
 				       clk_hw_get_name(&clk->hw), &clk->handle);
-
 	/*
-	 * Lenovo J716F: the ADSP firmware on this board answers
-	 * AFE_CMD_REMOTE_LPASS_CORE_HW_VOTE_REQUEST (0x100f4) with
-	 * ADSP_EUNSUPPORTED / -EINVAL:
+	 * Lenovo J716F: the ADSP firmware on this board does not implement the
+	 * LPASS core hardware vote:
 	 *
 	 *   qcom-q6afe aprsvc:service:4:4: cmd = 0x100f4 returned error = 0x16
 	 *   qcom-q6afe aprsvc:service:4:4: Unknown cmd 0x100f4
 	 *   qcom-q6afe aprsvc:service:4:4: AFE failed to vote (3)
 	 *
-	 * The vote only tells the DSP that a host client wants the LPASS core
-	 * hardware block kept powered. A rejected vote is not fatal for a
-	 * platform whose LPASS is already clocked and powered by the
-	 * bootloader, but returning the error here makes clk_prepare() fail,
-	 * which in turn blocks LPASS_HW_MACRO / LPASS_HW_DCODEC from ever
-	 * being enabled - and with those gates closed the macro register
-	 * writes land in a block that is not running, so the DMIC clock
-	 * generators never produce a clock and every capture path returns
-	 * silence.
+	 * It only sends a basic response to 0x100f4
+	 * (AFE_CMD_REMOTE_LPASS_CORE_HW_VOTE_REQUEST) with status 0x16 and
+	 * never the dedicated 0x100f5
+	 * (AFE_CMD_RSP_REMOTE_LPASS_CORE_HW_VOTE_REQUEST) reply, so
+	 * afe_apr_send_pkt() waits out TIMEOUT_MS (3 s) and returns -ETIMEDOUT
+	 * ("Failed to prepare clk ...: -110"). -EINVAL covers a firmware that
+	 * does answer 0x100f5 with a non-zero status, and also any
+	 * apr_send_pkt() transmit failure, which q6afe.c rewrites to -EINVAL -
+	 * so this tolerance hides transient APR send failures on this board
+	 * too. The dev_warn_once() below keeps both cases visible in the log.
 	 *
-	 * Log it once and carry on: the enable side (clk_vote_q6dsp_block's
-	 * counterpart) still programs the block, and unvote tolerates a NULL
-	 * handle.
+	 * The vote only asks the DSP to keep the LPASS core hardware block
+	 * powered, and on this board it is already up. Failing clk_prepare()
+	 * here instead keeps the LPASS_HW_MACRO / LPASS_HW_DCODEC gates closed,
+	 * the macro register writes land in a block that is not running and the
+	 * DMIC clock generators never produce a clock, so every capture path
+	 * stays silent. Tolerate the known firmware errors on this machine
+	 * only; other platforms keep the upstream error handling.
 	 */
-	if (ret) {
-		dev_dbg(clk->dev,
-			"J716F: LPASS core vote for %s failed (%d), continuing\n",
-			clk_hw_get_name(&clk->hw), ret);
+	if (ret && of_machine_is_compatible("lenovo,j716f") &&
+	    (ret == -ETIMEDOUT || ret == -EINVAL)) {
+		dev_warn_once(clk->dev,
+			      "J716F: %s: vote error %d ignored\n",
+			      clk_hw_get_name(&clk->hw), ret);
 		return 0;
 	}
 
-	return 0;
+	clk->voted = !ret;
+
+	return ret;
 }
 
 static void clk_unvote_q6dsp_block(struct clk_hw *hw)
@@ -131,16 +138,16 @@ static void clk_unvote_q6dsp_block(struct clk_hw *hw)
 	struct q6dsp_cc *cc = dev_get_drvdata(clk->dev);
 
 	/*
-	 * Lenovo J716F: the ADSP rejects the LPASS core vote (see
-	 * clk_vote_q6dsp_block) and q6afe never fills in a client handle,
-	 * so clk->handle stays 0.  Sending the matching devote anyway only
-	 * produces "cmd = 0x100f6 returned error = 0x1" plus "Unknown cmd"
-	 * on every audio clock teardown.  There is nothing to unvote when
-	 * the vote was refused, so skip it.
+	 * Track the vote per clock instead of testing clk->handle: q6prm does
+	 * not report a client handle at all, and q6afe only fills it in with
+	 * the vote response fix, so a handle test silently skipped devote on
+	 * every platform and leaked the LPASS core hardware vote there.
 	 */
-	if (clk->handle)
-		cc->desc->lpass_unvote_clk(clk->dev, clk->q6dsp_clk_id,
-					   clk->handle);
+	if (!clk->voted)
+		return;
+
+	cc->desc->lpass_unvote_clk(clk->dev, clk->q6dsp_clk_id, clk->handle);
+	clk->voted = false;
 }
 
 static const struct clk_ops clk_vote_q6dsp_ops = {
