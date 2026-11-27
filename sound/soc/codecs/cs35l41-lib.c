@@ -1277,14 +1277,9 @@ int cs35l41_global_enable(struct device *dev, struct regmap *regmap, enum cs35l4
 		break;
 	case CS35L41_INT_BOOST:
 		/*
-		 * Lenovo J716F: follow the vendor driver's enable sequence.
-		 *
-		 * The vendor does NOT wait for PUP_DONE here. It sets GLOBAL_EN,
-		 * clears the AMP_OUT_MUTE bit and unmasks the IRQ1_MASK1 bit that
-		 * reports the power-up event, then returns. Polling PUP_DONE the
-		 * way the upstream driver does makes every playback fail with
-		 * -110 on this board, even though the amplifier powers up fine
-		 * and audio plays.
+		 * Lenovo J716F: run the vendor driver's pre-enable sequence before
+		 * GLOBAL_EN: clear AMP_OUT_MUTE and unmask the IRQ1 power-up status
+		 * bit. Kept as a board delta until r02 evaluates it on its own.
 		 */
 		if (enable) {
 			regmap_update_bits(regmap, CS35L41_AMP_OUT_MUTE,
@@ -1300,21 +1295,11 @@ int cs35l41_global_enable(struct device *dev, struct regmap *regmap, enum cs35l4
 			return ret;
 		}
 
-		/*
-		 * Lenovo J716F: this amplifier never raises PUP_DONE with the
-		 * internal-boost configuration, even though it powers up and
-		 * plays audio (the vendor driver does not poll here at all).
-		 * Treat the timeout as informational; a genuine power-up
-		 * failure still results in silence.
-		 */
 		ret = regmap_read_poll_timeout(regmap, CS35L41_IRQ1_STATUS1,
 					int_status, int_status & pup_pdn_mask,
 					1000, 100000);
-		if (ret) {
-			dev_warn(dev, "PUP_DONE not seen (%d), continuing\n", ret);
-			/* Keep the DAPM event successful: the amp is up. */
-			ret = 0;
-		}
+		if (ret)
+			dev_err(dev, "Enable(%d) failed: %d\n", enable, ret);
 
 		/* Clear PUP/PDN status */
 		regmap_write(regmap, CS35L41_IRQ1_STATUS1, pup_pdn_mask);
