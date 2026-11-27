@@ -5,7 +5,6 @@
 #include <linux/init.h>
 #include <linux/clk.h>
 #include <linux/io.h>
-#include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <linux/pm_clock.h>
 #include <linux/pm_runtime.h>
@@ -864,16 +863,7 @@ static int tx_macro_put_dec_enum(struct snd_kcontrol *kcontrol,
 	}
 
 	if (val != 0) {
-		/*
-		 * Lenovo J716F: widget->shift is the DAPM shift of the MUX
-		 * widget, which is 4 for the "TX DMIC MUXn" widgets in this
-		 * driver - but the vendor's check used a different field and
-		 * mainline ends up taking the SWR branch (bit7 cleared) here,
-		 * so the DMIC clock was never enabled. These MUXes only ever
-		 * select digital microphones on this board, so always take the
-		 * MSM DMIC path.
-		 */
-		if (true) { /* MSM DMIC */
+		if (widget->shift) { /* MSM DMIC */
 			/*
 			 * Lenovo J716F: tx_macro_enable_dec() only powers the
 			 * DMIC clock when the low nibble of
@@ -961,7 +951,7 @@ static int tx_macro_enable_dec(struct snd_soc_dapm_widget *w,
 	u8 hpf_cut_off_freq;
 	int hpf_delay = TX_MACRO_DMIC_HPF_DELAY_MS;
 	int unmute_delay = TX_MACRO_DMIC_UNMUTE_DELAY_MS;
-	u16 adc_mux_reg, adc_reg, adc_n, dmic;
+	u16 adc_reg, adc_n, dmic;
 	u16 dmic_clk_reg;
 	struct tx_macro *tx = snd_soc_component_get_drvdata(component);
 
@@ -984,7 +974,6 @@ static int tx_macro_enable_dec(struct snd_soc_dapm_widget *w,
 		 * selects a digital microphone, regardless of which of the two
 		 * DMIC sources is selected.
 		 */
-		adc_mux_reg = CDC_TX_INP_MUX_ADC_MUXn_CFG1(decimator);
 		adc_reg = CDC_TX_INP_MUX_ADC_MUXn_CFG0(decimator);
 		adc_n = snd_soc_component_read(component, adc_reg) &
 			CDC_TX_MACRO_SWR_MIC_MUX_SEL_MASK;
@@ -2367,7 +2356,6 @@ static int tx_macro_probe(struct platform_device *pdev)
 	struct tx_macro *tx;
 	void __iomem *base;
 	int ret, reg;
-
 
 	tx = devm_kzalloc(dev, sizeof(*tx), GFP_KERNEL);
 	if (!tx)
