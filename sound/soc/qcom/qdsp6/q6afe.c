@@ -1699,15 +1699,8 @@ void q6afe_cdc_dma_port_prepare(struct q6afe_port *port,
 	dma_cfg->bit_width = cfg->bit_width;
 	dma_cfg->data_format = cfg->data_format;
 	dma_cfg->num_channels = cfg->num_channels;
-	/*
-	 * Lenovo J716F: the original code only assigned the computed default
-	 * when cfg->active_channels_mask was 0 and never copied a non-zero
-	 * mask, so setting an explicit channel map via
-	 * q6dma_set_channel_map() left the port with 0 active channels and
-	 * the ADSP rejected the config. Copy the mask either way.
-	 */
-	dma_cfg->active_channels_mask = cfg->active_channels_mask ?
-		cfg->active_channels_mask : (1 << cfg->num_channels) - 1;
+	if (!cfg->active_channels_mask)
+		dma_cfg->active_channels_mask = (1 << cfg->num_channels) - 1;
 }
 EXPORT_SYMBOL_GPL(q6afe_cdc_dma_port_prepare);
 /**
