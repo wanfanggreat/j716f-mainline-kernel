@@ -1028,7 +1028,6 @@ static int q6afe_callback(struct apr_device *adev, const struct apr_resp_pkt *da
 		case AFE_PORT_CMD_DEVICE_STOP:
 		case AFE_PORT_CMD_DEVICE_START:
 		case AFE_SVC_CMD_SET_PARAM:
-		case 0x000100FA: /* AFE_PORT_CMD_SET_PARAM_V3 (vendor) */
 			port = q6afe_find_port(afe, hdr->token);
 			if (port) {
 				port->result = *res;
@@ -1709,10 +1708,6 @@ void q6afe_cdc_dma_port_prepare(struct q6afe_port *port,
 	 */
 	dma_cfg->active_channels_mask = cfg->active_channels_mask ?
 		cfg->active_channels_mask : (1 << cfg->num_channels) - 1;
-
-	pr_debug("J716F-AFE: dma_cfg rate=%u width=%u fmt=%u ch=%u mask=%#x\n",
-		dma_cfg->sample_rate, dma_cfg->bit_width, dma_cfg->data_format,
-		dma_cfg->num_channels, dma_cfg->active_channels_mask);
 }
 EXPORT_SYMBOL_GPL(q6afe_cdc_dma_port_prepare);
 /**
@@ -1774,9 +1769,6 @@ int q6afe_port_start(struct q6afe_port *port)
 	if (ret)
 		dev_err(afe->dev, "AFE enable for port 0x%x failed %d\n",
 			port_id, ret);
-	else
-		pr_debug("J716F-AFE: port 0x%x START ok (cfg_type=%#x)\n",
-			port_id, param_id);
 
 	return ret;
 }
