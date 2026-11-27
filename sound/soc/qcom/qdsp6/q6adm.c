@@ -1012,7 +1012,7 @@ static int q6adm_probe(struct apr_device *adev)
 	 * firmware that does not answer CLOSE into a global stall).
 	 */
 	adm->close_wq = devm_alloc_workqueue(dev, "q6adm_close",
-					     WQ_MEM_RECLAIM, 0);
+					     WQ_MEM_RECLAIM | WQ_UNBOUND, 0);
 	if (!adm->close_wq)
 		return -ENOMEM;
 
