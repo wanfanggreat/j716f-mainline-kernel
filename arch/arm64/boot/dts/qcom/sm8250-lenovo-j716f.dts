@@ -911,20 +911,6 @@
 	/* FSA4480 USB audio switch @ 43 */
 	/* RTC6226 FM receiver @ 64 */
 	/* HL6111R wireless charging IC @ 25 */
-
-	/*
-	 * Four-microphone ADC.  Its serial output feeds the primary MI2S
-	 * capture direction, so data0/data1 must stay inputs on the SoC.
-	 */
-	es7210: audio-adc@40 {
-		compatible = "everest,es7210";
-		reg = <0x40>;
-
-		vd-supply = <&vreg_l16a_3p3>;
-		vp-supply = <&vreg_l8c_1p8>;
-
-		#sound-dai-cells = <0>;
-	};
 };
 
 &pcie0 {
@@ -1490,22 +1476,6 @@
 	};
 };
 
-/*
- * The primary MI2S data lines are driven by the ES7210 in the capture
- * direction.  sm8250.dtsi marks data0/data1 output-high, which makes the
- * SoC fight the codec and turns every recording into silence; delete the
- * property so the pads stay inputs.
- */
-&pri_mi2s_active {
-	data0-pins {
-		/delete-property/ output-high;
-	};
-
-	data1-pins {
-		/delete-property/ output-high;
-	};
-};
-
 /* DMIC pad groups on the LPASS LPI pin controller. */
 &lpass_tlmm {
 	dmic1_active: dmic1-active-state {
@@ -1602,8 +1572,6 @@
 		"MM_DL2", "MultiMedia2 Playback",
 		"MultiMedia3 Capture", "MM_UL3",
 		"MultiMedia1 Capture", "MM_UL1",
-		"PRI_MI2S_TX", "Capture",
-		"Primary MI2S Capture", "Capture",
 		"VA DMIC0", "vdd-micb",
 		"VA DMIC1", "vdd-micb",
 		"VA DMIC2", "vdd-micb",
@@ -1673,21 +1641,6 @@
 
 		codec {
 			sound-dai = <&vamacro 0>;
-		};
-	};
-
-	pri-mi2s-cap-dai-link {
-		link-name = "Primary MI2S Capture";
-		cpu {
-			sound-dai = <&q6afedai PRIMARY_MI2S_TX>;
-		};
-
-		platform {
-			sound-dai = <&q6routing>;
-		};
-
-		codec {
-			sound-dai = <&es7210>;
 		};
 	};
 };
