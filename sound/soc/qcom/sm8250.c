@@ -255,6 +255,19 @@ static int sm8250_snd_startup(struct snd_pcm_substream *substream)
 	switch (cpu_dai->id) {
 	case PRIMARY_MI2S_RX:
 		codec_dai_fmt |= SND_SOC_DAIFMT_NB_NF | SND_SOC_DAIFMT_I2S;
+		/*
+		 * Upstream hands the format to the first codec on the link only and
+		 * leaves its clock alone; every other board keeps exactly that.
+		 */
+		if (!of_machine_is_compatible("lenovo,j716f")) {
+			snd_soc_dai_set_sysclk(cpu_dai,
+				Q6AFE_LPASS_CLK_ID_PRI_MI2S_IBIT,
+				MI2S_BCLK_RATE, SNDRV_PCM_STREAM_PLAYBACK);
+			snd_soc_dai_set_fmt(cpu_dai, fmt);
+			snd_soc_dai_set_fmt(codec_dai, codec_dai_fmt);
+			break;
+		}
+
 		ret = snd_soc_dai_set_sysclk(cpu_dai,
 			Q6AFE_LPASS_CLK_ID_PRI_MI2S_IBIT,
 			MI2S_BCLK_RATE, SNDRV_PCM_STREAM_PLAYBACK);
