@@ -890,6 +890,9 @@ struct audio_client *q6asm_audio_client_alloc(struct device *dev, q6asm_cb cb,
 	if (!ac)
 		return ERR_PTR(-ENOMEM);
 
+	/* A response may take this lock as soon as the session is listed. */
+	mutex_init(&ac->cb_lock);
+
 	spin_lock_irqsave(&a->slock, flags);
 	a->session[session_id + 1] = ac;
 	spin_unlock_irqrestore(&a->slock, flags);
@@ -905,7 +908,6 @@ struct audio_client *q6asm_audio_client_alloc(struct device *dev, q6asm_cb cb,
 
 	init_waitqueue_head(&ac->cmd_wait);
 	mutex_init(&ac->cmd_lock);
-	mutex_init(&ac->cb_lock);
 	spin_lock_init(&ac->lock);
 
 	return ac;
