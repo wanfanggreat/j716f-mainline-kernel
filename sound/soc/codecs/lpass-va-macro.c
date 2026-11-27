@@ -20,11 +20,6 @@
 
 #include "lpass-macro-common.h"
 
-/* Optional register inspection must not add MMIO reads to normal capture. */
-static bool register_debug;
-module_param(register_debug, bool, 0600);
-MODULE_PARM_DESC(register_debug, "Inspect DMIC registers (disabled by default)");
-
 /* VA macro registers */
 #define CDC_VA_CLK_RST_CTRL_MCLK_CONTROL	(0x0000)
 #define CDC_VA_MCLK_CONTROL_EN			BIT(0)
@@ -789,29 +784,8 @@ static int va_dmic_clk_enable(struct snd_soc_component *component,
  * feeds them) live in the VA macro block, not in the TX macro. The TX macro's
  * DMIC capture path therefore has to power this block explicitly, otherwise
  * the DMIC clock never starts and the DSP reports EOS with no data.
- *
- * Called by lpass-tx-macro.c with the DAPM component of the VA macro.
  */
-/* Lenovo J716F: the TX macro needs to start our DMIC clocks. */
-static struct snd_soc_component *va_macro_component;
 static struct device *va_macro_dev;
-
-struct snd_soc_component *va_macro_get_component(void)
-{
-	/*
-	 * The TX macro's DAPM events can run before our ASoC component probe
-	 * (both macros are part of the same card). Fall back to looking the
-	 * component up from the platform device we saved during probe.
-	 */
-	if (!va_macro_component && va_macro_dev)
-		va_macro_component =
-			snd_soc_lookup_component_nolocked(va_macro_dev,
-							  "va_macro");
-
-	return va_macro_component;
-}
-EXPORT_SYMBOL_GPL(va_macro_get_component);
-
 
 /*
  * Lenovo J716F: power the microphone bias rail.
@@ -1009,17 +983,6 @@ int va_macro_set_dmic_clk_early(u32 dmic, bool enable)
 
 		/* make sure the clock resource bits survive any cache sync */
 		va_clk_rsc_fs_gen_request(va, true);
-		if (READ_ONCE(register_debug)) {
-			unsigned int v080 = 0, v084 = 0, v094 = 0;
-
-			regmap_read(va->regmap, CDC_VA_TOP_CSR_TOP_CFG0, &v080);
-			regmap_read(va->regmap, dmic_clk_reg, &v084);
-			regmap_read(va->regmap, CDC_VA_TOP_CSR_DMIC_CFG, &v094);
-			dev_info(va->dev,
-				 "J716F-VA: dmic%d reg=%#x top_cfg0=%#x dmic_ctl=%#x dmic_cfg=%#x div=%u\n",
-				 dmic, dmic_clk_reg, v080, v084, v094,
-				 va->dmic_clk_div);
-		}
 	} else {
 		regmap_update_bits(va->regmap, dmic_clk_reg,
 				   CDC_VA_DMIC_EN_MASK, 0);
@@ -1035,24 +998,12 @@ static int va_macro_enable_dmic(struct snd_soc_dapm_widget *w,
 	struct snd_soc_component *comp = snd_soc_dapm_to_component(w->dapm);
 	unsigned int dmic = w->shift;
 
-	pr_debug("J716F-VA: enable_dmic dmic=%u event=%d\n", dmic, event);
-
 	switch (event) {
 	case SND_SOC_DAPM_PRE_PMU: {
 		int __rc = va_dmic_clk_enable(comp, dmic, true);
 
 		if (__rc)
 			dev_warn(comp->dev, "J716F-VA: clk_enable failed %d\n", __rc);
-		if (READ_ONCE(register_debug)) {
-			unsigned int __ctl, __cfg;
-
-			__cfg = snd_soc_component_read(comp, CDC_VA_TOP_CSR_DMIC_CFG);
-			__ctl = snd_soc_component_read(comp,
-				CDC_VA_TOP_CSR_DMIC0_CTL + (dmic / 2) * 4);
-			pr_info("J716F-VA: clk_enable rc=%d DMIC_CFG=%#x CTL(0x%x)=%#x\n",
-				__rc, __cfg, CDC_VA_TOP_CSR_DMIC0_CTL + (dmic / 2) * 4,
-				__ctl);
-		}
 		break;
 	}
 	case SND_SOC_DAPM_POST_PMD:
@@ -1655,11 +1606,6 @@ static int va_macro_component_probe(struct snd_soc_component *component)
 
 	snd_soc_component_init_regmap(component, va->regmap);
 
-	/* Lenovo J716F: publish ourselves so the TX macro can start our
-	 * DMIC clock generators (see va_macro_set_dmic_clk()).
-	 */
-	va_macro_component = component;
-
 	return 0;
 }
 
@@ -1902,8 +1848,8 @@ static int va_macro_probe(struct platform_device *pdev)
 	 */
 	va->mclk2x = devm_clk_get_optional(dev, "mclk2x");
 	if (IS_ERR(va->mclk2x)) {
-		dev_info(dev, "J716F-VA: no mclk2x clock (%ld)\n",
-			 PTR_ERR(va->mclk2x));
+		dev_dbg(dev, "J716F-VA: no mclk2x clock (%ld)\n",
+			PTR_ERR(va->mclk2x));
 		va->mclk2x = NULL;
 	} else if (va->mclk2x) {
 		dev_dbg(dev, "J716F-VA: got mclk2x clock\n");
@@ -1940,8 +1886,8 @@ static int va_macro_probe(struct platform_device *pdev)
 		if (PTR_ERR(va->micb_reg) == -ENODEV) {
 			va->micb_reg = NULL;
 		} else {
-			dev_info(dev, "J716F-VA: no va-vdd-micb supply (%ld)\n",
-				 PTR_ERR(va->micb_reg));
+			dev_dbg(dev, "J716F-VA: no va-vdd-micb supply (%ld)\n",
+				PTR_ERR(va->micb_reg));
 			va->micb_reg = NULL;
 		}
 	}
