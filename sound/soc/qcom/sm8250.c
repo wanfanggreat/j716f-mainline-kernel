@@ -244,9 +244,6 @@ static int sm8250_be_hw_params_fixup(struct snd_soc_pcm_runtime *rtd,
 			dev_warn(rtd->card->dev,
 				 "J716F-CHMAP: dai_id=%d set_channel_map rc=%d\n",
 				 cpu_dai->id, __r);
-		else
-			pr_debug("J716F-CHMAP: dai_id=%d set_channel_map rc=%d\n",
-				 cpu_dai->id, __r);
 	}
 
 	return 0;
@@ -262,8 +259,6 @@ static int sm8250_snd_startup(struct snd_pcm_substream *substream)
 	struct sm8250_snd_data *data = snd_soc_card_get_drvdata(rtd->card);
 	bool dmic_ref = false;
 	int i, ret;
-
-	pr_debug("J716F-CLK: sm8250_snd_startup called\n");
 
 	/*
 	 * Lenovo J716F: power the digital microphones for the capture
@@ -287,8 +282,6 @@ static int sm8250_snd_startup(struct snd_pcm_substream *substream)
 			gpiod_set_value_cansleep(data->dmic_sel_gpio, 1);
 		sm8250_dmic_get(data);
 		dmic_ref = true;
-		pr_debug("J716F-DMIC: power on (dai id %d, users %d)\n",
-			 cpu_dai->id, data->dmic_users);
 	}
 
 	switch (cpu_dai->id) {
@@ -328,8 +321,6 @@ static int sm8250_snd_startup(struct snd_pcm_substream *substream)
 	 * backend never gets its bit clock configured and recording fails.
 	 */
 	case PRIMARY_MI2S_TX:
-		pr_debug("J716F-CLK: PRIMARY_MI2S_TX startup, setting IBIT %u\n",
-			MI2S_BCLK_RATE);
 		codec_dai_fmt |= SND_SOC_DAIFMT_NB_NF | SND_SOC_DAIFMT_I2S;
 		/*
 		 * Lenovo J716F: the ES7210 microphone ADC is clocked from the
@@ -366,8 +357,6 @@ static int sm8250_snd_startup(struct snd_pcm_substream *substream)
 			if (__rc)
 				dev_warn(rtd->card->dev,
 					 "J716F-CLK: set_sysclk IBIT rc=%d\n", __rc);
-			else
-				pr_debug("J716F-CLK: set_sysclk IBIT rc=%d\n", __rc);
 		}
 		/*
 		 * NOTE: sdm845/sc7180 additionally program
@@ -440,8 +429,6 @@ static void sm8250_snd_shutdown(struct snd_pcm_substream *substream)
 	    (cpu_dai->id == TX_CODEC_DMA_TX_3 ||
 	     cpu_dai->id == VA_CODEC_DMA_TX_0)) {
 		sm8250_dmic_put(data);
-		pr_debug("J716F-DMIC: power down (dai id %d, users %d)\n",
-			 cpu_dai->id, data->dmic_users);
 	}
 
 	qcom_snd_sdw_shutdown(substream);
@@ -455,8 +442,6 @@ static int sm8250_snd_hw_params(struct snd_pcm_substream *substream,
 	const unsigned int left_slots[] = { 0, 1 };
 	const unsigned int right_slots[] = { 1, 0 };
 	int i, ret;
-
-	(void)params;
 
 	/*
 	 * Lenovo J716F: the CS35L41 amplifiers take their PLL reference from
