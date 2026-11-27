@@ -158,6 +158,36 @@
 		vin-supply = <&pm8150b_vbus>;
 	};
 
+	/*
+	 * WCD938x analog codec.  The vendor tree calls it a split codec
+	 * inside "bolero-cdc"; upstream describes the same hardware with
+	 * the RX/TX SoundWire slaves below and the qcom,rx-device/
+	 * qcom,tx-device links instead.
+	 *
+	 * Rails follow the vendor map: rxtx/io/buck on PM8150 S4 (1.8 V)
+	 * and mic bias on PM8150A BOB (3.008-3.96 V).  The four mic bias
+	 * levels are the vendor values (1800/2700/1800/1800 mV).
+	 */
+	wcd938x: audio-codec {
+		compatible = "qcom,wcd9380-codec";
+
+		reset-gpios = <&tlmm 32 GPIO_ACTIVE_LOW>;
+
+		vdd-buck-supply = <&vreg_s4a_1p8>;
+		vdd-rxtx-supply = <&vreg_s4a_1p8>;
+		vdd-io-supply = <&vreg_s4a_1p8>;
+		vdd-mic-bias-supply = <&vreg_bob>;
+
+		qcom,micbias1-microvolt = <1800000>;
+		qcom,micbias2-microvolt = <2700000>;
+		qcom,micbias3-microvolt = <1800000>;
+		qcom,micbias4-microvolt = <1800000>;
+		qcom,rx-device = <&wcd_rx>;
+		qcom,tx-device = <&wcd_tx>;
+
+		#sound-dai-cells = <1>;
+	};
+
 	qca6390-pmu {
 		compatible = "qcom,qca6390-pmu";
 
@@ -911,6 +941,25 @@
 	/* FSA4480 USB audio switch @ 43 */
 	/* RTC6226 FM receiver @ 64 */
 	/* HL6111R wireless charging IC @ 25 */
+
+	/*
+	 * Analog audio/SBU switch between the SoC audio codec and the
+	 * USB-C receptacle.  TCPM drives it through the connector graph:
+	 * the vendor does the same with "fsa4480-i2c-handle".
+	 */
+	typec-mux@43 {
+		compatible = "fcs,fsa4480";
+		reg = <0x43>;
+
+		mode-switch;
+		orientation-switch;
+
+		port {
+			fsa4480_sbu_mux: endpoint {
+				remote-endpoint = <&pm8150b_sbu>;
+			};
+		};
+	};
 };
 
 &pcie0 {
@@ -1284,6 +1333,9 @@
 		data-role = "dual";
 		self-powered;
 
+		/* Analog headsets use the FSA4480 path, there is no CC ID. */
+		accessory-mode-audio;
+
 		op-sink-microwatt = <10000000>;
 
 		vbus-supply = <&j716f_usb_vbus_boost>;
@@ -1315,6 +1367,14 @@
 
 				pm8150b_ss_in: endpoint {
 					remote-endpoint = <&usb_1_qmpphy_out>;
+				};
+			};
+
+			port@2 {
+				reg = <2>;
+
+				pm8150b_sbu: endpoint {
+					remote-endpoint = <&fsa4480_sbu_mux>;
 				};
 			};
 		};
@@ -1527,6 +1587,30 @@
 	};
 };
 
+&rxmacro {
+	status = "okay";
+};
+
+&swr1 {
+	status = "okay";
+
+	wcd_rx: wcd9380-rx@0,4 {
+		compatible = "sdw20217010d00";
+		reg = <0 4>;
+		qcom,rx-port-mapping = <1 2 3 4 5>;
+	};
+};
+
+&swr2 {
+	status = "okay";
+
+	wcd_tx: wcd9380-tx@0,3 {
+		compatible = "sdw20217010d00";
+		reg = <0 3>;
+		qcom,tx-port-mapping = <2 3 4 5>;
+	};
+};
+
 &vamacro {
 	clocks = <&q6afecc LPASS_CLK_ID_VA_CORE_MCLK LPASS_CLK_ATTRIBUTE_COUPLE_NO>,
 		 <&q6afecc LPASS_CLK_ID_VA_CORE_2X_MCLK LPASS_CLK_ATTRIBUTE_COUPLE_NO>,
@@ -1575,7 +1659,11 @@
 		"VA DMIC0", "vdd-micb",
 		"VA DMIC1", "vdd-micb",
 		"VA DMIC2", "vdd-micb",
-		"VA DMIC3", "vdd-micb";
+		"VA DMIC3", "vdd-micb",
+		"IN1_HPHL", "HPHL_OUT",
+		"IN2_HPHR", "HPHR_OUT",
+		"AMIC2", "MIC BIAS2",
+		"TX SWR_ADC0", "ADC1_OUTPUT";
 
 	mm1-dai-link {
 		link-name = "MultiMedia1";
@@ -1641,6 +1729,41 @@
 
 		codec {
 			sound-dai = <&vamacro 0>;
+		};
+	};
+
+	/*
+	 * WCD938x playback and capture.  The vendor plays headphones on
+	 * RX_CDC_DMA_RX_0 and captures the headset mic on
+	 * TX_CDC_DMA_TX_4; TX_3 is already the DMIC backend above.
+	 */
+	wcd-playback-dai-link {
+		link-name = "WCD Playback";
+		cpu {
+			sound-dai = <&q6afedai RX_CODEC_DMA_RX_0>;
+		};
+
+		platform {
+			sound-dai = <&q6routing>;
+		};
+
+		codec {
+			sound-dai = <&wcd938x 0>, <&swr1 0>, <&rxmacro 0>;
+		};
+	};
+
+	wcd-capture-dai-link {
+		link-name = "WCD Capture";
+		cpu {
+			sound-dai = <&q6afedai TX_CODEC_DMA_TX_4>;
+		};
+
+		platform {
+			sound-dai = <&q6routing>;
+		};
+
+		codec {
+			sound-dai = <&wcd938x 1>, <&swr2 0>, <&txmacro 0>;
 		};
 	};
 };
