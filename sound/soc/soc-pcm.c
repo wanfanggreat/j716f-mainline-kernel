@@ -128,21 +128,10 @@ static int snd_soc_dpcm_can_be_params(struct snd_soc_pcm_runtime *fe,
 static int snd_soc_dpcm_can_be_prepared(struct snd_soc_pcm_runtime *fe,
 					struct snd_soc_pcm_runtime *be, int stream)
 {
-	/*
-	 * Lenovo J716F: a backend that is still in HW_PARAMS must also be
-	 * accepted here. userspace does open -> hw_params -> prepare, and at
-	 * hw_params dpcm_run_update_startup() returns early once the FE has
-	 * reached HW_PARAMS, before it ever calls dpcm_be_dai_prepare(). The
-	 * BE therefore stays in HW_PARAMS, and without this entry
-	 * dpcm_fe_dai_prepare() skips it, so __soc_pcm_prepare() never runs
-	 * for the BE, SND_SOC_DAPM_STREAM_START is never sent to the codec DAI
-	 * widget and the whole DAPM capture path stays unpowered.
-	 */
 	const enum snd_soc_dpcm_state state[] = {
 		SND_SOC_DPCM_STATE_START,
 		SND_SOC_DPCM_STATE_PAUSED,
 		SND_SOC_DPCM_STATE_PREPARE,
-		SND_SOC_DPCM_STATE_HW_PARAMS,
 	};
 
 	return snd_soc_dpcm_check_state(fe, be, stream, state, ARRAY_SIZE(state));
@@ -1758,6 +1747,7 @@ int dpcm_add_paths(struct snd_soc_pcm_runtime *fe, int stream,
 		new++;
 	}
 
+	dev_dbg(fe->dev, "ASoC: found %d new BE paths\n", new);
 	return new;
 }
 
@@ -2633,7 +2623,6 @@ int dpcm_be_dai_prepare(struct snd_soc_pcm_runtime *fe, int stream)
 		/* is this op for this BE ? */
 		if (!snd_soc_dpcm_can_be_update(fe, be, stream))
 			continue;
-
 
 		if (!snd_soc_dpcm_can_be_prepared(fe, be, stream))
 			continue;
