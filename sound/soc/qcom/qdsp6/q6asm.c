@@ -485,6 +485,7 @@ enum q6asm_fault {
 	Q6ASM_FAULT_PAUSE,
 	Q6ASM_FAULT_PAUSE_REJECT,
 	Q6ASM_FAULT_RUN_REJECT,
+	Q6ASM_FAULT_DUPLICATE,
 	Q6ASM_FAULT_DROP_MAP,
 };
 
@@ -502,6 +503,7 @@ static const char *const q6asm_fault_names[] = {
 	[Q6ASM_FAULT_PAUSE] = "pause",
 	[Q6ASM_FAULT_PAUSE_REJECT] = "pausereject",
 	[Q6ASM_FAULT_RUN_REJECT] = "runreject",
+	[Q6ASM_FAULT_DUPLICATE] = "duplicate",
 	[Q6ASM_FAULT_DROP_MAP] = "dropmap",
 };
 #endif
@@ -1999,6 +2001,17 @@ static int32_t q6asm_stream_callback(struct apr_device *adev,
 			if (injected)
 				status = injected;
 			owner = q6asm_cmd_rsp_claim(ac, result->opcode, status, 0);
+			/*
+			 * Diagnostic: hand the same answer to the correlator a
+			 * second time before any side effect.  It must be unowned;
+			 * an owned duplicate would mean an async credit can be
+			 * spent twice.
+			 */
+			if (q6asm_fault_drop(ac, Q6ASM_FAULT_DUPLICATE) &&
+			    q6asm_cmd_rsp_claim(ac, result->opcode, status, 0) !=
+			    Q6ASM_RSP_NONE)
+				dev_err_ratelimited(ac->dev,
+					"duplicate RUN answer was owned\n");
 			if (owner != Q6ASM_RSP_NONE)
 				q6asm_emit_simple(ac, Q6ASM_EVENT_RUN_DONE,
 						  stream_id, status);
@@ -3196,13 +3209,10 @@ EXPORT_SYMBOL_GPL(q6asm_cmd_nowait);
 
 #ifdef CONFIG_SND_SOC_QDSP6_ASM_FAULT_INJECT
 /*
- * Replay a completion for the first period of an active client.  With
- * @fresh set, the token is valid for the current mapping, so the first
- * delivery is accepted and an immediate second one must be rejected; with
- * it clear the token names another generation and must be dropped.  Either
- * way hw_ptr may only move once.
+ * Replay a completion for the first period of an active client using a
+ * token from another generation.  The transfer correlator must drop it.
  */
-static void q6asm_inject_completion(struct q6asm *a, bool fresh)
+static void q6asm_inject_completion(struct q6asm *a)
 {
 	struct audio_client *ac = NULL;
 	unsigned long flags;
@@ -3235,21 +3245,14 @@ static void q6asm_inject_completion(struct q6asm *a, bool fresh)
 			spin_unlock_irqrestore(&ac->lock, flags);
 			continue;
 		}
-		generation = q6asm_token_gen(port->generation);
-		if (!fresh) {
-			/* Any encoded value except the current one is stale. */
-			generation = (generation % Q6ASM_TOKEN_GEN_MAX) + 1;
-		}
+		/* Any encoded value except the current one is stale. */
+		generation = (q6asm_token_gen(port->generation) %
+			      Q6ASM_TOKEN_GEN_MAX) + 1;
 		phys = port->buf[0].phys;
 		spin_unlock_irqrestore(&ac->lock, flags);
 
 		q6asm_complete_transfer(ac, dir, 0, generation, 0, phys, true,
 					false, 0, 0, 0, 0);
-		if (fresh) {
-			/* The same completion again must not count twice. */
-			q6asm_complete_transfer(ac, dir, 0, generation, 0, phys,
-						true, false, 0, 0, 0, 0);
-		}
 	}
 	kref_put(&ac->refcount, q6asm_audio_client_release);
 }
@@ -3352,8 +3355,11 @@ static ssize_t inject_fault_show(struct device *dev,
  *   echo pause:reject   > .../inject_fault  # CMD_PAUSE is not sent
  *   echo pausereject:reject > .../inject_fault # DSP rejects the next PAUSE
  *   echo runreject:reject   > .../inject_fault # DSP rejects the next RUN
- *   echo duplicate      > .../inject_fault  # replay a completion twice
- *   echo spurious       > .../inject_fault  # replay an old completion
+ *   echo duplicate      > .../inject_fault  # replay the next RUN answer;
+ *                                           # its second delivery must be
+ *                                           # unowned and emit nothing
+ *   echo spurious       > .../inject_fault  # replay a data completion from
+ *                                           # an old generation
  *   echo dropmap        > .../inject_fault  # swallow the next MAP CMDRSP
  *                                           # (times out and retires MAP)
  *   echo clear          > .../inject_fault  # disarm
@@ -3380,12 +3386,12 @@ static ssize_t inject_fault_store(struct device *dev,
 		goto store;
 
 	if (sysfs_streq(buf, "spurious")) {
-		q6asm_inject_completion(q6asm, false);
+		q6asm_inject_completion(q6asm);
 		return count;
 	}
 	if (sysfs_streq(buf, "duplicate")) {
-		q6asm_inject_completion(q6asm, true);
-		return count;
+		fault = Q6ASM_FAULT_DUPLICATE;
+		goto store;
 	}
 	if (sysfs_streq(buf, "dropmap")) {
 		fault = Q6ASM_FAULT_DROP_MAP;

@@ -105,8 +105,9 @@ config SND_SOC_QDSP6_ASM_FAULT_INJECT
 	help
 	  Add a per-device inject_fault file that makes the next MAP,
 	  CMD_CLOSE, UNMAP, RUN, PAUSE, READ or WRITE command fail once, can
-	  reject a RUN or PAUSE answer, can replay a completion (duplicate or
-	  from an old generation), and can swallow the MAP CMDRSP so the
+	  reject a RUN or PAUSE answer, can replay the next RUN answer so its
+	  second delivery must be unowned, can replay a data completion from
+	  an old generation, and can swallow the MAP CMDRSP so the
 	  command times out and its opcode is retired.  This lets the session
 	  quarantine, held-buffer, state-rollback and response-correlation
 	  paths be exercised on real hardware.  Debug only: the knob is inert
