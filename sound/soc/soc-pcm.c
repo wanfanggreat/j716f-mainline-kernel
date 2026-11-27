@@ -2090,24 +2090,6 @@ static int dpcm_fe_dai_startup(struct snd_pcm_substream *fe_substream)
 
 	fe->dpcm[stream].state = SND_SOC_DPCM_STATE_OPEN;
 
-	/*
-	 * Lenovo J716F: power the capture/playback DAPM chain as soon as the
-	 * DPCM frontend opens.
-	 *
-	 * Upstream only issues dpcm_dapm_stream_event() from
-	 * dpcm_run_update_startup(), which runs from DAPM mixer changes and
-	 * bails out early when the FE substream is not active yet - so with a
-	 * plain "open the PCM, then read" sequence (what arecord does) the
-	 * event is never sent. The whole chain then stays powered down:
-	 * es7210 bias_level Off, LPASS PRI_MI2S_IBIT/EBIT enable_count 0,
-	 * and capture returns correctly sized but all-zero buffers.
-	 *
-	 * The matching SND_SOC_DAPM_STREAM_STOP is already sent from
-	 * dpcm_fe_dai_close(), so the pair stays balanced.
-	 */
-
-	dpcm_dapm_stream_event(fe, stream, SND_SOC_DAPM_STREAM_START);
-
 	dpcm_runtime_setup_fe(fe_substream);
 
 	dpcm_runtime_setup_be_format(fe_substream);
