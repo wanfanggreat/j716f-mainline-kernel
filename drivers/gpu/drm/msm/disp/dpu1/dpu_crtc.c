@@ -952,7 +952,6 @@ static void _dpu_crtc_setup_cp_blocks(struct drm_crtc *crtc)
 	struct dpu_hw_ctl *ctl;
 	struct dpu_hw_dspp *dspp;
 	bool complete = true;
-	u32 dspp_mask = 0;
 	u64 signature;
 	int i;
 
@@ -982,8 +981,6 @@ static void _dpu_crtc_setup_cp_blocks(struct drm_crtc *crtc)
 			}
 			continue;
 		}
-
-		dspp_mask |= BIT(dspp->idx - DSPP_0);
 
 		if (dspp->ops.setup_igc) {
 			if (!state->degamma_lut) {
@@ -1055,14 +1052,6 @@ static void _dpu_crtc_setup_cp_blocks(struct drm_crtc *crtc)
 		dpu_crtc->cp_needs_replay = false;
 		dpu_crtc->cp_signature = signature;
 	}
-
-	DRM_DEBUG_DRIVER("crtc%d mixers=%d gc=%s igc=%s gamut=%s pcc=%s dspp=%#x%s\n",
-			 crtc->base.id, cstate->num_mixers,
-			 state->gamma_lut ? "user" : "bypass",
-			 state->degamma_lut ? "user" : "bypass",
-			 cstate->gamut_lut ? "user" : "bypass",
-			 state->ctm ? "user" : "bypass",
-			 dspp_mask, complete ? "" : " incomplete");
 }
 
 static void dpu_crtc_atomic_begin(struct drm_crtc *crtc,
@@ -1352,17 +1341,7 @@ static void dpu_crtc_atomic_print_state(struct drm_printer *p,
 					const struct drm_crtc_state *state)
 {
 	const struct dpu_crtc_state *cstate = to_dpu_crtc_state(state);
-	const struct dpu_crtc *dpu_crtc = to_dpu_crtc(state->crtc);
 	int i;
-
-	drm_printf(p, "\tcp_programmed:%d cp_needs_replay:%d cp_signature:%#llx\n",
-		   dpu_crtc->cp_programmed, dpu_crtc->cp_needs_replay,
-		   dpu_crtc->cp_signature);
-	drm_printf(p, "\tgamma_lut:%u degamma_lut:%u ctm:%u gamut_lut:%u\n",
-		   state->gamma_lut ? state->gamma_lut->base.id : 0,
-		   state->degamma_lut ? state->degamma_lut->base.id : 0,
-		   state->ctm ? state->ctm->base.id : 0,
-		   cstate->gamut_lut ? cstate->gamut_lut->base.id : 0);
 
 	for (i = 0; i < cstate->num_mixers; i++) {
 		drm_printf(p, "\tlm[%d]=%d\n", i, cstate->mixers[i].hw_lm->idx - LM_0);
