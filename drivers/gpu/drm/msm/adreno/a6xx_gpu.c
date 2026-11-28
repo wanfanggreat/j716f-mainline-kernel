@@ -2190,12 +2190,7 @@ static int a6xx_pm_resume(struct msm_gpu *gpu)
 		goto err_set_opp;
 	}
 
-	/*
-	 * Set the core clock and bus bw, having VDD scaling in mind.
-	 * The OPP reference must stay alive until dev_pm_opp_set_opp()
-	 * has consumed it: dropping the last reference first can free the
-	 * object and turn the set_opp() call into a use-after-free.
-	 */
+	/* Set the core clock and bus bw, having VDD scaling in mind */
 	dev_pm_opp_set_opp(&gpu->pdev->dev, opp);
 	dev_pm_opp_put(opp);
 
