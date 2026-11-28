@@ -55,7 +55,6 @@
 #include <linux/cacheinfo.h>
 #include <linux/pgalloc_tag.h>
 #include <asm/div64.h>
-#include <soc/qcom/j716f-diag.h>
 #include "internal.h"
 #include "mm_init.h"
 #include "page_alloc.h"
@@ -1476,8 +1475,6 @@ static void free_pcppages_bulk(struct zone *zone, int count,
 	unsigned int order;
 	struct page *page;
 
-	j716f_bc(J716F_BC_PAGE_FREE_PCP_ENTER, (unsigned long)zone);
-
 	/*
 	 * Ensure proper count is passed which otherwise would stuck in the
 	 * below while (list_empty(list)) loop.
@@ -1519,8 +1516,6 @@ static void free_pcppages_bulk(struct zone *zone, int count,
 			trace_mm_page_pcpu_drain(page, order, mt);
 		} while (count > 0 && !list_empty(list));
 	}
-
-	j716f_bc(J716F_BC_PAGE_FREE_PCP_EXIT, (unsigned long)zone);
 }
 
 /* Split a multi-block free page into its individual pageblocks. */
@@ -3018,8 +3013,6 @@ void free_unref_folios(struct folio_batch *folios)
 	struct zone *locked_zone = NULL;
 	int i, j;
 
-	j716f_bc_quiet(J716F_BC_PAGE_FREE_LIST_ENTER, (unsigned long)_RET_IP_);
-
 	/* Prepare folios for freeing */
 	for (i = 0, j = 0; i < folios->nr; i++) {
 		struct folio *folio = folios->folios[i];
@@ -3103,45 +3096,7 @@ void free_unref_folios(struct folio_batch *folios)
 
 	if (pcp)
 		pcp_spin_unlock(pcp);
-	/*
-	 * M19: quiet, so this record cannot itself enter the scheduler.
-	 *
-	 * v52 used the loud j716f_bc() here.  It publishes the record and then
-	 * runs preempt_enable(); that call can reach preempt_schedule() ->
-	 * __schedule().  A hang inside that window is therefore *after* the
-	 * exit record yet still entirely inside the breadcrumb, which is why
-	 * the v52 ring could not tell "the page-free path stopped" from "the
-	 * breadcrumb's own preemption stopped".
-	 */
-	j716f_bc_quiet(J716F_BC_PAGE_FREE_LIST_EXIT, (unsigned long)folios);
-	/*
-	 * A second record immediately after the exit: if a freeze stops in
-	 * the exit record's first instructions, this record is missing and
-	 * the page-free loop itself is exonerated.
-	 *
-	 * M19a: named PRE_REINIT, not RET.  It is written before
-	 * folio_batch_reinit(), i.e. still inside free_unref_folios(); the
-	 * v53 name "free_unref_folios_ret" invited the M18 mistake of
-	 * reading this record as proof that the function had returned.
-	 */
-	j716f_bc_quiet(J716F_BC_PAGE_FREE_PRE_REINIT, (unsigned long)folios);
 	folio_batch_reinit(folios);
-	/*
-	 * M19a: barrier() so the record is provably ordered after the batch
-	 * reset.  Without it the compiler is free to move the two stores of
-	 * folio_batch_reinit() past the call, and "BATCH_DONE present" would
-	 * not prove the reset happened.  A compiler barrier is enough: the
-	 * record's own smp_wmb()/smp_store_release() publish it to readers,
-	 * and no other CPU observes this stack-local batch.
-	 */
-	barrier();
-	/*
-	 * Written after the only remaining work in the function.  If
-	 * BATCH_DONE is the last record, the CPU stopped in the epilogue
-	 * (register restore, autiasp, ret) - not in the batch reset, and not
-	 * in the caller.
-	 */
-	j716f_bc_quiet(J716F_BC_PAGE_FREE_BATCH_DONE, (unsigned long)folios);
 }
 
 static void __split_page(struct page *page, unsigned int order)

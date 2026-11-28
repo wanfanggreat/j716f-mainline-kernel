@@ -14,7 +14,6 @@
 #include <linux/of.h>
 #include <linux/platform_device.h>
 
-#include <soc/qcom/j716f-diag.h>
 #include <dt-bindings/interconnect/qcom,osm-l3.h>
 
 #define LUT_MAX_ENTRIES			40U
@@ -142,9 +141,7 @@ static int qcom_osm_l3_set(struct icc_node *src, struct icc_node *dst)
 			break;
 	}
 
-	j716f_bc(J716F_BC_OSM_L3_ENTER, index);
 	writel_relaxed(index, qp->base + qp->reg_perf_state);
-	j716f_bc(J716F_BC_OSM_L3_EXIT, index);
 
 	return 0;
 }

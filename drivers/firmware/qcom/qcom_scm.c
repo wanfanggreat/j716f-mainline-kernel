@@ -21,8 +21,6 @@
 #include <linux/interrupt.h>
 #include <linux/kstrtox.h>
 #include <linux/module.h>
-
-#include <soc/qcom/j716f-diag.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/of_irq.h>
@@ -333,26 +331,17 @@ found:
 static int qcom_scm_call(struct device *dev, const struct qcom_scm_desc *desc,
 			 struct qcom_scm_res *res)
 {
-	int ret;
-
 	might_sleep();
-	/* 0x40000000 marks an SMC call; SV=2, SMC64 function ID space. */
-	j716f_bc(J716F_BC_SCM_ENTER, ((unsigned long)desc->svc << 32) | desc->cmd);
 	switch (__get_convention()) {
 	case SMC_CONVENTION_ARM_32:
 	case SMC_CONVENTION_ARM_64:
-		ret = scm_smc_call(dev, desc, res, false);
-		break;
+		return scm_smc_call(dev, desc, res, false);
 	case SMC_CONVENTION_LEGACY:
-		ret = scm_legacy_call(dev, desc, res);
-		break;
+		return scm_legacy_call(dev, desc, res);
 	default:
 		pr_err("Unknown current SCM calling convention.\n");
-		ret = -EINVAL;
-		break;
+		return -EINVAL;
 	}
-	j716f_bc(J716F_BC_SCM_EXIT, (unsigned long)ret);
-	return ret;
 }
 
 /**

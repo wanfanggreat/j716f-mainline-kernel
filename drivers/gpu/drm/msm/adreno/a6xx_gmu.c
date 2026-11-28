@@ -10,7 +10,6 @@
 #include <linux/pm_domain.h>
 #include <linux/pm_opp.h>
 #include <soc/qcom/cmd-db.h>
-#include <soc/qcom/j716f-diag.h>
 #include <soc/qcom/tcs.h>
 #include <drm/drm_gem.h>
 
@@ -1319,13 +1318,8 @@ int a6xx_gmu_resume(struct a6xx_gpu *a6xx_gpu)
 
 	gmu->hung = false;
 
-	j716f_bc(J716F_BC_GPU_RESUME_ENTER, 0);
-	dev_info(gmu->dev, "J716F GMU: resume enter\n");
-
 	/* Turn on the resources */
 	pm_runtime_get_sync(gmu->dev);
-
-	dev_info(gmu->dev, "J716F GMU: power on done\n");
 
 	a6xx_gmu_gxpd_get(gmu);
 
@@ -1337,13 +1331,9 @@ int a6xx_gmu_resume(struct a6xx_gpu *a6xx_gpu)
 	if (ret)
 		goto rpm_put;
 
-	dev_info(gmu->dev, "J716F GMU: clocks on\n");
-
 	ret = a6xx_gmu_secure_init(a6xx_gpu);
 	if (ret)
 		goto disable_clk;
-
-	dev_info(gmu->dev, "J716F GMU: secure init done\n");
 
 	/* Read the slice info on A8x GPUs */
 	a8xx_gpu_get_slice_info(gpu);
@@ -1371,15 +1361,11 @@ int a6xx_gmu_resume(struct a6xx_gpu *a6xx_gpu)
 		status = GMU_COLD_BOOT;
 	}
 
-	dev_info(gmu->dev, "J716F GMU: fw_start enter status=%d\n", status);
 	ret = a6xx_gmu_fw_start(gmu, status);
-	dev_info(gmu->dev, "J716F GMU: fw_start ret=%d\n", ret);
 	if (ret)
 		goto disable_irq;
 
-	dev_info(gmu->dev, "J716F GMU: hfi_start enter\n");
 	ret = a6xx_hfi_start(gmu, status);
-	dev_info(gmu->dev, "J716F GMU: hfi_start ret=%d\n", ret);
 	if (ret)
 		goto disable_irq;
 
@@ -1394,9 +1380,6 @@ int a6xx_gmu_resume(struct a6xx_gpu *a6xx_gpu)
 	/* Set the GPU to the current freq */
 	a6xx_gmu_set_initial_freq(gpu, gmu);
 
-	dev_info(gmu->dev, "J716F GMU: resume done\n");
-
-	j716f_bc(J716F_BC_GPU_RESUME_EXIT, 0);
 	return 0;
 
 disable_irq:
@@ -1508,7 +1491,6 @@ int a6xx_gmu_stop(struct a6xx_gpu *a6xx_gpu)
 	if (!pm_runtime_active(gmu->dev))
 		return 0;
 
-	j716f_bc(J716F_BC_GPU_STOP_ENTER, 0);
 	/*
 	 * Force the GMU off if we detected a hang, otherwise try to shut it
 	 * down gracefully
@@ -1532,7 +1514,6 @@ int a6xx_gmu_stop(struct a6xx_gpu *a6xx_gpu)
 
 	pm_runtime_put_sync(gmu->dev);
 
-	j716f_bc(J716F_BC_GPU_STOP_EXIT, 0);
 	return 0;
 }
 

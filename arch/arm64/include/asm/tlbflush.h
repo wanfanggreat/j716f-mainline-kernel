@@ -15,8 +15,6 @@
 #include <linux/sched.h>
 #include <linux/mmu_notifier.h>
 #include <asm/cputype.h>
-
-#include <soc/qcom/j716f-diag.h>
 #include <asm/mmu.h>
 
 /*
@@ -379,15 +377,12 @@ static inline void flush_tlb_mm(struct mm_struct *mm)
 {
 	unsigned long asid;
 
-	j716f_bc(J716F_BC_TLB_FLUSH_ENTER, (unsigned long)mm);
 	dsb(ishst);
 	asid = __TLBI_VADDR(0, ASID(mm));
 	__tlbi(aside1is, asid);
 	__tlbi_user(aside1is, asid);
 	__tlbi_sync_s1ish(mm);
 	mmu_notifier_arch_invalidate_secondary_tlbs(mm, 0, -1UL);
-	j716f_bc(J716F_BC_TLB_FLUSH_EXIT, (unsigned long)mm);
-	j716f_bc(J716F_BC_TLB_FLUSH_RET, (unsigned long)mm);
 }
 
 static inline bool arch_tlbbatch_should_defer(struct mm_struct *mm)
@@ -407,10 +402,7 @@ static inline bool arch_tlbbatch_should_defer(struct mm_struct *mm)
  */
 static inline void arch_tlbbatch_flush(struct arch_tlbflush_unmap_batch *batch)
 {
-	j716f_bc(J716F_BC_TLB_FLUSH_ENTER, (unsigned long)batch);
 	__tlbi_sync_s1ish_batch();
-	j716f_bc(J716F_BC_TLB_FLUSH_EXIT, (unsigned long)batch);
-	j716f_bc(J716F_BC_TLB_FLUSH_RET, (unsigned long)batch);
 }
 
 /*

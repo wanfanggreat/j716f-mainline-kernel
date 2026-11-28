@@ -18,8 +18,6 @@
 #include <linux/of.h>
 #include <linux/overflow.h>
 
-#include <soc/qcom/j716f-diag.h>
-
 #include "internal.h"
 
 #define ICC_DYN_ID_START 100000
@@ -717,7 +715,7 @@ EXPORT_SYMBOL_GPL(icc_get_name);
 int icc_set_bw(struct icc_path *path, u32 avg_bw, u32 peak_bw)
 {
 	struct icc_node *node;
-	u32 old_avg, old_peak, txid;
+	u32 old_avg, old_peak;
 	size_t i;
 	int ret;
 
@@ -731,59 +729,6 @@ int icc_set_bw(struct icc_path *path, u32 avg_bw, u32 peak_bw)
 
 	old_avg = path->reqs[0].avg_bw;
 	old_peak = path->reqs[0].peak_bw;
-
-	/*
-	 * M20-P1: record the client-side request, not the commit.
-	 *
-	 * The BCM voter merges several clients, so the thread that ends up in
-	 * rpmh_write_batch() is not necessarily the requester.  This is the
-	 * only point where current->comm still names the real one.
-	 *
-	 * Only on an actual change: a no-op set would otherwise fill the ring
-	 * with identical entries and hide the interesting transition.  The
-	 * record happens under icc_bw_lock in plain process context; the ring
-	 * itself is bounded and allocation free.
-	 */
-	/*
-	 * M20-P1b: the transaction context is scoped to this call and always
-	 * cleared before returning.  Two cases must NOT inherit an id:
-	 *   - no actual change: apply_constraints() below may still run and
-	 *     the voter may still commit, but nothing new was requested here;
-	 *   - a later failure retry: that "apply_constraints(path)" call is a
-	 *     rollback of an already-recorded request, not a new transaction.
-	 * Both get txid 0, which the dump reports as unattributable.
-	 *
-	 * M20-P1c: hand the client's provenance to the voter before it runs.
-	 *
-	 * The promoted MC0 record cannot be written here: at this point nothing
-	 * knows yet whether the batch will contain MC0 (the voter may drop the
-	 * BCM, another client may be the one that keeps it alive, and the
-	 * commit that actually carries MC0 may be triggered by a different
-	 * icc_set_bw()).  So this only stashes the values; the voter promotes
-	 * them into a durable record when it sees MC0 in the batch.
-	 *
-	 * Only on an actual change: a no-op set re-runs the voter without a new
-	 * request, and those commits must not be attributed to anybody.
-	 */
-	txid = 0;
-	if (old_avg != avg_bw || old_peak != peak_bw) {
-		node = path->reqs[path->num_nodes - 1].node;
-		txid = j716f_vote_alloc_txid();
-		/*
-		 * Stash only when an id was actually handed out; with
-		 * vote_trace=0 txid is 0 and nothing should be promoted later.
-		 */
-		if (txid) {
-			j716f_vote_note_request(txid, avg_bw, peak_bw,
-						node ? (u32)node->id : 0,
-						path->name);
-			j716f_vote_record(J716F_VOTE_KIND_REQ, txid, 0, peak_bw,
-					   J716F_VOTE_NO_TCS,
-					   (node ? (u32)node->id : 0) |
-					   (avg_bw << 16));
-		}
-	}
-	j716f_vote_set_current_txid(txid);
 
 	for (i = 0; i < path->num_nodes; i++) {
 		node = path->reqs[i].node;
@@ -803,11 +748,6 @@ int icc_set_bw(struct icc_path *path, u32 avg_bw, u32 peak_bw)
 		pr_debug("interconnect: error applying constraints (%d)\n",
 			 ret);
 
-		/*
-		 * Rollback re-commit: explicitly not part of the failed
-		 * transaction, and not a transaction of its own.
-		 */
-		j716f_vote_set_current_txid(0);
 		for (i = 0; i < path->num_nodes; i++) {
 			node = path->reqs[i].node;
 			path->reqs[i].avg_bw = old_avg;
@@ -817,16 +757,6 @@ int icc_set_bw(struct icc_path *path, u32 avg_bw, u32 peak_bw)
 		apply_constraints(path);
 	}
 
-	/*
-	 * M20-P1d: this icc_set_bw() can no longer commit a batch for @txid.
-	 * Drop the transaction's open reference so the state machine may free
-	 * the entry once the last registered batch is reclaimed.  This runs on
-	 * both exits (normal and failed+rollback); without it a transaction
-	 * whose batches all completed between two provider commits would free
-	 * the entry early and the next commit would arm into a missing entry.
-	 */
-	j716f_vote_tx_finish(txid);
-	j716f_vote_set_current_txid(0);
 	mutex_unlock(&icc_bw_lock);
 
 	trace_icc_set_bw_end(path, ret);
