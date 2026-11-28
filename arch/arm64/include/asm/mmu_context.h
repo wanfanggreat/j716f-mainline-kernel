@@ -297,12 +297,6 @@ void arm64_mm_context_put(struct mm_struct *mm);
  */
 void arm64_workaround_1542418_asid_rollover(void);
 
-/* Evidence counters for the A77 1542418 controlled experiment. */
-u32 arm64_asid_bits(void);
-u64 arm64_asid_generation(void);
-u64 arm64_asid_rollover_count(void);
-u64 arm64_asid_workaround_count(int cpu);
-
 #define mm_untag_mask mm_untag_mask
 static inline unsigned long mm_untag_mask(struct mm_struct *mm)
 {

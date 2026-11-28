@@ -18,7 +18,6 @@
 #include <linux/types.h>
 #include <linux/wait.h>
 
-#include <soc/qcom/j716f-diag.h>
 #include <soc/qcom/rpmh.h>
 
 #include "rpmh-internal.h"
@@ -218,16 +217,6 @@ static int __fill_rpmh_msg(struct rpmh_request *req, enum rpmh_state state,
 	req->msg.cmds = req->cmd;
 	req->msg.num_cmds = n;
 	req->msg.is_read = is_read;
-	/*
-	 * M20-P1b: requests built here carry no transaction id.  Only the
-	 * caller that actually knows which client caused the transfer may
-	 * set one (see rpmh_write_batch_txid()); everything else stays 0 so
-	 * the dump reports "unattributable" instead of inventing a link.
-	 *
-	 * M20-P1c: unconditional.  The field is a plain software word, so the
-	 * production build keeps the same layout and needs no #ifdef here.
-	 */
-	req->msg.j716f_txid = 0;
 
 	return 0;
 }
@@ -276,12 +265,9 @@ static int __rpmh_write_wait(const struct device *dev, enum rpmh_state state,
 	struct rpmh_request *rpm_msg;
 	int ret;
 
-	j716f_bc(J716F_BC_RPMH_WRITE_ENTER, cmd[0].addr);
 	rpm_msg = rpmh_alloc_req(dev, state, cmd, n, !!data, true);
-	if (IS_ERR(rpm_msg)) {
-		j716f_bc(J716F_BC_RPMH_WRITE_EXIT, (unsigned long)PTR_ERR(rpm_msg));
+	if (IS_ERR(rpm_msg))
 		return PTR_ERR(rpm_msg);
-	}
 
 	/* Our own reference, the controller owns the initial one */
 	refcount_inc(&rpm_msg->refcnt);
@@ -290,7 +276,6 @@ static int __rpmh_write_wait(const struct device *dev, enum rpmh_state state,
 	if (ret)
 		goto out;
 
-	j716f_bc(J716F_BC_RPMH_BATCH_WAIT, cmd[0].addr);
 	if (!wait_for_completion_timeout(&rpm_msg->completion,
 					 RPMH_TIMEOUT_MS)) {
 		/*
@@ -299,7 +284,6 @@ static int __rpmh_write_wait(const struct device *dev, enum rpmh_state state,
 		 * are known to time out on some platforms, so only warn about
 		 * writes.
 		 */
-		j716f_bc(J716F_BC_RPMH_BATCH_TIMEOUT, cmd[0].addr);
 		rpmh_rsc_debug(ctrlr_to_drv(get_rpmh_ctrlr(dev)),
 			       &rpm_msg->completion);
 		WARN_ON(!data);
@@ -311,7 +295,6 @@ static int __rpmh_write_wait(const struct device *dev, enum rpmh_state state,
 		*data = rpm_msg->cmd[0].data;
 
 out:
-	j716f_bc(J716F_BC_RPMH_WRITE_EXIT, cmd[0].addr);
 	rpmh_put_req(rpm_msg);
 
 	return ret;
@@ -414,19 +397,16 @@ static int flush_batch(struct rpmh_ctrlr *ctrlr)
 
 static int rpmh_write_batch_active(const struct device *dev,
 				   const struct tcs_cmd *cmd, u32 *n,
-				   int count, u32 txid)
+				   int count)
 {
 	struct rsc_drv *drv = ctrlr_to_drv(get_rpmh_ctrlr(dev));
 	struct rpmh_request **rpm_msgs;
 	unsigned long time_left;
 	int ret = 0, nr_alloc, i, j;
 
-	j716f_bc(J716F_BC_RPMH_BATCH_ENTER, count);
 	rpm_msgs = kzalloc_objs(*rpm_msgs, count, GFP_ATOMIC);
-	if (!rpm_msgs) {
-		j716f_bc(J716F_BC_RPMH_BATCH_EXIT, (unsigned long)-ENOMEM);
+	if (!rpm_msgs)
 		return -ENOMEM;
-	}
 
 	for (nr_alloc = 0; nr_alloc < count; nr_alloc++) {
 		struct rpmh_request *rpm_msg;
@@ -440,18 +420,11 @@ static int rpmh_write_batch_active(const struct device *dev,
 
 		/* Our own reference, the controller owns the initial one */
 		refcount_inc(&rpm_msg->refcnt);
-		/*
-		 * M20-P1b: stamp the transaction id onto the request that
-		 * will be triggered, not onto a global.  A request that was
-		 * never stamped stays 0 and is reported as unattributable.
-		 */
-		rpm_msg->msg.j716f_txid = txid;
 		rpm_msgs[nr_alloc] = rpm_msg;
 		cmd += n[nr_alloc];
 	}
 
 	for (i = 0; !ret && i < count; i++) {
-		j716f_bc(J716F_BC_RPMH_BATCH_SEND, i);
 		ret = rpmh_rsc_send_data(drv, &rpm_msgs[i]->msg);
 		if (ret) {
 			pr_err("Error(%d) sending RPMH message addr=%#x\n",
@@ -466,7 +439,6 @@ static int rpmh_write_batch_active(const struct device *dev,
 
 	time_left = RPMH_TIMEOUT_MS;
 	while (i--) {
-		j716f_bc(J716F_BC_RPMH_BATCH_WAIT, i);
 		time_left = wait_for_completion_timeout(&rpm_msgs[i]->completion,
 							time_left);
 		if (!time_left) {
@@ -475,7 +447,6 @@ static int rpmh_write_batch_active(const struct device *dev,
 			 * controller and are freed by rpmh_tx_done() if the
 			 * hardware ever completes them.
 			 */
-			j716f_bc(J716F_BC_RPMH_BATCH_TIMEOUT, i);
 			rpmh_rsc_debug(drv, &rpm_msgs[i]->completion);
 			WARN_ON(1);
 			ret = -ETIMEDOUT;
@@ -483,7 +454,6 @@ static int rpmh_write_batch_active(const struct device *dev,
 		}
 	}
 
-	j716f_bc(J716F_BC_RPMH_BATCH_EXIT, (unsigned long)ret);
 	while (nr_alloc--)
 		rpmh_put_req(rpm_msgs[nr_alloc]);
 	kfree(rpm_msgs);
@@ -508,17 +478,8 @@ static int rpmh_write_batch_active(const struct device *dev,
  *
  * May sleep. Do not call from atomic contexts for ACTIVE_ONLY requests.
  */
-/**
- * rpmh_write_batch_txid - rpmh_write_batch() with an explicit transaction id
- * @txid: J716F diagnostic transaction id, 0 for "unattributable"
- *
- * Only the caller that knows which client caused the transfer passes a
- * non-zero id.  The id is attached to the request itself and travels with it
- * into rpmh_rsc_send_data(), so a completion can never be attributed to a
- * transaction other than the one that carried it.
- */
-int rpmh_write_batch_txid(const struct device *dev, enum rpmh_state state,
-			  const struct tcs_cmd *cmd, u32 *n, u32 txid)
+int rpmh_write_batch(const struct device *dev, enum rpmh_state state,
+		     const struct tcs_cmd *cmd, u32 *n)
 {
 	struct batch_cache_req *req;
 	struct rpmh_ctrlr *ctrlr = get_rpmh_ctrlr(dev);
@@ -534,7 +495,7 @@ int rpmh_write_batch_txid(const struct device *dev, enum rpmh_state state,
 		return -EINVAL;
 
 	if (state == RPMH_ACTIVE_ONLY_STATE)
-		return rpmh_write_batch_active(dev, cmd, n, count, txid);
+		return rpmh_write_batch_active(dev, cmd, n, count);
 
 	req = kzalloc_flex(*req, rpm_msgs, count, GFP_ATOMIC);
 	if (!req)
@@ -550,18 +511,6 @@ int rpmh_write_batch_txid(const struct device *dev, enum rpmh_state state,
 	cache_batch(ctrlr, req);
 
 	return 0;
-}
-EXPORT_SYMBOL_GPL(rpmh_write_batch_txid);
-
-int rpmh_write_batch(const struct device *dev, enum rpmh_state state,
-		     const struct tcs_cmd *cmd, u32 *n)
-{
-	/*
-	 * M20-P1b: callers that do not know which client caused the transfer
-	 * pass 0 and the dump reports "unattributable".  Filling this in from
-	 * some global "current transaction" is exactly the bug this replaces.
-	 */
-	return rpmh_write_batch_txid(dev, state, cmd, n, 0);
 }
 EXPORT_SYMBOL_GPL(rpmh_write_batch);
 

@@ -6,15 +6,12 @@
  * Copyright (C) 2012 ARM Ltd.
  */
 
-#include <linux/atomic.h>
 #include <linux/bitfield.h>
 #include <linux/bitops.h>
 #include <linux/lockdep.h>
 #include <linux/sched.h>
 #include <linux/slab.h>
 #include <linux/mm.h>
-
-#include <soc/qcom/j716f-diag.h>
 
 #include <asm/cpufeature.h>
 #include <asm/mmu_context.h>
@@ -25,8 +22,6 @@ static u32 asid_bits;
 static DEFINE_RAW_SPINLOCK(cpu_asid_lock);
 
 static atomic64_t asid_generation;
-static atomic64_t asid_rollover_count;
-static DEFINE_PER_CPU(u64, asid_workaround_count);
 static unsigned long *asid_map;
 
 static DEFINE_PER_CPU(atomic64_t, active_asids);
@@ -113,14 +108,6 @@ static void __arm64_workaround_1542418_asid_rollover(void)
 	    !this_cpu_has_cap(ARM64_WORKAROUND_1542418))
 		return;
 
-	/*
-	 * Counted before the loop: if the CPU stops inside the 61 ASID
-	 * selects, the count and the enter breadcrumb still show that this
-	 * CPU reached the workaround and that the experiment exercised it.
-	 */
-	raw_cpu_inc(asid_workaround_count);
-	j716f_bc(J716F_BC_A77_ASID_WORKAROUND_ENTER, 0);
-
 	if (!system_supports_cnp())
 		cpu_set_reserved_ttbr0();
 
@@ -134,7 +121,6 @@ static void __arm64_workaround_1542418_asid_rollover(void)
 	}
 
 	write_sysreg(ttbr1, ttbr1_el1);
-	j716f_bc(J716F_BC_A77_ASID_WORKAROUND_EXIT, 0);
 }
 
 /*
@@ -191,8 +177,6 @@ static void flush_context(void)
 {
 	int i;
 	u64 asid;
-
-	atomic64_inc(&asid_rollover_count);
 
 	/* Update the list of reserved ASIDs and the ASID bitmap. */
 	set_reserved_asid_bits();
@@ -507,35 +491,6 @@ static int asids_init(void)
 	 */
 	if (IS_ENABLED(CONFIG_UNMAP_KERNEL_AT_EL0))
 		set_kpti_asid_bits(asid_map);
-	pr_info("ASID: %u bits, %lu user ASIDs, KPTI=%d, errata-1542418=%d\n",
-		asid_bits, NUM_USER_ASIDS,
-		IS_ENABLED(CONFIG_UNMAP_KERNEL_AT_EL0),
-		IS_ENABLED(CONFIG_ARM64_ERRATUM_1542418));
 	return 0;
 }
 early_initcall(asids_init);
-
-/*
- * Evidence for the A77 1542418 controlled experiment.  The counters are
- * read from the diag proc file and from the panic dump; the workaround
- * count is per CPU because only the gold cores run it.
- */
-u32 arm64_asid_bits(void)
-{
-	return asid_bits;
-}
-
-u64 arm64_asid_generation(void)
-{
-	return atomic64_read(&asid_generation);
-}
-
-u64 arm64_asid_rollover_count(void)
-{
-	return atomic64_read(&asid_rollover_count);
-}
-
-u64 arm64_asid_workaround_count(int cpu)
-{
-	return per_cpu(asid_workaround_count, cpu);
-}

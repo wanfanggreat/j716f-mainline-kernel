@@ -31,33 +31,13 @@
 
 #include <clocksource/arm_arch_timer.h>
 #include <soc/qcom/cmd-db.h>
-#include <soc/qcom/j716f-diag.h>
 #include <soc/qcom/tcs.h>
 #include <dt-bindings/soc/qcom,rpmh-rsc.h>
 
 #include "rpmh-internal.h"
 
-#ifdef CONFIG_QCOM_J716F_DIAG
-static LIST_HEAD(rsc_drv_list);
-static bool rsc_panic_dump = true;
-module_param(rsc_panic_dump, bool, 0644);
-MODULE_PARM_DESC(rsc_panic_dump, "J716F: dump RSC/TCS state from the panic notifier");
-#endif
-
 #define CREATE_TRACE_POINTS
 #include "trace-rpmh.h"
-
-/*
- * J716F diagnostic: the RSC completion IRQ is normally left with the default
- * affinity.  If the target CPU enters a deep idle state, the GIC may not
- * deliver the completion until that CPU wakes.  enable_wake=1 asks the irqchip
- * to treat the RSC IRQ as a wakeup source, so the target CPU can be woken by
- * the completion itself.  This is an experiment, not a product setting.
- */
-static bool enable_wake;
-module_param_named(enable_wake, enable_wake, bool, 0644);
-MODULE_PARM_DESC(enable_wake,
-		 "J716F diagnostic: enable IRQ wake for the RSC completion IRQ");
 
 
 #define RSC_DRV_ID			0
@@ -255,7 +235,6 @@ static void write_tcs_reg_sync(const struct rsc_drv *drv, int reg, int tcs_id,
 {
 	int i;
 
-	j716f_bc(J716F_BC_RSC_WRSYNC_ENTER, ((unsigned long)tcs_id << 16) | reg);
 	writel(data, tcs_reg_addr(drv, reg, tcs_id));
 
 	/*
@@ -263,14 +242,10 @@ static void write_tcs_reg_sync(const struct rsc_drv *drv, int reg, int tcs_id,
 	 * ktime for timeout since this may be called after timekeeping stops.
 	 */
 	for (i = 0; i < USEC_PER_SEC; i++) {
-		if (readl(tcs_reg_addr(drv, reg, tcs_id)) == data) {
-			j716f_bc(J716F_BC_RSC_WRSYNC_DONE,
-				 ((unsigned long)tcs_id << 16) | reg);
+		if (readl(tcs_reg_addr(drv, reg, tcs_id)) == data)
 			return;
-		}
 		udelay(1);
 	}
-	j716f_bc(J716F_BC_RSC_WRSYNC_FAIL, ((unsigned long)tcs_id << 16) | reg);
 	pr_err("%s: error writing %#x to %d:%#x\n", drv->name,
 	       data, tcs_id, reg);
 }
@@ -296,12 +271,8 @@ static void tcs_invalidate(struct rsc_drv *drv, int type)
 	if (bitmap_empty(tcs->slots, MAX_TCS_SLOTS))
 		return;
 
-	j716f_bc(J716F_BC_RSC_INVAL_ENTER, type);
-	for (m = tcs->offset; m < tcs->offset + tcs->num_tcs; m++) {
-		j716f_bc(J716F_BC_RSC_INVAL_TCS, m);
+	for (m = tcs->offset; m < tcs->offset + tcs->num_tcs; m++)
 		write_tcs_reg_sync(drv, drv->regs[RSC_DRV_CMD_ENABLE], m, 0);
-	}
-	j716f_bc(J716F_BC_RSC_INVAL_EXIT, type);
 
 	bitmap_zero(tcs->slots, MAX_TCS_SLOTS);
 }
@@ -417,8 +388,6 @@ static void __tcs_set_trigger(struct rsc_drv *drv, int tcs_id, bool trigger)
 	u32 enable;
 	u32 reg = drv->regs[RSC_DRV_CONTROL];
 
-	j716f_bc(J716F_BC_RSC_TRIGGER_ENTER, ((unsigned long)tcs_id << 1) | trigger);
-
 	/*
 	 * HW req: Clear the DRV_CONTROL and enable TCS again
 	 * While clearing ensure that the AMC mode trigger is cleared
@@ -437,7 +406,6 @@ static void __tcs_set_trigger(struct rsc_drv *drv, int tcs_id, bool trigger)
 		enable |= TCS_AMC_MODE_TRIGGER;
 		write_tcs_reg(drv, reg, tcs_id, enable);
 	}
-	j716f_bc(J716F_BC_RSC_TRIGGER_EXIT, ((unsigned long)tcs_id << 1) | trigger);
 }
 
 /**
@@ -479,35 +447,10 @@ static irqreturn_t tcs_tx_done(int irq, void *p)
 	unsigned long irq_status;
 	const struct tcs_request *req;
 	u32 reg;
-	u32 txid;
-	bool mc0_batch;
 
-	j716f_bc(J716F_BC_RSC_IRQ_ENTER, irq);
-	j716f_irq_enter(irq);
 	irq_status = readl_relaxed(drv->tcs_base + drv->regs[RSC_DRV_IRQ_STATUS]);
 
 	for_each_set_bit(i, &irq_status, BITS_PER_TYPE(u32)) {
-		j716f_bc(J716F_BC_RSC_IRQ_TCS, i);
-		/*
-		 * M20-P1a: this is the HANDLER observing an already-set
-		 * completion bit, not the instant the accelerator finished.
-		 *
-		 * The bit was set at some unknown earlier time, so the true
-		 * completion lies in (trigger, DONE].  The record therefore
-		 * carries the raw status (evidence that the bit was set) and
-		 * the TCS id (which request it belongs to), and the dump
-		 * labels it "handler observed", never "hardware finished".
-		 *
-		 * M20-P1d: batch-mc0 says whether the exact (txid, rsc, tcs)
-		 * batch was registered as MC0.  A completion of a non-MC0
-		 * batch of the same transaction must not look like MC0
-		 * completion evidence.
-		 */
-		txid = rpmh_rsc_get_txid(drv, i);
-		mc0_batch = j716f_vote_tx_batch_is_mc0(txid, drv, (u32)i);
-		j716f_vote_record(J716F_VOTE_KIND_DONE, txid, 0, irq_status,
-				   (u32)i,
-				   mc0_batch ? J716F_VOTE_AUX_MC0_BATCH : 0);
 		req = get_req_from_tcs(drv, i);
 		if (WARN_ON(!req))
 			goto skip;
@@ -536,34 +479,11 @@ skip:
 		 */
 		if (!drv->tcs[ACTIVE_TCS].num_tcs)
 			enable_tcs_irq(drv, i, false);
-		txid = rpmh_rsc_get_txid(drv, i);
 		spin_unlock(&drv->lock);
-		/*
-		 * M20-P1a: separate "hardware done" from "software released
-		 * the TCS".  A dump that shows DONE but no RECLAIM proves the
-		 * completion was seen but the bookkeeping never finished, which
-		 * is a different failure than "never completed at all".
-		 *
-		 * Recorded AFTER releasing drv->lock: the vote ring has its own
-		 * lock, and taking it inside drv->lock would add a nesting edge
-		 * to a path this diagnostic is not supposed to perturb.
-		 *
-		 * M20-P1d: the batch entry is still present here (release runs
-		 * below), so batch-mc0 is exact for this completion.  The
-		 * release is keyed by (txid, rsc, tcs), never by txid alone: a
-		 * non-MC0 batch of the same txid must not consume an MC0 count.
-		 */
-		mc0_batch = j716f_vote_tx_batch_is_mc0(txid, drv, (u32)i);
-		j716f_vote_record(J716F_VOTE_KIND_RECLAIM, txid, 0, irq_status,
-				   (u32)i,
-				   mc0_batch ? J716F_VOTE_AUX_MC0_BATCH : 0);
-		j716f_vote_tx_release(txid, drv, (u32)i);
 		wake_up(&drv->tcs_wait);
 		if (req)
 			rpmh_tx_done(req);
 	}
-	j716f_bc(J716F_BC_RSC_IRQ_EXIT, irq_status);
-	j716f_irq_exit(irq);
 
 	return IRQ_HANDLED;
 }
@@ -742,8 +662,6 @@ int rpmh_rsc_send_data(struct rsc_drv *drv, const struct tcs_request *msg)
 	if (IS_ERR(tcs))
 		return PTR_ERR(tcs);
 
-	j716f_bc(J716F_BC_RSC_SEND_ENTER,
-		 ((unsigned long)msg->state << 32) | msg->cmds[0].addr);
 	spin_lock_irq(&drv->lock);
 
 	/* Wait forever for a free tcs. It better be there eventually! */
@@ -751,14 +669,7 @@ int rpmh_rsc_send_data(struct rsc_drv *drv, const struct tcs_request *msg)
 			    (tcs_id = claim_tcs_for_req(drv, tcs, msg)) >= 0,
 			    drv->lock);
 
-	j716f_bc(J716F_BC_RSC_SEND_CLAIM, tcs_id);
 	tcs->req[tcs_id - tcs->offset] = msg;
-	/*
-	 * M20-P1a: bind the transaction id to this TCS while holding
-	 * drv->lock, so tcs_tx_done() can attribute the completion to the
-	 * request even when other transactions interleave.
-	 */
-	rpmh_rsc_set_txid(drv, tcs_id, msg->j716f_txid);
 	set_bit(tcs_id, drv->tcs_in_use);
 	if (msg->state == RPMH_ACTIVE_ONLY_STATE && tcs->type != ACTIVE_TCS) {
 		/*
@@ -779,36 +690,8 @@ int rpmh_rsc_send_data(struct rsc_drv *drv, const struct tcs_request *msg)
 	 * - The interrupt can't go off until we trigger w/ the last line
 	 *   of __tcs_set_trigger() below.
 	 */
-	j716f_bc(J716F_BC_RSC_SEND_BUFFER, tcs_id);
 	__tcs_buffer_write(drv, tcs_id, 0, msg);
-	j716f_bc(J716F_BC_RSC_SEND_TRIGGER, tcs_id);
-	/*
-	 * M20-P1b split the trigger evidence in two, because they prove
-	 * different things:
-	 *
-	 *   TCS_PRE   the command buffer is programmed and we are about to
-	 *             poke the trigger register.  Proves only "prepared".
-	 *   TCS_POKED the trigger register write has been issued.  Proves the
-	 *             store happened, NOT that the accelerator accepted or
-	 *             acted on it: this is writel_relaxed() with no readback,
-	 *             and the hardware may be wedged right here.
-	 *
-	 * Between them they bracket the actual trigger, and neither may be
-	 * reported as "hardware started".
-	 *
-	 * M20-P1d: TCS_PRE also registers this exact batch as MC0 in the
-	 * in-flight table BEFORE __tcs_set_trigger() is called.  The
-	 * completion handler on another CPU can therefore never consume a
-	 * count that has not been taken yet.  TCS_POKED only annotates the
-	 * trigger store after the fact; it may legitimately find the batch
-	 * already gone if the completion won the race.
-	 */
-	j716f_vote_record_tcs(J716F_VOTE_KIND_TCS_PRE, msg, drv, drv->name,
-			      (u32)tcs_id);
 	__tcs_set_trigger(drv, tcs_id, true);
-	j716f_vote_record_tcs(J716F_VOTE_KIND_TCS_POKED, msg, drv, drv->name,
-			      (u32)tcs_id);
-	j716f_bc(J716F_BC_RSC_SEND_EXIT, tcs_id);
 
 	return 0;
 }
@@ -921,149 +804,6 @@ void rpmh_rsc_debug(struct rsc_drv *drv, struct completion *compl)
 			"IRQ pending at GIC but not handled within timeout\n");
 }
 
-#ifdef CONFIG_QCOM_J716F_DIAG
-/**
- * rpmh_rsc_panic_dump - print RSC/TCS state from the panic notifier
- *
- * Reads the possibly wedged RSC registers, so this must be the very last
- * thing the J716F panic dump does: the header lines are already on the
- * console, and a hang here mirrors the original failure.
- */
-void rpmh_rsc_panic_dump(void)
-{
-	struct rsc_drv *drv;
-	int i, j;
-
-	pr_info("J716F RSC dump begin (panic_dump=%d)\n", rsc_panic_dump);
-	if (!rsc_panic_dump)
-		return;
-
-	list_for_each_entry(drv, &rsc_drv_list, node) {
-		struct irq_data *irqd = irq_get_irq_data(drv->irq);
-		unsigned long in_use = 0;
-		bool gic_pend = false, gic_act = false;
-		int pret, aret;
-
-		bitmap_copy(&in_use, drv->tcs_in_use, drv->num_tcs);
-		pr_info("J716F RSC %s: irq=%d hwirq=%lu num_tcs=%d in_use=%08lx\n",
-			drv->name, drv->irq, irqd ? irqd->hwirq : 0,
-			drv->num_tcs, in_use);
-		{
-			/*
-			 * M20-P1: affinity is the other half of "the
-			 * completion IRQ was never serviced".  A target CPU
-			 * that is itself wedged cannot run the handler no
-			 * matter how correct the hardware is, so record what
-			 * the kernel believes the target is.
-			 */
-			const struct cpumask *eff =
-				irq_get_effective_affinity_mask(drv->irq);
-			const struct cpumask *req =
-				irq_get_affinity_mask(drv->irq);
-
-			if (req && eff)
-				pr_info("J716F RSC %s: affinity req=%*pbl eff=%*pbl\n",
-					drv->name,
-					cpumask_pr_args(req),
-					cpumask_pr_args(eff));
-			else
-				pr_info("J716F RSC %s: affinity req=%s eff=%s\n",
-					drv->name, req ? "yes" : "none",
-					eff ? "yes" : "none");
-		}
-
-		pret = irq_get_irqchip_state(drv->irq, IRQCHIP_STATE_PENDING,
-					     &gic_pend);
-		aret = irq_get_irqchip_state(drv->irq, IRQCHIP_STATE_ACTIVE,
-					     &gic_act);
-		pr_info("J716F RSC %s: irq pending=%d active=%d (err %d/%d)\n",
-			drv->name, gic_pend, gic_act, pret, aret);
-
-		for_each_set_bit(i, &in_use, drv->num_tcs) {
-			const struct tcs_request *req = get_req_from_tcs(drv, i);
-			u32 ctrl, sts, en, irq_sts, waittcs;
-
-			ctrl = read_tcs_reg(drv, drv->regs[RSC_DRV_CONTROL], i);
-			sts = read_tcs_reg(drv, drv->regs[RSC_DRV_STATUS], i);
-			en = read_tcs_reg(drv, drv->regs[RSC_DRV_CMD_ENABLE], i);
-			waittcs = read_tcs_reg(drv,
-					       drv->regs[RSC_DRV_CMD_WAIT_FOR_CMPL], i);
-			irq_sts = readl_relaxed(drv->tcs_base +
-						drv->regs[RSC_DRV_IRQ_STATUS]);
-
-			/*
-			 * M20-P1: decode the register polarity explicitly.
-			 *
-			 * DRV_STATUS is non-zero when the TCS is IDLE, and the
-			 * IRQ_STATUS bit is set once the accelerator has
-			 * COMPLETED the TCS.  Printing the raw value alone
-			 * invites the M19a misreading "irq_sts=1 means the
-			 * transaction is still pending"; it means the opposite.
-			 */
-			pr_info("J716F RSC %s tcs%d: svc=%s done=%s ctrl=%08x(%s%s) rsc_sts=%08x en=%08x waitcmpl=%08x irq_sts=%08x\n",
-				drv->name, i,
-				test_bit(i, drv->tcs_in_use) ? "in-use" : "free",
-				(irq_sts & BIT(i)) ? "DONE" : "WAITING",
-				ctrl,
-				(ctrl & TCS_AMC_MODE_ENABLE) ? "amc-en" : "-",
-				(ctrl & TCS_AMC_MODE_TRIGGER) ? "+trigger" : "-",
-				sts, en, waittcs, irq_sts);
-
-			if (!en) {
-				pr_info("J716F RSC %s tcs%d: no commands enabled\n",
-					drv->name, i);
-				continue;
-			}
-
-			if (req)
-				pr_info("J716F RSC %s tcs%d: req state=%d cmds=%u wait_for_compl=%u\n",
-					drv->name, i, req->state, req->num_cmds,
-					req->wait_for_compl);
-
-			/*
-			 * Dump every enabled command slot, not only slot 0.
-			 * The point is to see whether MC0 shares the TCS with
-			 * other votes and what those carry.
-			 */
-			for (j = 0; j < drv->tcs[0].ncpt; j++) {
-				char rname[CMD_DB_ID_SIZE + 1];
-				u32 addr, data, msgid, cmdsts;
-
-				if (!(en & BIT(j)))
-					continue;
-				addr = read_tcs_cmd(drv,
-						    drv->regs[RSC_DRV_CMD_ADDR],
-						    i, j);
-				data = read_tcs_cmd(drv,
-						    drv->regs[RSC_DRV_CMD_DATA],
-						    i, j);
-				msgid = read_tcs_cmd(drv,
-						     drv->regs[RSC_DRV_CMD_MSGID],
-						     i, j);
-				cmdsts = read_tcs_cmd(drv,
-						      drv->regs[RSC_DRV_CMD_STATUS],
-						      i, j);
-				if (cmd_db_read_name(addr, rname, sizeof(rname)))
-					strscpy(rname, "unknown", sizeof(rname));
-
-				pr_info("J716F RSC %s tcs%d cmd%d: addr=0x%x(%s) data=0x%08x%s%s msgid=%08x cmdsts=%08x%s%s%s resp=0x%08x\n",
-					drv->name, i, j, addr, rname, data,
-					(data & BCM_TCS_CMD_COMMIT_MASK) ? " commit" : "",
-					(data & BCM_TCS_CMD_VALID_MASK) ? " valid" : "",
-					msgid, cmdsts,
-					(cmdsts & CMD_STATUS_TRIGGERED) ? " triggered" : "-",
-					(cmdsts & CMD_STATUS_ISSUED) ? "+sent-to-aoss" : "",
-					(cmdsts & CMD_STATUS_COMPL) ? "+resp-received" : "",
-					read_tcs_cmd(drv,
-						     drv->regs[RSC_DRV_CMD_RESP_DATA],
-						     i, j));
-			}
-		}
-	}
-	pr_info("J716F RSC dump end\n");
-}
-#endif
-
 /**
  * find_slots() - Find a place to write the given message.
  * @tcs:    The tcs group to search.
@@ -1126,12 +866,10 @@ int rpmh_rsc_write_ctrl_data(struct rsc_drv *drv, const struct tcs_request *msg)
 	if (IS_ERR(tcs))
 		return PTR_ERR(tcs);
 
-	j716f_bc(J716F_BC_RSC_CTRLDATA_ENTER, msg->cmds[0].addr);
 	/* find the TCS id and the command in the TCS to write to */
 	ret = find_slots(tcs, msg, &tcs_id, &cmd_id);
 	if (!ret)
 		__tcs_buffer_write(drv, tcs_id, cmd_id, msg);
-	j716f_bc(J716F_BC_RSC_CTRLDATA_EXIT, msg->cmds[0].addr);
 
 	return ret;
 }
@@ -1488,27 +1226,6 @@ static int rpmh_rsc_probe(struct platform_device *pdev)
 		return ret;
 
 	drv->irq = irq;
-	j716f_irq_set(irq);
-	{
-		const struct cpumask *aff = irq_get_effective_affinity_mask(irq);
-		struct irq_data *irqd = irq_get_irq_data(irq);
-
-		if (aff)
-			dev_info(&pdev->dev,
-				 "J716F RSC %s irq=%d hwirq=%lu aff=%*pbl\n",
-				 drv->name, irq, irqd ? irqd->hwirq : 0,
-				 cpumask_pr_args(aff));
-		else
-			dev_info(&pdev->dev,
-				 "J716F RSC %s irq=%d hwirq=%lu aff=none\n",
-				 drv->name, irq, irqd ? irqd->hwirq : 0);
-	}
-
-	if (enable_wake) {
-		ret = enable_irq_wake(irq);
-		dev_info(&pdev->dev, "J716F RSC %s enable_irq_wake=%d\n",
-			 drv->name, ret);
-	}
 
 	/*
 	 * CPU PM/genpd notification are not required for controllers that support
@@ -1547,9 +1264,6 @@ static int rpmh_rsc_probe(struct platform_device *pdev)
 
 	dev_set_drvdata(&pdev->dev, drv);
 	drv->dev = &pdev->dev;
-#ifdef CONFIG_QCOM_J716F_DIAG
-	list_add_tail(&drv->node, &rsc_drv_list);
-#endif
 
 	return devm_of_platform_populate(&pdev->dev);
 }

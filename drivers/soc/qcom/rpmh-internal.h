@@ -139,51 +139,7 @@ struct rsc_drv {
 	struct device *dev;
 	struct rsc_ver ver;
 	u32 *regs;
-#ifdef CONFIG_QCOM_J716F_DIAG
-	struct list_head node;
-	/*
-	 * M20-P1a: transaction id currently programmed into each TCS.  Written
-	 * in rpmh_rsc_send_data() while the TCS is claimed, read by
-	 * tcs_tx_done(); this is what lets the completion be attributed to the
-	 * request that caused it without guessing from timing.  Not a hardware
-	 * field: the accelerator knows nothing about these ids.
-	 */
-	u32 txid[MAX_TCS_NR];
-#endif
 };
-
-/*
- * M20-P1c: accessors instead of direct field use.
- *
- * drv->txid[] only exists with the diagnostic built in, and v57 referenced it
- * unconditionally from rpmh_rsc_send_data()/tcs_tx_done(), so
- * CONFIG_QCOM_J716F_DIAG=n did not compile.  Wrapping the accesses keeps the
- * production build free of diagnostic fields without sprinkling #ifdef
- * through the hot path.
- */
-static inline void rpmh_rsc_set_txid(struct rsc_drv *drv, int tcs_id, u32 txid)
-{
-#ifdef CONFIG_QCOM_J716F_DIAG
-	if (tcs_id >= 0 && tcs_id < MAX_TCS_NR)
-		drv->txid[tcs_id] = txid;
-#else
-	(void)drv;
-	(void)tcs_id;
-	(void)txid;
-#endif
-}
-
-static inline u32 rpmh_rsc_get_txid(struct rsc_drv *drv, int tcs_id)
-{
-#ifdef CONFIG_QCOM_J716F_DIAG
-	return (tcs_id >= 0 && tcs_id < MAX_TCS_NR) ?
-		READ_ONCE(drv->txid[tcs_id]) : 0;
-#else
-	(void)drv;
-	(void)tcs_id;
-	return 0;
-#endif
-}
 
 int rpmh_rsc_send_data(struct rsc_drv *drv, const struct tcs_request *msg);
 int rpmh_rsc_write_ctrl_data(struct rsc_drv *drv,
@@ -191,9 +147,6 @@ int rpmh_rsc_write_ctrl_data(struct rsc_drv *drv,
 void rpmh_rsc_invalidate(struct rsc_drv *drv);
 void rpmh_rsc_write_next_wakeup(struct rsc_drv *drv);
 void rpmh_rsc_debug(struct rsc_drv *drv, struct completion *compl);
-#ifdef CONFIG_QCOM_J716F_DIAG
-void rpmh_rsc_panic_dump(void);
-#endif
 
 void rpmh_tx_done(const struct tcs_request *msg);
 int rpmh_flush(struct rpmh_ctrlr *ctrlr);
