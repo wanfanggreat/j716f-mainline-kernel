@@ -279,8 +279,26 @@ static int fsa4480_probe(struct i2c_client *client)
 		return dev_err_probe(dev, ret, "Failed to get regulator\n");
 
 	ret = regmap_read(fsa->regmap, FSA4480_DEVICE_ID, &val);
-	if (ret)
-		return dev_err_probe(dev, -ENODEV, "FSA4480 not found\n");
+	if (ret) {
+		/*
+		 * The first access after the driver is loaded can fail while
+		 * the board's I2C rail is still settling (observed on the
+		 * Lenovo J716F: the address is NACKed until ~1 s after the
+		 * shared 3.3 V rail comes up).  Retry later instead of
+		 * turning a transient bus error into a permanent -ENODEV.
+		 */
+		dev_dbg(dev, "device ID read failed: %d\n", ret);
+		switch (ret) {
+		case -ETIMEDOUT:
+		case -EAGAIN:
+		case -EIO:
+		case -EREMOTEIO:
+		case -ENXIO:
+			return -EPROBE_DEFER;
+		default:
+			return dev_err_probe(dev, -ENODEV, "FSA4480 not found\n");
+		}
+	}
 
 	dev_dbg(dev, "Found FSA4480 v%lu.%lu (Vendor ID = %lu)\n",
 		FIELD_GET(FSA4480_DEVICE_ID_VERSION_ID, val),

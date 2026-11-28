@@ -945,11 +945,14 @@
 	/*
 	 * Analog audio/SBU switch between the SoC audio codec and the
 	 * USB-C receptacle.  TCPM drives it through the connector graph:
-	 * the vendor does the same with "fsa4480-i2c-handle".
+	 * the vendor does the same with "fsa4480-i2c-handle".  The driver
+	 * defers its first register access until i2c15 has settled, so the
+	 * graph link can be kept without holding TCPM back.
 	 */
 	typec-mux@43 {
 		compatible = "fcs,fsa4480";
 		reg = <0x43>;
+		vcc-supply = <&vreg_l16a_3p3>;
 
 		mode-switch;
 		orientation-switch;
