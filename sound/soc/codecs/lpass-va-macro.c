@@ -274,7 +274,10 @@ struct va_macro {
 	struct regulator *micb_reg;
 	unsigned int micb_voltage;
 	unsigned int micb_current;
-	bool micb_enabled;
+	/* One bit per DMIC, shared by va_macro_set_dmic_clk_early(). */
+	u32 dmic_users;
+	/* One bit per DMIC, shared by va_macro_enable_micbias(). */
+	u32 micb_users;
 
 	s32 dmic_0_1_clk_cnt;
 	s32 dmic_2_3_clk_cnt;
@@ -806,55 +809,71 @@ static struct device *va_macro_dev;
 int va_macro_enable_micbias(u32 dmic, bool enable)
 {
 	struct va_macro *va = va_macro_dev ? dev_get_drvdata(va_macro_dev) : NULL;
+	u32 mask;
 	int ret;
 
 	if (!va || !va->micb_reg)
 		return -ENODEV;
+	if (dmic >= 32)
+		return -EINVAL;
+
+	mask = BIT(dmic);
 
 	if (enable) {
-		if (va->micb_enabled)
+		if (va->micb_users & mask)
 			return 0;
 
-		if (va->micb_voltage) {
-			ret = regulator_set_voltage(va->micb_reg,
-						    va->micb_voltage,
-						    va->micb_voltage);
-			if (ret)
-				dev_err(va->dev,
-					"J716F-VA: micb set voltage %u failed %d\n",
-					va->micb_voltage, ret);
+		/*
+		 * Lenovo J716F: only the first user programs and enables the
+		 * rail; later users just take a reference so that one of them
+		 * stopping does not cut the bias of the others.
+		 */
+		if (!va->micb_users) {
+			if (va->micb_voltage) {
+				ret = regulator_set_voltage(va->micb_reg,
+							    va->micb_voltage,
+							    va->micb_voltage);
+				if (ret)
+					dev_err(va->dev,
+						"J716F-VA: micb set voltage %u failed %d\n",
+						va->micb_voltage, ret);
+			}
+			if (va->micb_current) {
+				ret = regulator_set_current_limit(va->micb_reg,
+								  va->micb_current,
+								  va->micb_current);
+				/*
+				 * Lenovo J716F: va-vdd-micb is vreg_s4a_1p8, a fixed
+				 * always-on SMPS that does not implement current
+				 * limiting, so -EINVAL is expected and harmless (the
+				 * microphones work).  Do not log it as an error on
+				 * every capture start.
+				 */
+				if (ret)
+					dev_dbg(va->dev,
+						"J716F-VA: micb current %u not supported (%d)\n",
+						va->micb_current, ret);
+			}
+			ret = regulator_enable(va->micb_reg);
+			if (ret) {
+				dev_err(va->dev, "J716F-VA: micb enable failed %d\n", ret);
+				return ret;
+			}
+			dev_dbg(va->dev, "J716F-VA: micbias on (%u uV, %u uA)\n",
+				 va->micb_voltage, va->micb_current);
 		}
-		if (va->micb_current) {
-			ret = regulator_set_current_limit(va->micb_reg,
-							  va->micb_current,
-							  va->micb_current);
-			/*
-			 * Lenovo J716F: va-vdd-micb is vreg_s4a_1p8, a fixed
-			 * always-on SMPS that does not implement current
-			 * limiting, so -EINVAL is expected and harmless (the
-			 * microphones work).  Do not log it as an error on
-			 * every capture start.
-			 */
-			if (ret)
-				dev_dbg(va->dev,
-					"J716F-VA: micb current %u not supported (%d)\n",
-					va->micb_current, ret);
-		}
-		ret = regulator_enable(va->micb_reg);
-		if (ret) {
-			dev_err(va->dev, "J716F-VA: micb enable failed %d\n", ret);
-			return ret;
-		}
-		va->micb_enabled = true;
-		dev_dbg(va->dev, "J716F-VA: micbias on (%u uV, %u uA)\n",
-			 va->micb_voltage, va->micb_current);
+		va->micb_users |= mask;
 	} else {
-		if (!va->micb_enabled)
+		if (!(va->micb_users & mask))
 			return 0;
+
+		va->micb_users &= ~mask;
+		if (va->micb_users)
+			return 0;
+
 		ret = regulator_disable(va->micb_reg);
 		if (ret)
 			dev_err(va->dev, "J716F-VA: micb disable failed %d\n", ret);
-		va->micb_enabled = false;
 		dev_dbg(va->dev, "J716F-VA: micbias off\n");
 	}
 
@@ -872,53 +891,67 @@ int va_macro_set_dmic_clk_early(u32 dmic, bool enable)
 {
 	struct va_macro *va = va_macro_dev ? dev_get_drvdata(va_macro_dev) : NULL;
 	u16 dmic_clk_reg;
+	u32 mask;
 	int ret;
 
 	if (!va || !va->regmap)
 		return -ENODEV;
+	if (dmic >= 32)
+		return -EINVAL;
+
+	mask = BIT(dmic);
 
 	/* DMIC0/1 -> 0x84, DMIC2/3 -> 0x88, DMIC4/5 -> 0x8c, ... */
 	dmic_clk_reg = CDC_VA_TOP_CSR_DMIC0_CTL + (dmic / 2) * 4;
 
 	if (enable) {
-		/*
-		 * Lenovo J716F: va_macro_mclk_enable() only touches the
-		 * macro's register block; the LPASS VA_CORE_MCLK itself is
-		 * prepared/enabled by the DAPM path only when the macro acts
-		 * as a SoundWire master. This board wires the DMICs directly,
-		 * so without an explicit enable here VA_CORE_MCLK stays at
-		 * enable_count 0 and the DMIC clock never runs at its
-		 * programmed rate - capture then delivered data at roughly
-		 * 1/8 of the requested 48 kHz.
-		 */
-		ret = clk_prepare_enable(va->mclk);
-		if (ret) {
-			dev_err(va->dev, "mclk enable failed %d\n", ret);
-			return ret;
-		}
-		ret = clk_set_rate(va->mclk, 2 * VA_MACRO_MCLK_FREQ);
-		if (ret)
-			dev_warn(va->dev, "mclk set_rate failed %d\n", ret);
+		if (va->dmic_users & mask)
+			return 0;
 
 		/*
-		 * Lenovo J716F: enable the 2x core MCLK as well. It is a
-		 * distinct LPASS clock ID and stays at enable_count 0 unless
-		 * something asks for it, and the DMIC clock generators do not
-		 * run without it.
+		 * Lenovo J716F: only the first user starts the shared clocks,
+		 * and the last one to leave stops them again.
 		 */
-		if (va->mclk2x) {
-			ret = clk_set_rate(va->mclk2x, 2 * VA_MACRO_MCLK_FREQ);
+		if (!va->dmic_users) {
+			/*
+			 * Lenovo J716F: va_macro_mclk_enable() only touches the
+			 * macro's register block; the LPASS VA_CORE_MCLK itself is
+			 * prepared/enabled by the DAPM path only when the macro acts
+			 * as a SoundWire master. This board wires the DMICs directly,
+			 * so without an explicit enable here VA_CORE_MCLK stays at
+			 * enable_count 0 and the DMIC clock never runs at its
+			 * programmed rate - capture then delivered data at roughly
+			 * 1/8 of the requested 48 kHz.
+			 */
+			ret = clk_prepare_enable(va->mclk);
+			if (ret) {
+				dev_err(va->dev, "mclk enable failed %d\n", ret);
+				return ret;
+			}
+			ret = clk_set_rate(va->mclk, 2 * VA_MACRO_MCLK_FREQ);
 			if (ret)
-				dev_warn(va->dev,
-					 "mclk2x set_rate failed %d\n", ret);
-			ret = clk_prepare_enable(va->mclk2x);
-			if (ret)
-				dev_err(va->dev,
-					"mclk2x enable failed %d\n", ret);
-			else
-				dev_dbg(va->dev,
-					 "J716F-VA: mclk2x enabled at %lu Hz\n",
-					 clk_get_rate(va->mclk2x));
+				dev_warn(va->dev, "mclk set_rate failed %d\n", ret);
+
+			/*
+			 * Lenovo J716F: enable the 2x core MCLK as well. It is a
+			 * distinct LPASS clock ID and stays at enable_count 0 unless
+			 * something asks for it, and the DMIC clock generators do not
+			 * run without it.
+			 */
+			if (va->mclk2x) {
+				ret = clk_set_rate(va->mclk2x, 2 * VA_MACRO_MCLK_FREQ);
+				if (ret)
+					dev_warn(va->dev,
+						 "mclk2x set_rate failed %d\n", ret);
+				ret = clk_prepare_enable(va->mclk2x);
+				if (ret)
+					dev_err(va->dev,
+						"mclk2x enable failed %d\n", ret);
+				else
+					dev_dbg(va->dev,
+						 "J716F-VA: mclk2x enabled at %lu Hz\n",
+						 clk_get_rate(va->mclk2x));
+			}
 		}
 
 		/*
@@ -983,9 +1016,42 @@ int va_macro_set_dmic_clk_early(u32 dmic, bool enable)
 
 		/* make sure the clock resource bits survive any cache sync */
 		va_clk_rsc_fs_gen_request(va, true);
+		va->dmic_users |= mask;
 	} else {
+		u32 group_mask;
+
+		if (!(va->dmic_users & mask))
+			return 0;
+
+		va->dmic_users &= ~mask;
+		/*
+		 * DMIC0/1 share one generator register and DMIC2/3 the next
+		 * one (see va_dmic_clk_enable()), so the register's enable
+		 * bits may only be cleared once both users of the pair are
+		 * gone. Turning them off under a still-running DMIC would
+		 * stop its clock.
+		 */
+		group_mask = GENMASK(dmic | 1, dmic & ~1);
+		if (va->dmic_users & group_mask)
+			return 0;
+
 		regmap_update_bits(va->regmap, dmic_clk_reg,
 				   CDC_VA_DMIC_EN_MASK, 0);
+		regmap_update_bits(va->regmap, dmic_clk_reg,
+				   CDC_VA_DMIC_EN2_MASK, 0);
+
+		/* Another DMIC pair is still active: keep the clocks on. */
+		if (va->dmic_users)
+			return 0;
+
+		/* Registers off before the clocks that feed them. */
+		va_macro_mclk_enable(va, false);
+		regmap_update_bits(va->regmap, CDC_VA_TOP_CSR_TOP_CFG0,
+				   CDC_VA_DMIC_EN_MASK, 0);
+		va_clk_rsc_fs_gen_request(va, false);
+		if (va->mclk2x)
+			clk_disable_unprepare(va->mclk2x);
+		clk_disable_unprepare(va->mclk);
 	}
 
 	return 0;

@@ -291,6 +291,12 @@ struct tx_macro {
 	int tx_mclk_users;
 	bool bcs_enable;
 	int dec_mode[NUM_DECIMATORS];
+	/*
+	 * Lenovo J716F: the DMIC that each decimator started in the VA macro,
+	 * or -1. The mux register can be reprogrammed while the widget is up,
+	 * so POST_PMD cannot recover this from hardware.
+	 */
+	int dec_dmic[NUM_DECIMATORS];
 	struct lpass_macro *pds;
 	bool bcs_clk_en;
 };
@@ -985,19 +991,33 @@ static int tx_macro_enable_dec(struct snd_soc_dapm_widget *w,
 				 * kcontrol write, so the APR vote inside the
 				 * VA macro helper cannot deadlock the control
 				 * path.
+				 *
+				 * Remember the DMIC per decimator: the mux may
+				 * be reprogrammed while the widget stays up, so
+				 * POST_PMD must release exactly what was taken.
 				 */
-				va_macro_set_dmic_clk_early(dmic, true);
-				/*
-				 * Lenovo J716F: a MEMS microphone needs its
-				 * bias rail before it will drive the data
-				 * line. mainline's "vdd-micb" DAPM supply
-				 * widget stays Off (0 users, 0 mV) unless
-				 * something explicitly programs the
-				 * regulator, so power it here alongside the
-				 * DMIC clock - this is where the vendor's
-				 * va_macro_enable_micbias() runs too.
-				 */
-				va_macro_enable_micbias(dmic, true);
+				if (tx->dec_dmic[decimator] >= 0 &&
+				    tx->dec_dmic[decimator] != dmic) {
+					va_macro_set_dmic_clk_early(
+						tx->dec_dmic[decimator], false);
+					va_macro_enable_micbias(
+						tx->dec_dmic[decimator], false);
+				}
+				if (tx->dec_dmic[decimator] != dmic) {
+					va_macro_set_dmic_clk_early(dmic, true);
+					/*
+					 * Lenovo J716F: a MEMS microphone needs its
+					 * bias rail before it will drive the data
+					 * line. mainline's "vdd-micb" DAPM supply
+					 * widget stays Off (0 users, 0 mV) unless
+					 * something explicitly programs the
+					 * regulator, so power it here alongside the
+					 * DMIC clock - this is where the vendor's
+					 * va_macro_enable_micbias() runs too.
+					 */
+					va_macro_enable_micbias(dmic, true);
+					tx->dec_dmic[decimator] = dmic;
+				}
 		}
 		snd_soc_component_write_field(component, dec_cfg_reg,
 					      CDC_TXn_ADC_MODE_MASK,
@@ -1119,6 +1139,20 @@ static int tx_macro_enable_dec(struct snd_soc_dapm_widget *w,
 						      CDC_TX0_MBHC_CTL_EN_MASK,
 						      0x0);
 			tx->bcs_clk_en = false;
+		}
+		/*
+		 * Lenovo J716F: release exactly the DMIC that PRE_PMU started
+		 * in the VA macro. The mux register can be reprogrammed while
+		 * the widget is up, so it is not a reliable source here. Both
+		 * helpers are reference counted and idempotent, so the second
+		 * decimator of a 2-channel capture does not stop the shared
+		 * DMIC clock or bias.
+		 */
+		if (tx->dec_dmic[decimator] >= 0) {
+			dmic = tx->dec_dmic[decimator];
+			tx->dec_dmic[decimator] = -1;
+			va_macro_set_dmic_clk_early(dmic, false);
+			va_macro_enable_micbias(dmic, false);
 		}
 		break;
 	}
@@ -2306,7 +2340,7 @@ static int tx_macro_probe(struct platform_device *pdev)
 	struct device_node *np = dev->of_node;
 	struct tx_macro *tx;
 	void __iomem *base;
-	int ret, reg;
+	int ret, reg, i;
 
 	tx = devm_kzalloc(dev, sizeof(*tx), GFP_KERNEL);
 	if (!tx)
@@ -2374,6 +2408,10 @@ static int tx_macro_probe(struct platform_device *pdev)
 	tx->active_decimator[TX_MACRO_AIF1_CAP] = -1;
 	tx->active_decimator[TX_MACRO_AIF2_CAP] = -1;
 	tx->active_decimator[TX_MACRO_AIF3_CAP] = -1;
+
+	/* Lenovo J716F: no decimator owns a VA DMIC yet. */
+	for (i = 0; i < NUM_DECIMATORS; i++)
+		tx->dec_dmic[i] = -1;
 
 	/* set MCLK and NPL rates */
 	ret = clk_set_rate(tx->mclk, MCLK_FREQ);
