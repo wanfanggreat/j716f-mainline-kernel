@@ -735,6 +735,11 @@
 	 * VA is the 3.3 V logic rail.  There is no VP supply on this board:
 	 * the amplifiers feed their boost converter straight from the
 	 * battery rail on the PCB.
+	 *
+	 * ZUI describes codec GPIO2 with the vendor child node
+	 * "cirrus,gpio-config2" (gpio-src-select = 4, gpio-output-enable,
+	 * gpio-type = 1) on all four amplifiers, i.e. GPIO2 is the
+	 * push-pull INTB output.  Keep the equivalent flat properties.
 	 */
 	spk_amp1: speaker@40 {
 		compatible = "cirrus,cs35l41";
@@ -753,7 +758,6 @@
 		VA-supply = <&vreg_l16a_3p3>;
 		cirrus,subsystem-id = "j716f";
 
-		cirrus,boost-type = <0>;
 		cirrus,boost-peak-milliamp = <3500>;
 		cirrus,boost-ind-nanohenry = <1000>;
 		cirrus,boost-cap-microfarad = <15>;
@@ -779,7 +783,6 @@
 		VA-supply = <&vreg_l16a_3p3>;
 		cirrus,subsystem-id = "j716f";
 
-		cirrus,boost-type = <0>;
 		cirrus,boost-peak-milliamp = <3500>;
 		cirrus,boost-ind-nanohenry = <1000>;
 		cirrus,boost-cap-microfarad = <15>;
@@ -805,7 +808,6 @@
 		VA-supply = <&vreg_l16a_3p3>;
 		cirrus,subsystem-id = "j716f";
 
-		cirrus,boost-type = <0>;
 		cirrus,boost-peak-milliamp = <3500>;
 		cirrus,boost-ind-nanohenry = <1000>;
 		cirrus,boost-cap-microfarad = <15>;
@@ -831,7 +833,6 @@
 		VA-supply = <&vreg_l16a_3p3>;
 		cirrus,subsystem-id = "j716f";
 
-		cirrus,boost-type = <0>;
 		cirrus,boost-peak-milliamp = <3500>;
 		cirrus,boost-ind-nanohenry = <1000>;
 		cirrus,boost-cap-microfarad = <15>;
@@ -876,7 +877,6 @@
 	touchscreen@5d {
 		compatible = "goodix,gt738x";
 		reg = <0x5d>;
-		goodix,debug-reports;
 
 		interrupt-parent = <&tlmm>;
 		interrupts = <39 IRQ_TYPE_EDGE_FALLING>;
@@ -899,14 +899,13 @@
 		goodix,config-name = "j716f_cfg.bin";
 
 		/*
-		 * Vendor rail map:
-		 *   pm8150a_l1  (1.8 V) -> vdd-supply / avdd-supply
+		 * Vendor rail map, restricted to the supplies mainline goodix
+		 * actually consumes (lower-case vdd/vddio have no consumer):
+		 *   pm8150a_l1  (1.8 V) -> avdd-supply
 		 *   pm8150_l13  (3.0 V) -> AVDD28-supply
-		 *   pm8150_l14  (1.8 V) -> VDDIO-supply / vddio-supply
+		 *   pm8150_l14  (1.8 V) -> VDDIO-supply
 		 */
 		avdd-supply = <&vreg_l1d_1p8>;
-		vdd-supply = <&vreg_l1d_1p8>;
-		vddio-supply = <&vreg_l14a_1p88>;
 		AVDD28-supply = <&vreg_l13a_3p0>;
 		VDDIO-supply = <&vreg_l14a_1p88>;
 

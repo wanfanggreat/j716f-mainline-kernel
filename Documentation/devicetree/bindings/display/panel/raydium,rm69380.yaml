@@ -35,7 +35,9 @@ properties:
     description: Analog voltage rail
 
   vdd-supply:
-    description: Panel power supply rail
+    description:
+      Optional panel power supply rail.  Boards that power the panel from
+      avdd/vddio only leave this unset.
 
   vddio-supply:
     description: I/O voltage rail
@@ -48,7 +50,6 @@ required:
   - compatible
   - reg
   - avdd-supply
-  - vdd-supply
   - vddio-supply
   - reset-gpios
 
