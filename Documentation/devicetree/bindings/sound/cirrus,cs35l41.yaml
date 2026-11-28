@@ -25,9 +25,6 @@ properties:
   interrupts:
     maxItems: 1
 
-  interrupt-names:
-    maxItems: 1
-
   '#sound-dai-cells':
     description:
       The first cell indicating the audio interface.

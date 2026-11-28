@@ -745,8 +745,6 @@
 
 		interrupt-parent = <&tlmm>;
 		interrupts = <67 IRQ_TYPE_LEVEL_LOW>;
-		interrupt-names = "cs35l41_1_irq";
-
 		pinctrl-names = "default";
 		pinctrl-0 = <&spk1_irq_default &spk_reset_default>;
 
@@ -775,8 +773,6 @@
 
 		interrupt-parent = <&tlmm>;
 		interrupts = <113 IRQ_TYPE_LEVEL_LOW>;
-		interrupt-names = "cs35l41_2_irq";
-
 		pinctrl-names = "default";
 		pinctrl-0 = <&spk2_irq_default>;
 
@@ -804,8 +800,6 @@
 
 		interrupt-parent = <&tlmm>;
 		interrupts = <126 IRQ_TYPE_LEVEL_LOW>;
-		interrupt-names = "cs35l41_3_irq";
-
 		pinctrl-names = "default";
 		pinctrl-0 = <&spk3_irq_default>;
 
@@ -833,8 +827,6 @@
 
 		interrupt-parent = <&tlmm>;
 		interrupts = <68 IRQ_TYPE_LEVEL_LOW>;
-		interrupt-names = "cs35l41_4_irq";
-
 		pinctrl-names = "default";
 		pinctrl-0 = <&spk4_irq_default>;
 
@@ -1505,9 +1497,9 @@
  */
 
 /*
- * Phase L5 audio: four CS35L41 amplifiers on primary MI2S RX, ES7210 on
- * primary MI2S TX, DMIC capture through the VA/TX macros, and the Q6ASM
- * front ends.  The topology follows the working 6.15.11 J716F reference.
+ * Phase L5 audio: four CS35L41 amplifiers on primary MI2S RX, capture
+ * through the VA and TX macros, and the Q6ASM front ends.  The topology
+ * follows the working 6.15.11 J716F reference.
  */
 &q6asmdai {
 	dai@0 {
@@ -1525,17 +1517,11 @@
 
 &q6afedai {
 	/*
-	 * Speakers use SD1, the ES7210 microphone ADC uses SD0.
-	 * mainline builds the line mask with BIT(index).
+	 * Speakers use SD1; mainline builds the line mask with BIT(index).
 	 */
 	dai@16 {
 		reg = <PRIMARY_MI2S_RX>;
 		qcom,sd-lines = <1>;
-	};
-
-	dai@17 {
-		reg = <PRIMARY_MI2S_TX>;
-		qcom,sd-lines = <0>;
 	};
 };
 
@@ -1634,8 +1620,6 @@
 };
 
 &txmacro {
-	vdd-micb-supply = <&vreg_s4a_1p8>;
-
 	status = "okay";
 };
 

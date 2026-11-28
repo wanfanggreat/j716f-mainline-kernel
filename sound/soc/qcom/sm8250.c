@@ -296,59 +296,6 @@ static int sm8250_snd_startup(struct snd_pcm_substream *substream)
 				return ret;
 		}
 		break;
-	/*
-	 * Lenovo J716F: the primary MI2S also carries the ES7210 microphone
-	 * ADC on its capture direction. Without a TX case here the capture
-	 * backend never gets its bit clock configured and recording fails.
-	 */
-	case PRIMARY_MI2S_TX:
-		codec_dai_fmt |= SND_SOC_DAIFMT_NB_NF | SND_SOC_DAIFMT_I2S;
-		/*
-		 * Lenovo J716F: the ES7210 microphone ADC is clocked from the
-		 * I2S bit clock. The vendor driver's coeff_div[] table programs
-		 * it for MCLK = 256 x Fs (12.288 MHz at 48 kHz, lrck divider
-		 * 0x0100), so the capture direction needs that rate rather than
-		 * the 32 x Fs rate the speaker amplifiers use. With the slow
-		 * clock the chip is configured correctly, the DAPM path comes up
-		 * and the registers release, but the ADC cannot produce samples,
-		 * so every recording is silence.
-		 */
-		/*
-		 * IBIT only, as upstream sm8250 does.
-		 *
-		 * The vendor machine driver (audio_machine_kona.ko) programs both
-		 * IBIT and EBIT at 1.536 MHz here; its tables were read out of
-		 * the module and are:
-		 *
-		 *   .data  mi2s_clk[]       { 0x100, 1536000, 1, 1 }
-		 *                           { 0x102, 1536000, 1, 1 }
-		 *                           { 0x104, 1536000, 1, 1 }
-		 *   .rodata mi2s_ebit_clk[] { 0x101, 0x103, 0x105 }
-		 *
-		 * Adding the EBIT was tried and makes the capture record **zero
-		 * bytes**, so only IBIT stays. Note also that both the vendor and
-		 * this driver use 32 x Fs, not the 256 x Fs the ES7210's
-		 * coeff_div[] table documents - which is where the microphone
-		 * bring-up currently stands.
-		 */
-		{
-			int __rc = snd_soc_dai_set_sysclk(cpu_dai,
-				Q6AFE_LPASS_CLK_ID_PRI_MI2S_IBIT,
-				MI2S_BCLK_RATE, SNDRV_PCM_STREAM_CAPTURE);
-			if (__rc)
-				dev_warn(rtd->card->dev,
-					 "J716F-CLK: set_sysclk IBIT rc=%d\n", __rc);
-		}
-		/*
-		 * NOTE: sdm845/sc7180 additionally program
-		 * Q6AFE_LPASS_CLK_ID_MCLK_1 here to give the codec a master
-		 * clock. That was tried for the ES7210 and the ADSP rejects it
-		 * ("AFE set params failed -22"), so the capture port is left
-		 * with just the bit clock.
-		 */
-		snd_soc_dai_set_fmt(cpu_dai, fmt);
-		snd_soc_dai_set_fmt(codec_dai, codec_dai_fmt);
-		break;
 	case SECONDARY_MI2S_RX:
 		codec_dai_fmt |= SND_SOC_DAIFMT_NB_NF | SND_SOC_DAIFMT_I2S;
 		snd_soc_dai_set_sysclk(cpu_dai,

@@ -1003,7 +1003,7 @@ static int va_macro_enable_dmic(struct snd_soc_dapm_widget *w,
 		int __rc = va_dmic_clk_enable(comp, dmic, true);
 
 		if (__rc)
-			dev_warn(comp->dev, "J716F-VA: clk_enable failed %d\n", __rc);
+			dev_dbg(comp->dev, "J716F-VA: clk_enable failed %d\n", __rc);
 		break;
 	}
 	case SND_SOC_DAPM_POST_PMD:
