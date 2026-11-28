@@ -61,7 +61,6 @@
 #define CS35L41_MDSYNC_SYNC_PTE3	0x0000352C
 #define CS35L41_MDSYNC_SYNC_MSM_STATUS	0x0000353C
 #define CS35L41_BSTCVRT_VCTRL1		0x00003800
-#define CS35L41_BST_VCTL_MASK		0x000000ff
 #define CS35L41_BSTCVRT_VCTRL2		0x00003804
 #define CS35L41_BSTCVRT_PEAK_CUR	0x00003808
 #define CS35L41_BSTCVRT_SFT_RAMP	0x0000380C
@@ -811,7 +810,6 @@ struct cs35l41_hw_cfg {
 	int bst_ind;
 	int bst_ipk;
 	int bst_cap;
-	int bst_vctl_mv;
 	int dout_hiz;
 	struct cs35l41_gpio_cfg gpio1;
 	struct cs35l41_gpio_cfg gpio2;

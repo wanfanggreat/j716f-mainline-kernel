@@ -757,8 +757,6 @@
 		cirrus,boost-peak-milliamp = <3500>;
 		cirrus,boost-ind-nanohenry = <1000>;
 		cirrus,boost-cap-microfarad = <15>;
-		/* Without a boost target the amplifier stays silent. */
-		cirrus,boost-ctl-millivolt = <4600>;
 		cirrus,asp-sdout-hiz = <3>;
 		cirrus,gpio2-src-select = <4>;
 		cirrus,gpio2-output-enable;
@@ -785,7 +783,6 @@
 		cirrus,boost-peak-milliamp = <3500>;
 		cirrus,boost-ind-nanohenry = <1000>;
 		cirrus,boost-cap-microfarad = <15>;
-		cirrus,boost-ctl-millivolt = <4600>;
 		cirrus,asp-sdout-hiz = <3>;
 		cirrus,gpio2-src-select = <4>;
 		cirrus,gpio2-output-enable;
@@ -812,7 +809,6 @@
 		cirrus,boost-peak-milliamp = <3500>;
 		cirrus,boost-ind-nanohenry = <1000>;
 		cirrus,boost-cap-microfarad = <15>;
-		cirrus,boost-ctl-millivolt = <4600>;
 		cirrus,asp-sdout-hiz = <3>;
 		cirrus,gpio2-src-select = <4>;
 		cirrus,gpio2-output-enable;
@@ -839,7 +835,6 @@
 		cirrus,boost-peak-milliamp = <3500>;
 		cirrus,boost-ind-nanohenry = <1000>;
 		cirrus,boost-cap-microfarad = <15>;
-		cirrus,boost-ctl-millivolt = <4600>;
 		cirrus,asp-sdout-hiz = <3>;
 		cirrus,gpio2-src-select = <4>;
 		cirrus,gpio2-output-enable;
