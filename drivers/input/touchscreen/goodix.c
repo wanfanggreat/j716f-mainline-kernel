@@ -281,11 +281,6 @@ static int goodix_ts_read_input_report(struct goodix_ts_data *ts, u8 *data)
 		if (error)
 			return error;
 
-		if (ts->gt738x_debug) {
-			pr_debug("J716F-TS: 0x814E[0]=%02x [1]=%02x [2]=%02x [3]=%02x\n",
-				data[0], data[1], data[2], data[3]);
-		}
-
 		/*
 		 * Lenovo J716F: the GT738x firmware on this board reports the
 		 * contact count in the low nibble but does not set the
@@ -512,7 +507,6 @@ static void goodix_ts_report_key(struct goodix_ts_data *ts, u8 *data)
  */
 static int goodix_gt738x_read_report(struct goodix_ts_data *ts, u8 *point_data)
 {
-	static unsigned int j716f_trace_frames;
 	u8 buf[GOODIX_GT738X_INITIAL_READ +
 	       GOODIX_GT738X_CONTACT_SIZE * (GOODIX_MAX_CONTACTS - 1)] = {};
 	u8 checksum = 0;
@@ -543,13 +537,8 @@ static int goodix_gt738x_read_report(struct goodix_ts_data *ts, u8 *point_data)
 		 * a continuous press, so preserve the slot on these not-ready IRQs.
 		 * A ready frame with count 0 (0x80) still reports a real release.
 		 */
-		if (ts->gt738x_j716f_mode) {
-			if (ts->gt738x_debug)
-				dev_dbg_ratelimited(&ts->client->dev,
-					"J716F report not ready, ignore: %*ph\n",
-					GOODIX_GT738X_INITIAL_READ, buf);
+		if (ts->gt738x_j716f_mode)
 			return -EAGAIN;
-		}
 		return 0;
 	}
 
@@ -570,14 +559,8 @@ static int goodix_gt738x_read_report(struct goodix_ts_data *ts, u8 *point_data)
 	}
 	/*
 	 * A ready zero-contact report releases all slots; individual width-zero
-	 * records below release their slots as well. Log the initial packet so
-	 * tracking-ID breaks can be matched to controller releases instead of
-	 * inferred only from the resulting input events.
+	 * records below release their slots as well.
 	 */
-	if (ts->gt738x_j716f_mode && ts->gt738x_debug && !touch_num)
-		dev_dbg_ratelimited(&ts->client->dev,
-				     "J716F ready zero-contact report: %*ph\n",
-				     GOODIX_GT738X_INITIAL_READ, buf);
 
 	/* J716F has one status byte, followed by LE finger records and footer. */
 	report_len = header_size +
@@ -596,24 +579,6 @@ static int goodix_gt738x_read_report(struct goodix_ts_data *ts, u8 *point_data)
 	if (touch_num)
 		for (i = 0; i < report_len - !ts->gt738x_j716f_mode; i++)
 			checksum += buf[i];
-	/*
-	 * Optional J716F diagnostics: trace complete one-contact packets
-	 * before they are converted to input events. The old two-byte-header/BE
-	 * interpretation mixed adjacent fields and caused 256-unit jumps. Tracing
-	 * requires both the debug-reports DT property and dynamic debug for this
-	 * callsite, so normal input does not continuously fill the kernel log.
-	 */
-	if (ts->gt738x_j716f_mode && ts->gt738x_debug && touch_num == 1) {
-		u8 *record = &buf[header_size];
-		u16 x = get_unaligned_le16(&record[1]);
-		u16 y = get_unaligned_le16(&record[3]);
-		u16 width = get_unaligned_le16(&record[5]);
-
-		dev_dbg(&ts->client->dev,
-			 "J716F frame %u: sum=%02x id=%02x x=%u y=%u w=%u data=%*ph\n",
-			 ++j716f_trace_frames, checksum, record[0], x, y, width,
-			 report_len, buf);
-	}
 	/* J716F finger frames include the status byte in their checksum. */
 	if (checksum) {
 		dev_warn_ratelimited(&ts->client->dev,
@@ -1698,8 +1663,6 @@ reset:
 	    of_device_is_compatible(client->dev.of_node, "goodix,gt7385p")) {
 		ts->gt738x_mode = true;
 		ts->gt738x_j716f_mode = of_machine_is_compatible("lenovo,j716f");
-		ts->gt738x_debug = of_property_read_bool(client->dev.of_node,
-							 "goodix,debug-reports");
 		ts->chip = &gt1x_chip_data;
 		dev_info(&client->dev,
 			 "GT738x config at 0x%04x, reports at 0x%04x%s\n",
