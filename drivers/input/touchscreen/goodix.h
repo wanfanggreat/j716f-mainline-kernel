@@ -107,7 +107,6 @@ struct goodix_ts_data {
 	bool gt738x_mode;
 	/* J716F firmware puts the active-contact count in status byte 0. */
 	bool gt738x_j716f_mode;
-	bool gt738x_debug;
 	bool gt738x_trace_ids_initialized;
 	u16 gt738x_trace_ids[GOODIX_MAX_CONTACTS];
 	u16 gt738x_released_slots;
