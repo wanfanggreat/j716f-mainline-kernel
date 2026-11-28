@@ -315,9 +315,6 @@ out:
  */
 int rpmh_read(const struct device *dev, struct tcs_cmd *cmd)
 {
-	if (!cmd)
-		return -EINVAL;
-
 	return __rpmh_write_wait(dev, RPMH_ACTIVE_ONLY_STATE, cmd, 1,
 				 &cmd->data);
 }
