@@ -109,7 +109,6 @@ struct msm_dsi_host {
 
 	void __iomem *ctrl_base;
 	phys_addr_t ctrl_size;
-
 	struct regulator_bulk_data *supplies;
 
 	int num_bus_clks;
@@ -943,7 +942,6 @@ static void dsi_ctrl_enable(struct msm_dsi_host *msm_host,
 
 	dsi_write(msm_host, REG_DSI_CTRL, data);
 
-
 	if (msm_host->cphy_mode)
 		dsi_write(msm_host, REG_DSI_CPHY_MODE_CTRL, BIT(0));
 }
@@ -1095,7 +1093,6 @@ static void dsi_timing_setup(struct msm_dsi_host *msm_host, bool is_bonded_dsi)
 		if (msm_host->dsc)
 			dsi_update_dsc_timing(msm_host, false);
 
-
 		dsi_write(msm_host, REG_DSI_ACTIVE_H,
 			DSI_ACTIVE_H_START(ha_start) |
 			DSI_ACTIVE_H_END(ha_end));
@@ -1201,7 +1198,6 @@ static void dsi_sw_reset(struct msm_dsi_host *msm_host)
 		dsi_write(msm_host, REG_DSI_CTRL, restore);
 		wmb();	/* make sure dsi controller enabled again */
 	}
-
 }
 
 static void dsi_op_mode_config(struct msm_dsi_host *msm_host,
@@ -1619,29 +1615,8 @@ static void dsi_err_worker(struct work_struct *work)
 	u32 status = msm_host->err_work_state;
 
 	pr_err_ratelimited("%s: status=%x\n", __func__, status);
-	if (status & DSI_ERR_STATE_MDP_FIFO_UNDERFLOW) {
-		u32 ctrl;
-
+	if (status & DSI_ERR_STATE_MDP_FIFO_UNDERFLOW)
 		dsi_sw_reset(msm_host);
-
-		/*
-		 * Safety net for the Lenovo TB-J716F: after recovering from an
-		 * underflow the controller must be running again, otherwise the
-		 * link is dead for the rest of the session (the panel half
-		 * driven by it stays black). dsi_sw_reset() restores the enable
-		 * state, but verify it here so a future regression cannot
-		 * silently leave the link off.
-		 */
-		ctrl = dsi_read(msm_host, REG_DSI_CTRL);
-		if (msm_host->enabled && !(ctrl & DSI_CTRL_ENABLE)) {
-			u32 restore = DSI_CTRL_ENABLE | DSI_CTRL_CLK_EN;
-
-			restore |= ((DSI_CTRL_LANE0 << msm_host->lanes) -
-				    DSI_CTRL_LANE0);
-			dsi_write(msm_host, REG_DSI_CTRL, restore);
-			wmb();
-		}
-	}
 
 	/* It is safe to clear here because error irq is disabled. */
 	msm_host->err_work_state = 0;
@@ -2534,7 +2509,6 @@ int msm_dsi_host_enable(struct mipi_dsi_host *host)
 {
 	struct msm_dsi_host *msm_host = to_msm_dsi_host(host);
 
-
 	dsi_op_mode_config(msm_host,
 		!!(msm_host->mode_flags & MIPI_DSI_MODE_VIDEO), true);
 
@@ -2548,7 +2522,6 @@ int msm_dsi_host_enable(struct mipi_dsi_host *host)
 	 * }
 	 */
 	msm_host->enabled = true;
-
 	return 0;
 }
 
@@ -2628,7 +2601,6 @@ int msm_dsi_host_power_on(struct mipi_dsi_host *host,
 			__func__, ret);
 		goto fail_disable_clk;
 	}
-
 
 	dsi_timing_setup(msm_host, is_bonded_dsi);
 	dsi_sw_reset(msm_host);
